@@ -8,7 +8,9 @@ It does not change the GitHub Action, its pinned model, or its fixed 0.80 cutoff
 Use Node 24.
 Choose explicit paths for URL list, dataset, model, and report.
 Keep dataset and artifacts outside tracked paths; the CLI warns before writing to a tracked dataset.
-Artifact writes do not overwrite existing files.
+Artifact writes do not overwrite existing model or report files.
+Missing parent directories are created with owner-only permissions; existing directory permissions remain unchanged.
+New artifact files use owner-only permissions.
 
 ```sh
 export GH_TOKEN=github_pat_read_only_value
@@ -23,6 +25,7 @@ The CLI never prints the token and sends it only to GitHub's API.
 Do not put token in URL list or command arguments.
 
 The URL list accepts one `https://github.com/OWNER/REPO/issues/NUMBER` or `/pull/NUMBER` URL per line.
+Terminal control characters in fetched titles and descriptions are escaped for display; saved snapshots retain original text.
 CLI snapshots title and description locally, then prompts for `human`, `ai`, or `unsure`.
 Each accepted label is saved atomically, so rerunning collect skips already labeled URLs and resumes after interruption.
 Fetch failures do not remove existing records.
@@ -41,7 +44,9 @@ Avoid using current detector output as sole label evidence.
 ## Split and limits
 
 The workflow groups identical prepared text, removes exact duplicates with conflicting labels, and assigns groups deterministically to an approximately 20% holdout.
+Class-stratified group assignment places both labels in training and holdout when each label has enough independent groups; impossible splits retain warnings.
 Training-only documents determine classifier vocabulary and IDF.
+Classifier version 2 tokenizes Unicode letters, marks, and numbers; scoring retains compatibility with version 1 artifacts using their original ASCII tokenizer.
 Small datasets may produce empty, small, or class-imbalanced holdouts; split warnings are stored with model.
 Repeated templates and near-duplicates may still leak across groups.
 Selected URLs may not represent future submissions, and reviewer labels may be wrong.

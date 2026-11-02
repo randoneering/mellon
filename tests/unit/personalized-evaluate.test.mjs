@@ -40,6 +40,7 @@ test('records snapshot and split metadata and rejects changed evaluation data', 
   assert.equal(result.trainingParameters.regularization, 1);
   assert.equal(result.trainingParameters.iterations, 500);
   assert.equal(result.trainingParameters.learningRate, 0.2);
+  assert.equal(metadata.classifierVersion, 2);
   assert.deepEqual(result.splitAssignments, metadata.assignments);
   await assert.rejects(evaluateHoldout({ ...model, evaluation: metadata }, [records[0]], async () => 0.5), /dataset.*split/i);
 });

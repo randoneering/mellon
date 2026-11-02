@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { prepareSubmission } from '../prepare.mjs';
-import { scoreClassifier } from './classifier.mjs';
+import { CLASSIFIER_VERSION, scoreClassifier } from './classifier.mjs';
 
 export const EVALUATION_VERSION = 1;
 export const BASELINE_CUTOFF = 0.8;
@@ -27,7 +27,7 @@ export function createEvaluationMetadata(records, split, baselineModelHash) {
     splitVersion: split.version,
     assignments: Object.fromEntries(Object.entries(split.assignments).sort(([a], [b]) => a.localeCompare(b))),
     preparationVersion: PREPARATION_VERSION,
-    classifierVersion: 1,
+    classifierVersion: CLASSIFIER_VERSION,
     baselineModelHash,
     trainingParameters: {
       algorithm: 'tfidf-logistic-regression',

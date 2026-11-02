@@ -77,6 +77,44 @@ test('resumes labeling without refetching or overwriting saved labels', async t 
   assert.equal(resumed.records[0].label, 'human');
 });
 
+test('escapes terminal controls at prompt boundary while retaining raw snapshots', async t => {
+  const files = await fixture(t);
+  const unsafeTitle = `Title ${String.fromCodePoint(0x1b)}]0;owned${String.fromCodePoint(7)} C1 ${String.fromCodePoint(0x9b)}31m`;
+  const unsafeBody = `first\nsecond ${String.fromCodePoint(0x1b)}[2J\rspoof ${String.fromCodePoint(0x1b)}]52;c;c3ludGhldGlj${String.fromCodePoint(7)}`;
+  let promptText = '';
+  await runCli(['collect', '--urls', files.urlFile, '--dataset', files.datasetPath], {
+    ...deps(Array(10).fill('human')),
+    fetchImpl: async () => ({ ok: true, json: async () => ({ title: unsafeTitle, body: unsafeBody }) }),
+    prompt: async text => { promptText = text; return 'human'; },
+  });
+  for (const control of [0x1b, 0x9b, 0x07, 0x0d]) assert.equal(promptText.includes(String.fromCodePoint(control)), false);
+  assert.ok(promptText.includes('first\nsecond'));
+  assert.match(promptText, /\\x1B/);
+  const saved = JSON.parse(await readFile(files.datasetPath, 'utf8'));
+  assert.equal(saved.records[0].title, unsafeTitle);
+  assert.equal(saved.records[0].body, unsafeBody);
+});
+
+test('creates nested artifact parents restrictively without changing existing permissions or overwriting', async t => {
+  const files = await fixture(t);
+  const nestedDataset = path.join(files.directory, 'new', 'deep', 'dataset.json');
+  const nestedModel = path.join(files.directory, 'models', 'nested', 'model.json');
+  const nestedReport = path.join(files.directory, 'reports', 'nested', 'report.json');
+  await runCli(['collect', '--urls', files.urlFile, '--dataset', nestedDataset], deps(urls.map((_, index) => index % 2 ? 'ai' : 'human')));
+  await runCli(['train', '--dataset', nestedDataset, '--model', nestedModel], { ...deps([]), baselineModelHash: 'a'.repeat(64) });
+  await runCli(['evaluate', '--dataset', nestedDataset, '--model', nestedModel, '--report', nestedReport], { ...deps([]), baselineScore: async () => 0.2 });
+  const { stat } = await import('node:fs/promises');
+  assert.equal((await stat(path.dirname(path.dirname(nestedModel)))).mode & 0o077, 0);
+  await assert.rejects(runCli(['train', '--dataset', nestedDataset, '--model', nestedModel], { ...deps([]), baselineModelHash: 'a'.repeat(64) }), error => error.code === 'EEXIST');
+  await assert.rejects(runCli(['evaluate', '--dataset', nestedDataset, '--model', nestedModel, '--report', nestedReport], { ...deps([]), baselineScore: async () => 0.2 }), error => error.code === 'EEXIST');
+  const existingDirectory = path.join(files.directory, 'existing');
+  const { mkdir, chmod } = await import('node:fs/promises');
+  await mkdir(existingDirectory);
+  await chmod(existingDirectory, 0o750);
+  await runCli(['collect', '--urls', files.urlFile, '--dataset', path.join(existingDirectory, 'data.json')], deps(urls.map((_, index) => index % 2 ? 'ai' : 'human')));
+  assert.equal((await stat(existingDirectory)).mode & 0o777, 0o750);
+});
+
 test('rejects invalid arguments before side effects', async t => {
   const files = await fixture(t);
   await assert.rejects(runCli(['train', '--dataset', files.datasetPath], deps([])), /Usage:/);

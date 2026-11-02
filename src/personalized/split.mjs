@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { prepareSubmission } from '../prepare.mjs';
 
-export const SPLIT_VERSION = 1;
+export const SPLIT_VERSION = 2;
 
 function hashText(text) {
   return createHash('sha256').update(text).digest('hex');
@@ -37,24 +37,32 @@ export function splitDataset(records) {
     }
   }
   const sorted = [...groups.values()].sort((a, b) => a.hash.localeCompare(b.hash));
-  const holdoutTarget = Math.round(sorted.length * 0.2);
-  const labelCounts = new Map();
-  for (const group of sorted) {
-    const label = [...group.labels][0];
-    labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
-  }
+  const groupsByLabel = new Map([['human', []], ['ai', []]]);
+  for (const group of sorted) groupsByLabel.get([...group.labels][0]).push(group);
+  const eachLabelCanSplit = [...groupsByLabel.values()].every(groups => groups.length >= 2);
+  const holdoutTarget = Math.min(sorted.length - 2, Math.max(Math.round(sorted.length * 0.2), eachLabelCanSplit ? 2 : 0));
   const holdoutGroups = [];
-  const trainingGroups = [];
-  for (const group of sorted) {
-    const label = [...group.labels][0];
-    if (holdoutGroups.length < holdoutTarget && labelCounts.get(label) > 1) {
-      holdoutGroups.push(group);
-      labelCounts.set(label, labelCounts.get(label) - 1);
-    } else {
-      trainingGroups.push(group);
+  if (holdoutTarget > 0) {
+    const quotas = new Map([...groupsByLabel].map(([label, groups]) => [label, Math.floor(holdoutTarget * groups.length / sorted.length)]));
+    let remaining = holdoutTarget - [...quotas.values()].reduce((sum, count) => sum + count, 0);
+    const rankedLabels = [...groupsByLabel.keys()].sort((left, right) => {
+      const leftRemainder = holdoutTarget * groupsByLabel.get(left).length / sorted.length - quotas.get(left);
+      const rightRemainder = holdoutTarget * groupsByLabel.get(right).length / sorted.length - quotas.get(right);
+      return rightRemainder - leftRemainder || left.localeCompare(right);
+    });
+    for (const label of rankedLabels) if (remaining > 0) { quotas.set(label, quotas.get(label) + 1); remaining--; }
+    if (eachLabelCanSplit && holdoutTarget >= 2) {
+      for (const label of groupsByLabel.keys()) quotas.set(label, Math.max(1, quotas.get(label)));
+      while ([...quotas.values()].reduce((sum, count) => sum + count, 0) > holdoutTarget) {
+        const label = [...groupsByLabel.keys()].sort((a, b) => quotas.get(b) - quotas.get(a) || b.localeCompare(a))[0];
+        if (quotas.get(label) <= 1) break;
+        quotas.set(label, quotas.get(label) - 1);
+      }
     }
+    for (const [label, groups] of groupsByLabel) holdoutGroups.push(...groups.slice(0, Math.min(quotas.get(label), groups.length - 1)));
   }
   const holdoutSet = new Set(holdoutGroups.map(group => group.hash));
+  const trainingGroups = sorted.filter(group => !holdoutSet.has(group.hash));
   const assignments = {};
   const groupHashes = {};
   for (const group of [...trainingGroups, ...holdoutGroups]) {

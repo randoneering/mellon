@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { parseSubmissionUrl } from './github.mjs';
@@ -69,6 +69,7 @@ export async function saveDataset(path, records, { isTracked = isGitTracked, war
   if (await isTracked(path)) warn(`Warning: dataset destination is Git-tracked: ${path}`);
   const target = resolve(path);
   const directory = dirname(target);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
   const temporaryDirectory = await mkdtemp(`${directory}/.mellon-dataset-`);
   const temporaryPath = `${temporaryDirectory}/${randomUUID()}.json`;
   try {

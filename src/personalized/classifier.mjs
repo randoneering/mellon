@@ -1,17 +1,31 @@
 import { prepareSubmission } from '../prepare.mjs';
 
-const ALGORITHM_VERSION = 1;
+export const CLASSIFIER_VERSION = 2;
+const ALGORITHM_VERSION = CLASSIFIER_VERSION;
 const REGULARIZATION = 1;
 const ITERATIONS = 500;
 const LEARNING_RATE = 0.2;
 const DECISION_CUTOFF = 0.5;
 
-function tokens(text) {
+function tokens(text, version = ALGORITHM_VERSION) {
   if (typeof text !== 'string') throw new TypeError('Classifier input must be text.');
-  const words = text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  const pattern = version === 1 ? /[a-z0-9]+/g : /[\p{L}\p{M}\p{N}]+/gu;
+  const words = text.toLowerCase().match(pattern) ?? [];
   const features = [...words];
   for (let i = 0; i + 1 < words.length; i++) features.push(`${words[i]} ${words[i + 1]}`);
   return features;
+}
+
+function sparseVector(document, vocabularyIndex, idf) {
+  const counts = new Map();
+  for (const term of document) counts.set(term, (counts.get(term) ?? 0) + 1);
+  const norm = Math.sqrt([...counts.values()].reduce((sum, count) => sum + count * count, 0)) || 1;
+  const vector = new Map();
+  for (const [term, count] of counts) {
+    const index = vocabularyIndex.get(term);
+    if (index !== undefined) vector.set(index, count / norm * idf[index]);
+  }
+  return vector;
 }
 
 function sigmoid(value) {
@@ -29,23 +43,25 @@ export function trainClassifier(trainingRecords) {
   if (labels.size !== 2) throw new TypeError('Training requires examples from both human and ai labels.');
   const documents = trainingRecords.map(record => tokens(prepareSubmission(record.title, record.body)));
   const vocabulary = [...new Set(documents.flat())].sort();
-  const idf = vocabulary.map(term => Math.log((1 + documents.length) / (1 + documents.filter(doc => doc.includes(term)).length)) + 1);
-  const vectors = documents.map(doc => {
-    const counts = new Map();
-    for (const term of doc) counts.set(term, (counts.get(term) ?? 0) + 1);
-    const norm = Math.sqrt([...counts.values()].reduce((sum, count) => sum + count * count, 0)) || 1;
-    return vocabulary.map((term, i) => ((counts.get(term) ?? 0) / norm) * idf[i]);
-  });
+  const vocabularyIndex = new Map(vocabulary.map((term, index) => [term, index]));
+  const documentFrequencies = new Uint32Array(vocabulary.length);
+  for (const document of documents) {
+    for (const term of new Set(document)) documentFrequencies[vocabularyIndex.get(term)]++;
+  }
+  const idf = vocabulary.map((_, index) => Math.log((1 + documents.length) / (1 + documentFrequencies[index])) + 1);
+  const vectors = documents.map(document => sparseVector(document, vocabularyIndex, idf));
   const weights = Array(vocabulary.length).fill(0);
   let bias = 0;
   for (let iteration = 0; iteration < ITERATIONS; iteration++) {
     const gradient = Array(vocabulary.length).fill(0);
     let biasGradient = 0;
     for (let row = 0; row < vectors.length; row++) {
-      const prediction = sigmoid(vectors[row].reduce((sum, value, i) => sum + value * weights[i], bias));
+      let logit = bias;
+      for (const [index, value] of vectors[row]) logit += value * weights[index];
+      const prediction = sigmoid(logit);
       const error = prediction - (trainingRecords[row].label === 'ai' ? 1 : 0);
       biasGradient += error;
-      for (let i = 0; i < gradient.length; i++) gradient[i] += error * vectors[row][i];
+      for (const [index, value] of vectors[row]) gradient[index] += error * value;
     }
     for (let i = 0; i < weights.length; i++) {
       weights[i] -= LEARNING_RATE * (gradient[i] / vectors.length + REGULARIZATION * weights[i]);
@@ -65,15 +81,12 @@ export function trainClassifier(trainingRecords) {
 }
 
 export function scoreClassifier(model, text) {
-  if (!model || model.algorithmVersion !== ALGORITHM_VERSION || !Array.isArray(model.vocabulary) || !Array.isArray(model.idf) || !Array.isArray(model.weights) || model.vocabulary.length !== model.idf.length || model.vocabulary.length !== model.weights.length) {
+  if (!model || ![1, ALGORITHM_VERSION].includes(model.algorithmVersion) || !Array.isArray(model.vocabulary) || !Array.isArray(model.idf) || !Array.isArray(model.weights) || model.vocabulary.length !== model.idf.length || model.vocabulary.length !== model.weights.length) {
     throw new TypeError('Classifier model is invalid or unsupported.');
   }
-  const counts = new Map();
-  for (const term of tokens(text)) counts.set(term, (counts.get(term) ?? 0) + 1);
-  const norm = Math.sqrt([...counts.values()].reduce((sum, count) => sum + count * count, 0)) || 1;
+  const vocabularyIndex = new Map(model.vocabulary.map((term, index) => [term, index]));
+  const vector = sparseVector(tokens(text, model.algorithmVersion), vocabularyIndex, model.idf);
   let logit = model.bias;
-  for (let i = 0; i < model.vocabulary.length; i++) {
-    logit += ((counts.get(model.vocabulary[i]) ?? 0) / norm) * model.idf[i] * model.weights[i];
-  }
+  for (const [index, value] of vector) logit += value * model.weights[index];
   return sigmoid(logit);
 }

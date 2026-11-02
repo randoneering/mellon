@@ -1,8 +1,9 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
+import { dirname } from 'node:path';
 import { parseSubmissionUrl, fetchSubmission } from '../src/personalized/github.mjs';
 import { loadDataset, addRecord, saveDataset, validateDataset } from '../src/personalized/dataset.mjs';
 import { splitDataset } from '../src/personalized/split.mjs';
@@ -11,6 +12,17 @@ import { createEvaluationMetadata, evaluateHoldout } from '../src/personalized/e
 import { scoreRequest } from '../detector/scorer.mjs';
 
 const LABELS = new Set(['human', 'ai', 'unsure']);
+
+function displayText(value) {
+  return value.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/gu, character => {
+    const code = character.codePointAt(0);
+    return code <= 0xff ? `\\x${code.toString(16).padStart(2, '0').toUpperCase()}` : `\\u${code.toString(16).padStart(4, '0').toUpperCase()}`;
+  });
+}
+
+async function ensurePrivateParent(path) {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+}
 const usage = 'Usage: personalized-detection.mjs collect --urls FILE --dataset FILE | train --dataset FILE --model FILE | evaluate --dataset FILE --model FILE --report FILE';
 
 function argumentsMap(args, command) {
@@ -57,7 +69,7 @@ export async function runCli(argv, dependencies = {}) {
       try { snapshot = await fetchSubmission(parsed, token, dependencies.fetchImpl ?? fetch); }
       catch { output(`Could not fetch ${parsed.canonicalUrl}; existing dataset preserved.`); continue; }
       const prompt = dependencies.prompt ?? interactivePrompt;
-      const answer = await prompt(`${parsed.canonicalUrl}\n${snapshot.title}\n${snapshot.body}\nLabel [human/ai/unsure]: `);
+      const answer = await prompt(displayText(`${parsed.canonicalUrl}\n${snapshot.title}\n${snapshot.body}\nLabel [human/ai/unsure]: `));
       const label = String(answer).trim().toLowerCase();
       if (!LABELS.has(label)) throw new Error('Label must be human, ai, or unsure.');
       const next = addRecord(records, { url: parsed.canonicalUrl, ...snapshot, label });
@@ -82,6 +94,7 @@ export async function runCli(argv, dependencies = {}) {
       exclusions: split.exclusions,
       warnings: split.warnings,
     };
+    await ensurePrivateParent(values.get('--model'));
     await writeFile(values.get('--model'), `${JSON.stringify(model, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
     output(`Model saved to ${values.get('--model')}. Training: ${split.training.length}; holdout: ${split.holdout.length}.`);
     return;
@@ -98,6 +111,7 @@ export async function runCli(argv, dependencies = {}) {
   if (!holdout.length) throw new Error('Recorded holdout is empty.');
   const baselineScore = dependencies.baselineScore ?? (async text => scoreRequest({ protocol_version: 1, text }));
   const report = await evaluateHoldout(model, holdout, baselineScore);
+  await ensurePrivateParent(values.get('--report'));
   await writeFile(values.get('--report'), `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
   output(`Evaluation report saved to ${values.get('--report')}.`);
 }
