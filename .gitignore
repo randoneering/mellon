@@ -1,6 +1,4 @@
 .pi
-openspec
-/AGENTS.md
 node_modules/
 detector/node_modules/
 coverage.out
