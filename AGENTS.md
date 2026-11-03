@@ -27,7 +27,8 @@ After building, check that generated `dist/` changes are included when needed.
 ## Project rules
 
 1. **Keep fork code out of moderation workflows.** In workflows using `pull_request_target`, never check out or run pull request code, and grant only the permissions needed for moderation.
-   Pin third-party GitHub Actions in workflows and examples to full commit SHAs.
+   Pin third-party GitHub Actions in committed workflows and runnable examples to full commit SHAs.
+   Templates may use explicit placeholders that instruct consumers to select reviewed full commit SHAs.
    The workflow runs with base-repository trust and may receive submissions from forks.
 2. **Keep moderation claims measured.** In messages, documentation, and moderation behavior, treat the classifier score as a fallible signal, not proof of AI authorship.
    The model was trained on code comments and has not been calibrated for issues or pull requests.
@@ -41,27 +42,19 @@ After building, check that generated `dist/` changes are included when needed.
 5. **Keep secrets and private text out of output.** In Action outputs, errors, logs, and CLI messages, never expose tokens, API response details, or scorer exception messages.
    Keep personalized datasets, models, and reports local, and never commit them.
    These may include credentials or private submission text.
-6. **Keep the Action self-contained and generated.** For Action code, `dist/`, and `detector/scorer.mjs`, do not install packages, use `node_modules`, or download models at runtime; use only fixed GitHub API resources.
+6. **Keep the Action self-contained and generated.** The packaged Action and scorer in `dist/` must not install packages, depend on `node_modules`, or download models at runtime; use only fixed GitHub API resources.
+   The source `detector/scorer.mjs` may use lockfile-installed dependencies; the build bundles them into the release scorer.
    After changing Action code or bundled detector assets, run `npm run build` and commit resulting `dist/` changes; do not edit `dist/` by hand.
    Personalized detection experiments must not change Action behavior or its fixed 0.80 cutoff.
    `action.yml` runs the bundled entry point, CI checks the generated output, and runtime downloads would make releases harder to review.
 7. **Keep detector assets traceable.** When changing detector or model assets, keep provenance and third-party notices aligned, and run `npm run verify:assets` and `npm run test:parity`.
    These checks protect asset integrity and detector parity.
 
-## Orchestration
-
-- Use Terra as the orchestrator for project work.
-- Delegate suitable research, implementation, and review work to subagents.
-- Try these models in order for each delegated task:
-  1. `neon/gpt-6-luna`
-  2. `neon/glm-5-3-flash`
-  3. `openai-codex/gpt-6-luna`
-- Move to the next model when the previous model is unavailable or fails.
-- Report failures and preserve any partial work before retrying.
-- If all three models fail, stop and ask the user how to proceed.
-- The orchestrator owns decisions, integration, and final verification.
-
 ## Specifications
 
-- Use OpenSpec for feature proposals, requirements, and designs.
-- Keep implementation aligned with the approved OpenSpec change.
+- OpenSpec files live in a local `openspec/` folder at the repository root.
+  The folder is in `.gitignore` because it can contain sensitive information; never commit it or copy its contents into tracked files.
+- When `openspec/` exists, use it for feature proposals, requirements, and designs, and follow `openspec/implementation-guidance.md`.
+- Run `openspec list` to find changes, and keep implementation aligned with the change the user selects.
+- When `openspec/` is missing, ask the user whether one exists elsewhere.
+  If they say no, skip OpenSpec and work from the user's request.
