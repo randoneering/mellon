@@ -75,6 +75,18 @@ The label is visible to anyone who can see the issue or PR.
 Observation mode does not comment or close submissions.
 Existing labels keep their color and description.
 
+For a manual review workflow, maintainers can use these optional labels:
+
+| Label | Meaning |
+| --- | --- |
+| `mellon: review` | Waiting for maintainer review. |
+| `mellon: checked` | Reviewed; no follow-up needed. |
+| `mellon: follow-up` | Reviewed; clarification or more detail needed. |
+
+After review, remove `mellon: review` and apply the appropriate outcome label.
+Maintainers create and apply the outcome labels themselves.
+Labels are public, so use them to describe next steps rather than assert authorship.
+
 Enforcement mode posts the response and then closes a flagged submission.
 mellon appends the score and detector details to the response.
 An empty `response` uses the packaged message.
