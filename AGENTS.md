@@ -39,7 +39,8 @@ After building, check that generated `dist/` changes are included when needed.
    Reconcile uncertain GitHub writes, and never blindly repost comments or close submissions.
    Update boundary tests when behavior changes.
    Network failures can leave GitHub writes uncertain, and retries must not create duplicate comments or unintended closures.
-5. **Keep secrets and private text out of output.** In Action outputs, errors, logs, and CLI messages, never expose tokens, API response details, or scorer exception messages.
+5. **Keep secrets and private text out of shared output.** In Action outputs, errors, logs, and CLI status messages, never expose tokens, API response details, scorer exception messages, or submission text.
+   The local `collect` labeling prompt may show escaped titles and descriptions, since the person labeling needs to read them.
    Keep personalized datasets, models, and reports local, and never commit them.
    These may include credentials or private submission text.
 6. **Keep the Action self-contained and generated.** The packaged Action and scorer in `dist/` must not install packages, depend on `node_modules`, or download models at runtime; use only fixed GitHub API resources.
