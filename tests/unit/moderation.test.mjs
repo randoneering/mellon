@@ -130,7 +130,22 @@ test('reuses genuine matching response only in response-only mode', async () => 
   const outcome = await moderate({ getContext, getInputs: responseOnlyInputs, api: fixture.api, score: fixture.score });
   assert.equal(outcome.outcome, 'commented');
   assert.equal(outcome.comment_id, 3);
-  assert.deepEqual(fixture.calls, ['comments', 'state', 'state']);
+  assert.deepEqual(fixture.calls, ['comments', 'state']);
+});
+
+test('response-only rerun retains confirmed response when state read fails', async () => {
+  const fixture = setup(0.8, { comments: [{ id: 3, body: marker, user: { login: 'github-actions[bot]', type: 'Bot' } }] });
+  fixture.api.getItem = async () => { fixture.calls.push('state'); throw new Error('private API detail'); };
+  const outcome = await moderate({ getContext, getInputs: responseOnlyInputs, api: fixture.api, score: fixture.score });
+  assert.equal(outcome.outcome, 'error');
+  assert.equal(outcome.partial, true);
+  assert.equal(outcome.comment_id, 3);
+  assert.equal(outcome.score, 0.8);
+  assert.equal(outcome.detector_revision, revision);
+  assert.equal(outcome.model_sha256, hash);
+  assert.equal(outcome.input_sha256, inputHash);
+  assert.equal(JSON.stringify(outcome).includes('private API detail'), false);
+  assert.deepEqual(fixture.calls, ['comments', 'state']);
 });
 
 test('spoofed matching markers from contributors never count as genuine response', async () => {

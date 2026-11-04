@@ -13021,17 +13021,8 @@ async function moderate({ getContext, getInputs, api, score, prepare = prepareSu
       let comments = await api.listComments(context);
       let existing = comments.find((comment) => genuine(comment, marker));
       let posted = Boolean(existing);
-      if (policy.autoClose === false) {
-        if (!await currentMatches(api, context)) return {
-          outcome: "skipped",
-          reason: "stale_before_comment",
-          cutoff: CUTOFF,
-          score: classified.robot_score,
-          partial: false
-        };
-      }
       if (!existing) {
-        if (policy.autoClose !== false && !await currentMatches(api, context)) return { outcome: "skipped", reason: "stale_before_comment", cutoff: CUTOFF, score: classified.robot_score, partial: false };
+        if (!await currentMatches(api, context)) return { outcome: "skipped", reason: "stale_before_comment", cutoff: CUTOFF, score: classified.robot_score, partial: false };
         const body = `${policy.response}
 
 Automated score: ${classified.robot_score} (cutoff ${CUTOFF}). Detector: ${classified.detector_revision}. Model SHA-256: ${classified.model_sha256}.
