@@ -79,10 +79,13 @@ export function parsePolicy(inputs = {}) {
   const autoClose = inputs.autoClose === undefined || inputs.autoClose === ''
     ? true
     : inputs.autoClose === 'true' ? true : inputs.autoClose === 'false' ? false : null;
+  const reviewLabel = inputs.reviewLabel === undefined || inputs.reviewLabel === ''
+    ? true
+    : inputs.reviewLabel === 'true' ? true : inputs.reviewLabel === 'false' ? false : null;
   if (typeof response !== 'string' || !validText(response) || Buffer.byteLength(response, 'utf8') > RESPONSE_LIMIT ||
-      mode !== 'enforce' && mode !== 'observe' || autoClose === null) throw invalidInput();
-  if (Object.keys(inputs).some((key) => !['allowlist', 'response', 'mode', 'autoClose'].includes(key))) throw invalidInput();
-  return { allowlist, response, cutoff: 0.8, mode, autoClose };
+      mode !== 'enforce' && mode !== 'observe' || autoClose === null || reviewLabel === null) throw invalidInput();
+  if (Object.keys(inputs).some((key) => !['allowlist', 'response', 'mode', 'autoClose', 'reviewLabel'].includes(key))) throw invalidInput();
+  return { allowlist, response, cutoff: 0.8, mode, autoClose, reviewLabel };
 }
 
 export function createEligibleContinuation({ getContext, getInputs }) {

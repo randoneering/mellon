@@ -37,28 +37,22 @@ test('GitHub client supports fixed review-label lookup, create, and application 
     ['POST', '/repos/o/r/labels'],
     ['POST', '/repos/o/r/issues/4/labels'],
   ]);
-  assert.deepEqual(JSON.parse(calls[1].options.body), { name: 'mellon: review', color: 'fbca04', description: 'Flagged by Mellon observation mode.' });
+  assert.deepEqual(JSON.parse(calls[1].options.body), { name: 'mellon: review', color: 'fbca04', description: 'Flagged by Mellon for maintainer review.' });
   assert.deepEqual(JSON.parse(calls[2].options.body), { labels: ['mellon: review'] });
 });
 
-test('label creation 422 race is reconciled, while unrelated failures remain errors', async () => {
+test('label write errors expose only status for safe caller reconciliation', async () => {
   const calls = [];
-  let labelAvailable = false;
   const client = createGitHubClient({ token: 'token', fetchImpl: async (url, options) => {
-    const pathname = new URL(url).pathname;
-    calls.push([options.method, pathname]);
-    if (options.method === 'POST' && pathname === '/repos/o/r/labels') {
-      return new Response(JSON.stringify({ message: 'Validation Failed' }), { status: 422 });
-    }
-    if (pathname.includes('/labels/mellon%3A%20review')) {
-      labelAvailable = true;
-      return new Response(JSON.stringify({ name: 'mellon: review' }), { status: 200 });
-    }
-    return new Response('private failure', { status: 500 });
+    calls.push(options.method);
+    return new Response('private failure detail', { status: 503 });
   } });
-  await client.createReviewLabel({ repository: 'o/r' });
-  assert.equal(labelAvailable, true);
-  assert.deepEqual(calls, [['POST', '/repos/o/r/labels'], ['GET', '/repos/o/r/labels/mellon%3A%20review']]);
+  await assert.rejects(client.createReviewLabel({ repository: 'o/r' }), error => {
+    assert.equal(error.status, 503);
+    assert.equal(error.message.includes('private failure detail'), false);
+    return true;
+  });
+  assert.deepEqual(calls, ['POST']);
   const unavailable = createGitHubClient({ token: 'token', fetchImpl: async () => new Response('private failure', { status: 500 }) });
   await assert.rejects(unavailable.getReviewLabel({ repository: 'o/r' }), /failed safely/);
 });
@@ -127,6 +121,23 @@ test('GitHub comment pagination is same-origin and includes every page', async (
   const comments = await client.listComments({ repository: 'o/r', number: 4 });
   assert.deepEqual(comments.map((comment) => comment.id), [1, 2]);
   assert.equal(urls.length, 2);
+});
+
+test('label application does not retry or reconcile outside moderation state checks', async () => {
+  let calls = 0;
+  const client = createGitHubClient({ token: 'token', fetchImpl: async () => {
+    calls++;
+    return new Response(null, { status: 503 });
+  } });
+  await assert.rejects(client.addLabel({ repository: 'o/r', number: 4 }), error => error.status === 503);
+  assert.equal(calls, 1);
+});
+
+
+
+test('GitHub client rejects malformed label arrays during reconciliation', async () => {
+  const client = createGitHubClient({ token: 'token', fetchImpl: async () => new Response('[{"name":3}]', { status: 200 }) });
+  await assert.rejects(client.getItemLabels({ repository: 'o/r', number: 4 }), /failed safely/);
 });
 
 test('GitHub client rejects cross-origin pagination before issuing another request', async () => {

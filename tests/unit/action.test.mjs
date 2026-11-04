@@ -133,12 +133,36 @@ test('observe mode validates before inference and reports safe flagged output an
   assert.equal(result.robotScore, 0.8);
   assert.deepEqual(requests.map(([method, pathname]) => [method, pathname]), [
     ['GET', '/repos/owner/repo/issues/7'], ['GET', '/repos/owner/repo/labels/mellon%3A%20review'],
-    ['POST', '/repos/owner/repo/labels'], ['GET', '/repos/owner/repo/issues/7'],
+    ['GET', '/repos/owner/repo/issues/7'], ['POST', '/repos/owner/repo/labels'], ['GET', '/repos/owner/repo/issues/7'],
     ['POST', '/repos/owner/repo/issues/7/labels'],
   ]);
   assert.equal(requests.some(([method, pathname]) => method === 'PATCH' || method === 'POST' && pathname.endsWith('/comments')), false);
   assert.equal(await readFile(outputPath, 'utf8'), 'outcome=flagged\nrobot-score=0.8\n');
   assert.match(await readFile(summaryPath, 'utf8'), /Flagged for review/);
+  assert.match(await readFile(summaryPath, 'utf8'), /Label: mellon: review/);
+});
+
+test('observe mode with labeling disabled makes no GitHub calls or label claim in summary', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'mellon-observe-no-label-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const eventPath = path.join(directory, 'event.json');
+  const outputPath = path.join(directory, 'output');
+  const summaryPath = path.join(directory, 'summary');
+  await writeFile(eventPath, JSON.stringify(event));
+  let calls = 0;
+  const result = await runAction({ env: { GITHUB_EVENT_NAME: 'issues', GITHUB_REPOSITORY: 'owner/repo',
+    GITHUB_EVENT_PATH: eventPath, GITHUB_OUTPUT: outputPath, GITHUB_STEP_SUMMARY: summaryPath },
+    getuid: () => 1000, getInput: name => ({ token: 'token', mode: 'observe', 'review-label': 'false' })[name] ?? '',
+    score: async () => ({ protocol_version: 1, outcome: 'classified', robot_score: 0.8,
+      detector_revision: 'c'.repeat(40), model_sha256: 'a'.repeat(64), input_sha256: 'b'.repeat(64) }),
+    fetchImpl: async () => { calls++; throw new Error('unexpected GitHub request'); } });
+  assert.equal(result.outcome, 'flagged');
+  assert.equal(result.robotScore, 0.8);
+  assert.equal(calls, 0);
+  assert.equal(await readFile(outputPath, 'utf8'), 'outcome=flagged\nrobot-score=0.8\n');
+  const summary = await readFile(summaryPath, 'utf8');
+  assert.match(summary, /Flagged for review/);
+  assert.doesNotMatch(summary, /Label: mellon: review/);
 });
 
 test('observation label API failures report safe error without leaking API details', async (t) => {
@@ -169,7 +193,7 @@ test('commented outcomes publish validated score output and remain successful', 
     env: { GITHUB_EVENT_NAME: 'issues', GITHUB_REPOSITORY: 'owner/repo',
       GITHUB_EVENT_PATH: eventPath, GITHUB_OUTPUT: outputPath },
     getuid: () => 1000,
-    getInput: name => ({ token: 'test-token', 'auto-close': 'false' })[name] ?? '',
+    getInput: name => ({ token: 'test-token', 'auto-close': 'false', 'review-label': 'false' })[name] ?? '',
     score: async () => ({ protocol_version: 1, outcome: 'classified', robot_score: 0.9,
       detector_revision: 'c'.repeat(40), model_sha256: 'a'.repeat(64), input_sha256: 'b'.repeat(64) }),
     fetchImpl: async (url, options) => {
