@@ -97,6 +97,21 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
         detector_revision: classified.detector_revision, model_sha256: classified.model_sha256,
         input_sha256: classified.input_sha256,
       };
+      if (!policy.autoClose) {
+        try {
+          if (!await currentMatches(api, context)) return {
+            outcome: 'skipped', reason: 'stale_after_comment', cutoff: CUTOFF,
+            score: classified.robot_score, comment_id: existing.id, partial: posted,
+          };
+        } catch {
+          return safeFailure('Response is confirmed, but current state could not be checked.', partial);
+        }
+        return {
+          outcome: 'commented', cutoff: CUTOFF, score: classified.robot_score,
+          detector_revision: classified.detector_revision, model_sha256: classified.model_sha256,
+          input_sha256: classified.input_sha256, comment_id: existing.id, partial: false,
+        };
+      }
       try {
         if (!await currentMatches(api, context)) return {
           outcome: 'skipped', reason: 'stale_before_close', cutoff: CUTOFF,

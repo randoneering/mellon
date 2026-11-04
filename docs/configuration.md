@@ -32,7 +32,7 @@ The supported events are only `issues.opened` and `pull_request_target.opened`. 
 
 ## Inputs
 
-Metadata exposes `token`, `allowlist`, `response`, and `mode`; it reports safe `outcome` and optional finite `robot-score` outputs. The cutoff is intentionally not an input.
+Metadata exposes `token`, `allowlist`, `response`, `mode`, and `auto-close`; it reports safe `outcome` and optional finite `robot-score` outputs. The cutoff is intentionally not an input.
 
 | Input | Default | Validation and use |
 |---|---|---|
@@ -40,10 +40,13 @@ Metadata exposes `token`, `allowlist`, `response`, and `mode`; it reports safe `
 | `allowlist` | Empty JSON array `[]` | JSON array of exact account logins. Case-insensitive equality only, including explicitly named bot accounts; no wildcards or implicit role exemptions. |
 | `response` | Packaged human-voice message | Literal, nonempty UTF-8 text, at most 32 KiB. No interpolation or template evaluation. Used only in enforce mode. |
 | `mode` | `enforce` | Exact value `enforce` or `observe`. The input is trusted Action configuration, never submission content. |
+| `auto-close` | `'true'` | Exact string `'true'` or `'false'`. In `enforce`, `'false'` posts the response without closing the item; observe mode does not comment or close either way. |
 
-For GitHub Actions, an empty allowlist input uses the default empty list, and an empty response input uses the packaged response. Malformed nonempty policy values fail before inference or writes. Do not supply a cutoff, API host, model path, executable path, or configuration-file input. The cutoff remains fixed at inclusive unrounded `0.80`. `enforce` preserves the default comment-and-close behavior. `observe` applies only the fixed `mellon: review` label at or above cutoff, with no comment or closure. The label can be publicly visible; Mellon creates it on demand when absent. Existing labels are reused without changing their name or color. The Action does not scan or alter past items. Submission text, workspace files, and `.mellon.json` cannot set policy.
+For GitHub Actions, an empty allowlist input uses the default empty list, and an empty response input uses the packaged response. Malformed nonempty policy values fail before inference or writes. Do not supply a cutoff, API host, model path, executable path, or configuration-file input. The cutoff remains fixed at inclusive unrounded `0.80`. `enforce` preserves the default response-and-close behavior. Setting `auto-close: 'false'` keeps the response but skips closure; a confirmed response-only result has outcome `commented`. `observe` applies only the fixed `mellon: review` label at or above cutoff, with no comment or closure regardless of `auto-close`. The label can be publicly visible; Mellon creates it on demand when absent. Existing labels are reused without changing their name or color. The Action does not scan or alter past items. Submission text, workspace files, and `.mellon.json` cannot set policy.
 
 The default response welcomes AI-assisted code while asking contributors to describe the work in their own words, explains that automated classification can be mistaken, and points contributors to maintainers. The score is not proof of authorship, understanding, or contribution quality. Issue and PR calibration is unvalidated; the cutoff is a repository policy threshold, not a calibrated authorship probability. Historical dataset evaluation and calibration remain separate follow-up work.
+
+Changing `auto-close` only affects a later run. Setting it to `'false'` does not reopen items already closed. Setting it to `'true'` can close an eligible open item after Mellon reuses its matching bot response. Mellon does not duplicate a confirmed matching response on reruns.
 
 ## Permissions and trust
 

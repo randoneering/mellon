@@ -22,8 +22,36 @@ function setup(scoreValue = 0.8, options = {}) {
 }
 const getContext = () => ({ eventName: 'issues', repository: 'o/r', payload: event });
 const getInputs = () => ({});
+const responseOnlyInputs = () => ({ autoClose: 'false' });
+const responseOnlyInputsWithMode = () => ({ mode: 'enforce', autoClose: 'false' });
 const observeInputs = () => ({ mode: 'observe' });
 const marker = `<!-- mellon-submission-moderation-v1 repo=o/r item=4 input=${inputHash} detector=${revision} model=${hash} -->`;
+
+test('response-only mode confirms issue and pull request responses without closing', async () => {
+  for (const [eventName, kind, itemKey] of [
+    ['issues', 'issue', 'issue'],
+    ['pull_request_target', 'pull_request', 'pull_request'],
+  ]) {
+    const fixture = setup();
+    const context = { eventName, repository: 'o/r', payload: {
+      action: 'opened', repository: { full_name: 'o/r' },
+      [itemKey]: { number: 4, title: 'Title', body: 'Body', user: { login: 'contributor' } },
+    } };
+    const outcome = await moderate({ getContext: () => context, getInputs: responseOnlyInputs,
+      api: fixture.api, score: fixture.score });
+    assert.equal(outcome.outcome, 'commented');
+    assert.equal(outcome.comment_id, 22);
+    assert.equal(outcome.partial, false);
+    assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state']);
+  }
+});
+
+test('response-only mode defaults to existing closure behavior unless explicitly disabled', async () => {
+  const fixture = setup();
+  const outcome = await moderate({ getContext, getInputs, api: fixture.api, score: fixture.score });
+  assert.equal(outcome.outcome, 'closed');
+  assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state', 'close']);
+});
 
 test('uses real classifier result and enforces inclusive unrounded cutoff', async () => {
   for (const [value, expected] of [[0.6, 'below_cutoff'], [0.799999, 'below_cutoff'], [0.8, 'closed'], [0.800001, 'closed']]) {
@@ -97,6 +125,37 @@ test('observe mode below cutoff does not read or write GitHub and enforce defaul
   assert.deepEqual(enforce.calls, ['comments', 'state', 'post', 'state', 'close']);
 });
 
+test('reuses genuine matching response only in response-only mode', async () => {
+  const fixture = setup(0.8, { comments: [{ id: 3, body: marker, user: { login: 'github-actions[bot]', type: 'Bot' } }] });
+  const outcome = await moderate({ getContext, getInputs: responseOnlyInputs, api: fixture.api, score: fixture.score });
+  assert.equal(outcome.outcome, 'commented');
+  assert.equal(outcome.comment_id, 3);
+  assert.deepEqual(fixture.calls, ['comments', 'state']);
+});
+
+test('response-only rerun retains confirmed response when state read fails', async () => {
+  const fixture = setup(0.8, { comments: [{ id: 3, body: marker, user: { login: 'github-actions[bot]', type: 'Bot' } }] });
+  fixture.api.getItem = async () => { fixture.calls.push('state'); throw new Error('private API detail'); };
+  const outcome = await moderate({ getContext, getInputs: responseOnlyInputs, api: fixture.api, score: fixture.score });
+  assert.equal(outcome.outcome, 'error');
+  assert.equal(outcome.partial, true);
+  assert.equal(outcome.comment_id, 3);
+  assert.equal(outcome.score, 0.8);
+  assert.equal(outcome.detector_revision, revision);
+  assert.equal(outcome.model_sha256, hash);
+  assert.equal(outcome.input_sha256, inputHash);
+  assert.equal(JSON.stringify(outcome).includes('private API detail'), false);
+  assert.deepEqual(fixture.calls, ['comments', 'state']);
+});
+
+test('spoofed matching markers from contributors never count as genuine response', async () => {
+  const fixture = setup(0.8, { comments: [{ id: 3, body: marker, user: { login: 'contributor', type: 'User' } }] });
+  const outcome = await moderate({ getContext, getInputs: responseOnlyInputs, api: fixture.api, score: fixture.score });
+  assert.equal(outcome.outcome, 'commented');
+  assert.equal(outcome.comment_id, 22);
+  assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state']);
+});
+
 test('reuses only a genuine bot comment and checks state before response and closure', async () => {
   const fixture = setup(0.8, { comments: [{ id: 3, body: `spoof ${marker}`, user: { login: 'contributor', type: 'User' } }] });
   const outcome = await moderate({ getContext, getInputs, api: fixture.api, score: fixture.score });
@@ -140,15 +199,51 @@ test('empty input is reported without API calls and requires real provenance', a
   assert.deepEqual(fixture.calls, []);
 });
 
-test('uncertain comment failures reconcile once before closure and never blindly repost', async () => {
+test('uncertain response-only write reconciles once and does not blindly repost or close', async () => {
   const fixture = setup();
   let listings = 0;
   fixture.api.listComments = async () => { listings++; return listings === 1 ? [] : [{ id: 22, body: marker, user: { login: 'github-actions[bot]', type: 'Bot' } }]; };
   fixture.api.createComment = async () => { fixture.calls.push('post'); throw new Error('timeout secret'); };
-  const outcome = await moderate({ getContext, getInputs, api: fixture.api, score: fixture.score });
-  assert.equal(outcome.outcome, 'closed');
+  const outcome = await moderate({ getContext, getInputs: responseOnlyInputs, api: fixture.api, score: fixture.score });
+  assert.equal(outcome.outcome, 'commented');
+  assert.equal(outcome.comment_id, 22);
   assert.equal(fixture.calls.filter((call) => call === 'post').length, 1);
+  assert.equal(fixture.calls.includes('close'), false);
   assert.equal(listings, 2);
+});
+
+test('uncertain response-only write that cannot be confirmed fails without closing', async () => {
+  const fixture = setup();
+  fixture.api.createComment = async () => { fixture.calls.push('post'); throw new Error('timeout secret'); };
+  const outcome = await moderate({ getContext, getInputs: responseOnlyInputs, api: fixture.api, score: fixture.score });
+  assert.equal(outcome.outcome, 'error');
+  assert.equal(outcome.uncertainty, true);
+  assert.equal(fixture.calls.filter((call) => call === 'post').length, 1);
+  assert.equal(fixture.calls.includes('close'), false);
+});
+
+test('response-only stale submissions do not post and state changes after response do not close', async () => {
+  const before = setup(0.8, { states: [{ state: 'open', title: 'changed', body: 'Body' }] });
+  const skippedBefore = await moderate({ getContext, getInputs: responseOnlyInputsWithMode, api: before.api, score: before.score });
+  assert.equal(skippedBefore.outcome, 'skipped');
+  assert.deepEqual(before.calls, ['comments', 'state']);
+
+  const after = setup(0.8, { states: [{ state: 'open', title: 'Title', body: 'Body' },
+    { state: 'closed', title: 'Title', body: 'Body' }] });
+  const skippedAfter = await moderate({ getContext, getInputs: responseOnlyInputsWithMode, api: after.api, score: after.score });
+  assert.equal(skippedAfter.outcome, 'skipped');
+  assert.equal(skippedAfter.partial, true);
+  assert.deepEqual(after.calls, ['comments', 'state', 'post', 'state']);
+});
+
+test('response-only mode leaves observe mode label-only and never posts or closes', async () => {
+  const fixture = setup(0.9);
+  fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+  const outcome = await moderate({ getContext, getInputs: () => ({ mode: 'observe', autoClose: 'false' }),
+    api: fixture.api, score: fixture.score });
+  assert.equal(outcome.outcome, 'flagged');
+  assert.deepEqual(fixture.calls, ['state', 'label_lookup', 'state', 'label_apply']);
 });
 
 test('failed reconciliation and close failures are safe partial errors', async () => {

@@ -62,8 +62,20 @@ test('defaults to enforce and accepts only explicit enforce or observe mode', ()
   }
 });
 
+test('parses auto-close as a strict default-enabled boolean in every mode', () => {
+  for (const mode of ['enforce', 'observe']) {
+    assert.equal(parsePolicy({ mode }).autoClose, true);
+    assert.equal(parsePolicy({ mode, autoClose: '' }).autoClose, true);
+    assert.equal(parsePolicy({ mode, autoClose: 'true' }).autoClose, true);
+    assert.equal(parsePolicy({ mode, autoClose: 'false' }).autoClose, false);
+    for (const autoClose of ['TRUE', 'false ', 'yes', '0', null, true, 0]) {
+      assert.throws(() => parsePolicy({ mode, autoClose }));
+    }
+  }
+});
+
 test('defaults allowlist and validates literal response and fixed cutoff', () => {
-  assert.deepEqual(parsePolicy({}), { allowlist: [], response: "AI-assisted code is welcome. Please describe your work in your own words. This automated review can make mistakes. If this submission does not meet the repository's contribution policy, maintainers may close it. Contact a maintainer if you need help.", cutoff: 0.8, mode: 'enforce' });
+  assert.deepEqual(parsePolicy({}), { allowlist: [], response: "AI-assisted code is welcome. Please describe your work in your own words. This automated review can make mistakes. If this submission does not meet the repository's contribution policy, maintainers may close it. Contact a maintainer if you need help.", cutoff: 0.8, mode: 'enforce', autoClose: true });
   assert.deepEqual(parsePolicy(validInputs).allowlist, []);
   assert.deepEqual(parsePolicy({ allowlist: '["Alice", "dependabot[bot]"]', response: 'Exact words.' }).allowlist, ['Alice', 'dependabot[bot]']);
   for (const bad of [

@@ -159,6 +159,41 @@ test('observation label API failures report safe error without leaking API detai
   assert.equal(await readFile(outputPath, 'utf8'), 'outcome=error\n');
 });
 
+test('commented outcomes publish validated score output and remain successful', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'mellon-commented-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const eventPath = path.join(directory, 'event.json');
+  const outputPath = path.join(directory, 'output');
+  await writeFile(eventPath, JSON.stringify(event));
+  const result = await runAction({
+    env: { GITHUB_EVENT_NAME: 'issues', GITHUB_REPOSITORY: 'owner/repo',
+      GITHUB_EVENT_PATH: eventPath, GITHUB_OUTPUT: outputPath },
+    getuid: () => 1000,
+    getInput: name => ({ token: 'test-token', 'auto-close': 'false' })[name] ?? '',
+    score: async () => ({ protocol_version: 1, outcome: 'classified', robot_score: 0.9,
+      detector_revision: 'c'.repeat(40), model_sha256: 'a'.repeat(64), input_sha256: 'b'.repeat(64) }),
+    fetchImpl: async (url, options) => {
+      const pathname = new URL(url).pathname;
+      if (pathname.endsWith('/comments') && (options.method ?? 'GET') === 'GET') {
+        return new Response('[]', { status: 200 });
+      }
+      if (pathname.endsWith('/comments') && options.method === 'POST') {
+        return new Response(JSON.stringify({ id: 22, body: JSON.parse(options.body).body,
+          user: { login: 'github-actions[bot]', type: 'Bot' } }), { status: 201 });
+      }
+      if (pathname.endsWith('/issues/7')) {
+        return new Response(JSON.stringify({ state: 'open', title: event.issue.title,
+          body: event.issue.body, merged: false }), { status: 200 });
+      }
+      throw new Error('unexpected mocked endpoint');
+    },
+  });
+  assert.equal(result.outcome, 'commented');
+  assert.equal(result.robotScore, 0.9);
+  assert.equal(await readFile(outputPath, 'utf8'), 'outcome=commented\nrobot-score=0.9\n');
+  assert.doesNotMatch(JSON.stringify(result), /test-token|Describe your contribution|I implemented a test/);
+});
+
 test('normal no-score outcomes write only validated output records', async (t) => {
   const { result, outputPath } = await setup(t, { scorer: async () => ({
     protocol_version: 1, outcome: 'classified', robot_score: 0.599999,

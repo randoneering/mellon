@@ -6,7 +6,7 @@ import { createGitHubClient } from './github.mjs';
 import { moderate } from './moderation.mjs';
 
 const EVENT_LIMIT = 4 * 1024 * 1024;
-const OUTCOMES = new Set(['skipped', 'empty_input', 'below_cutoff', 'closed', 'flagged', 'error']);
+const OUTCOMES = new Set(['skipped', 'empty_input', 'below_cutoff', 'closed', 'commented', 'flagged', 'error']);
 const ACTION_DIRECTORY = fileURLToPath(new URL('./', import.meta.url));
 const ASSET_DIGESTS = new Map([
   ['preprocess.mjs', '14c86ef36a82cf603ef8120e5c4cc96a30ec0427650ca42ff20d3eb1217db984'],
@@ -167,10 +167,12 @@ export async function runAction({
         const allowlist = typeof getInput === 'function' ? getInput('allowlist') : '';
         const response = typeof getInput === 'function' ? getInput('response') : '';
         const mode = typeof getInput === 'function' ? getInput('mode') : '';
+        const autoClose = typeof getInput === 'function' ? getInput('auto-close') : '';
         return {
           ...(allowlist === '' ? {} : { allowlist }),
           ...(response === '' ? {} : { response }),
           ...(mode === '' ? {} : { mode }),
+          ...(autoClose === '' ? {} : { autoClose }),
         };
       };
       let api;
@@ -222,6 +224,7 @@ async function writeSummary(filename, result) {
   const labels = {
     skipped: 'Skipped', empty_input: 'No prose to classify',
     below_cutoff: 'Below moderation cutoff', closed: 'Closed after confirmed response',
+    commented: 'Response posted; submission remains open',
     flagged: 'Flagged for review', error: 'Operational error',
   };
   const score = result.robotScore === undefined ? '' : `\n\nRobot score: ${result.robotScore}.`;

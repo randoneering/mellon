@@ -7791,9 +7791,10 @@ function parsePolicy(inputs = {}) {
   if (!Array.isArray(allowlist) || allowlist.some((account) => typeof account !== "string" || !ACCOUNT_PATTERN.test(account))) throw invalidInput();
   const response = inputs.response === void 0 ? DEFAULT_RESPONSE : inputs.response;
   const mode = inputs.mode === void 0 ? "enforce" : inputs.mode;
-  if (typeof response !== "string" || !validText(response) || Buffer.byteLength(response, "utf8") > RESPONSE_LIMIT || mode !== "enforce" && mode !== "observe") throw invalidInput();
-  if (Object.keys(inputs).some((key) => !["allowlist", "response", "mode"].includes(key))) throw invalidInput();
-  return { allowlist, response, cutoff: 0.8, mode };
+  const autoClose = inputs.autoClose === void 0 || inputs.autoClose === "" ? true : inputs.autoClose === "true" ? true : inputs.autoClose === "false" ? false : null;
+  if (typeof response !== "string" || !validText(response) || Buffer.byteLength(response, "utf8") > RESPONSE_LIMIT || mode !== "enforce" && mode !== "observe" || autoClose === null) throw invalidInput();
+  if (Object.keys(inputs).some((key) => !["allowlist", "response", "mode", "autoClose"].includes(key))) throw invalidInput();
+  return { allowlist, response, cutoff: 0.8, mode, autoClose };
 }
 function createEligibleContinuation({ getContext, getInputs }) {
   return async function run(continueEligible) {
@@ -13051,6 +13052,30 @@ ${marker}`;
         model_sha256: classified.model_sha256,
         input_sha256: classified.input_sha256
       };
+      if (!policy.autoClose) {
+        try {
+          if (!await currentMatches(api, context)) return {
+            outcome: "skipped",
+            reason: "stale_after_comment",
+            cutoff: CUTOFF,
+            score: classified.robot_score,
+            comment_id: existing.id,
+            partial: posted
+          };
+        } catch {
+          return safeFailure("Response is confirmed, but current state could not be checked.", partial);
+        }
+        return {
+          outcome: "commented",
+          cutoff: CUTOFF,
+          score: classified.robot_score,
+          detector_revision: classified.detector_revision,
+          model_sha256: classified.model_sha256,
+          input_sha256: classified.input_sha256,
+          comment_id: existing.id,
+          partial: false
+        };
+      }
       try {
         if (!await currentMatches(api, context)) return {
           outcome: "skipped",
@@ -13086,7 +13111,7 @@ ${marker}`;
 
 // src/action.mjs
 var EVENT_LIMIT2 = 4 * 1024 * 1024;
-var OUTCOMES = /* @__PURE__ */ new Set(["skipped", "empty_input", "below_cutoff", "closed", "flagged", "error"]);
+var OUTCOMES = /* @__PURE__ */ new Set(["skipped", "empty_input", "below_cutoff", "closed", "commented", "flagged", "error"]);
 var ACTION_DIRECTORY = fileURLToPath(new URL("./", import.meta.url));
 var ASSET_DIGESTS = /* @__PURE__ */ new Map([
   ["preprocess.mjs", "14c86ef36a82cf603ef8120e5c4cc96a30ec0427650ca42ff20d3eb1217db984"],
@@ -13248,10 +13273,12 @@ async function runAction({
         const allowlist = typeof getInput === "function" ? getInput("allowlist") : "";
         const response = typeof getInput === "function" ? getInput("response") : "";
         const mode = typeof getInput === "function" ? getInput("mode") : "";
+        const autoClose = typeof getInput === "function" ? getInput("auto-close") : "";
         return {
           ...allowlist === "" ? {} : { allowlist },
           ...response === "" ? {} : { response },
-          ...mode === "" ? {} : { mode }
+          ...mode === "" ? {} : { mode },
+          ...autoClose === "" ? {} : { autoClose }
         };
       };
       let api;
@@ -13302,6 +13329,7 @@ async function writeSummary(filename, result) {
     empty_input: "No prose to classify",
     below_cutoff: "Below moderation cutoff",
     closed: "Closed after confirmed response",
+    commented: "Response posted; submission remains open",
     flagged: "Flagged for review",
     error: "Operational error"
   };
