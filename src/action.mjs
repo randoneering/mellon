@@ -78,6 +78,7 @@ function normalizeResult(result) {
   if (hasScore && score === undefined) throw operationalError();
   const normalized = {
     outcome: result?.outcome,
+    ...(result?.outcome_labels_incomplete === true ? { outcomeLabelsIncomplete: true } : {}),
     ...(score === undefined ? {} : { robotScore: score }),
     ...(result?.outcome === 'flagged' ? { labelApplied: result.label_applied === true } : {}),
     ...(result?.outcome === 'error' || result?.outcome === 'skipped' && result.partial === true
@@ -195,6 +196,8 @@ export async function runAction({
         closeItem: (...args) => lazyApi().closeItem(...args),
         getReviewLabel: (...args) => lazyApi().getReviewLabel(...args),
         createReviewLabel: (...args) => lazyApi().createReviewLabel(...args),
+        getOutcomeLabel: (...args) => lazyApi().getOutcomeLabel(...args),
+        createOutcomeLabel: (...args) => lazyApi().createOutcomeLabel(...args),
         addLabel: (...args) => lazyApi().addLabel(...args),
       };
       result = await moderate({
@@ -240,9 +243,11 @@ async function writeSummary(filename, result) {
     ? '\n\nLabel: mellon: review' : '';
   const uncertainty = result.outcome === 'error' && result.uncertainty
     ? '\n\nResponse confirmation: uncertain' : '';
+  const setupNote = result.outcomeLabelsIncomplete
+    ? '\n\nOutcome-label setup is incomplete. Create missing review outcome labels manually in repository settings.' : '';
   try {
     const handle = await open(filename, 'a');
-    try { await handle.writeFile(`## Mellon moderation\n\n${labels[result.outcome]}${score}${labelNote}${partial}${uncertainty}\n`, 'utf8'); }
+    try { await handle.writeFile(`## Mellon moderation\n\n${labels[result.outcome]}${score}${labelNote}${partial}${uncertainty}${setupNote}\n`, 'utf8'); }
     finally { await handle.close(); }
   } catch {
     // Summaries are optional and contain no event text or credentials.

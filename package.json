@@ -8,9 +8,9 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test": "node --test detector/tests/*.test.mjs tests/unit/*.test.mjs tests/integration/*.test.mjs scripts/tests/*.test.mjs",
+    "test": "node --test --test-concurrency=1 detector/tests/*.test.mjs tests/unit/*.test.mjs tests/integration/*.test.mjs scripts/tests/*.test.mjs",
     "test:unit": "node --test tests/unit/*.test.mjs tests/integration/*.test.mjs",
-    "test:build": "node --test scripts/tests/*.test.mjs",
+    "test:build": "node --test --test-concurrency=1 scripts/tests/*.test.mjs",
     "validate:release": "node scripts/validate-release.mjs",
     "test:parity": "node --test detector/tests/parity.test.mjs",
     "coverage": "node scripts/coverage.mjs",

@@ -73,30 +73,71 @@ mellon runs on Node 24 and requires a non-root runner.
 | `auto-close` | `'true'` | `'false'` posts the enforcement response without closing the issue or pull request. |
 | `review-label` | `'true'` | Shared across modes. `'false'` disables automatic review labeling. |
 
-Observation mode creates `mellon: review` if needed and applies it to submissions at or above the cutoff by default.
-Set `review-label: 'false'` to disable automatic labeling in either mode; observe mode still reports flagged submissions without GitHub reads or writes.
-The label is visible to anyone who can see the issue or PR.
+Both modes apply only `mellon: review` to eligible submissions at or above the cutoff by default.
 Observation mode does not comment or close submissions.
-Existing labels keep their color and description.
+With automatic labeling enabled, mellon also attempts to create the three outcome labels so they appear in the label picker.
+Existing labels keep their color and description; newly created outcome labels have distinct colors and short descriptions.
+Outcome-label setup failures do not block moderation.
+The job summary reports incomplete setup and asks maintainers to create missing outcome labels manually.
 
-For a manual review workflow, maintainers can use these optional labels:
+### Review labels
 
-| Label | Meaning |
+| Label | Applied by | Meaning |
+| --- | --- | --- |
+| `mellon: review` | mellon | Flagged and waiting for maintainer review. |
+| `mellon: reviewed-human` | Maintainer | Assesses the description as human-like. |
+| `mellon: reviewed-ai` | Maintainer | Assesses the description as AI-like. |
+| `mellon: reviewed-unsure` | Maintainer | Cannot confidently assess the description. |
+
+After review, remove `mellon: review` and add exactly one outcome label.
+Labels describe the maintainer's fallible assessment of the text, not the contributor or verified authorship.
+They are visible to anyone who can see the issue or PR.
+mellon never applies outcome labels, reacts to label changes, or swaps labels automatically.
+Any outcome label prevents a rerun from reapplying `mellon: review` or closing the item, including with `review-label: 'false'`.
+Outcome-label checks ignore capitalization and preserve existing label names.
+It does not suppress an enforcement response if no matching bot response exists.
+
+Find pending reviews in both states:
+
+| Search | Typical use |
 | --- | --- |
-| `mellon: review` | Waiting for maintainer review. |
-| `mellon: checked` | Reviewed; no follow-up needed. |
-| `mellon: follow-up` | Reviewed; clarification or more detail needed. |
+| `is:open label:"mellon: review"` | Observe mode or enforce with `auto-close: 'false'`. |
+| `is:closed label:"mellon: review"` | Default enforce mode. |
+| `label:"mellon: review"` | All pending items; remove the default `is:open` filter. |
 
-After review, remove `mellon: review` and apply the appropriate outcome label.
-Maintainers create and apply the outcome labels themselves.
-Labels are public, so use them to describe next steps rather than assert authorship.
+Manual closes and reopens can change state, so check both queues.
+Set `review-label: 'false'` to disable automatic label creation and application in either mode, and therefore automatic label-based metrics.
+Observe mode with labeling disabled still reports flagged submissions without GitHub reads or writes.
+Existing labels and past items are not migrated.
+Maintainers can replace retired labels manually after reviewing each item.
+
+### Review metrics
+
+Count items across open and closed states: `P` = pending `review`, `H` = `reviewed-human`, `A` = `reviewed-ai`, and `U` = `reviewed-unsure`.
+
+| Metric | Formula |
+| --- | --- |
+| Pending | `P` |
+| Total flagged | `P + H + A + U` |
+| Reviewer-assessed precision | `A / (A + H)`; report `U` separately. |
+| Unsure-inclusive lower bound | `A / (A + H + U)`; counts every unsure as a miss. |
+
+A zero denominator means unavailable, not zero precision.
+Counts assume each flagged item has exactly one pending or outcome label; overlapping, removed, or manually added labels distort results.
+These estimates cover reviewed flagged submissions, not recall or missed detections below the fixed `0.80` cutoff.
+Reviewer error and selection bias limit interpretation; label names record neither mode nor score.
+See [metric limits and an example](docs/moderation.md#review-metrics).
+
+### Enforcement and reruns
 
 Enforcement mode confirms a response first, applies `mellon: review` by default, then follows the existing auto-close setting.
 Set `review-label: 'false'` to disable automatic labeling in either mode.
-If label creation or application fails, the confirmed response remains partial work and mellon does not close the item; a later run reconciles GitHub state before retrying, without blindly reposting the response.
+If the pending review label cannot be created or applied, the confirmed response remains partial work and mellon does not close the item; a later run reconciles GitHub state before retrying, without blindly reposting the response.
+Optional outcome-label provisioning does not gate closure.
+Unreadable current outcome labels prevent pending-label writes and closure.
 The Action reports `commented` when it confirms the response but does not close the submission.
 It reuses a matching bot response on reruns rather than posting a duplicate.
-Changing `auto-close` affects later runs: turning it off does not reopen a closed item, and turning it on can close an eligible open item after reusing its response.
+Changing `auto-close` affects later runs: turning it off does not reopen a closed item, and turning it on can close an eligible open item without an outcome label after reusing its response.
 mellon appends the score and detector details to the response.
 An empty `response` uses the packaged message.
 The cutoff is fixed and cannot be configured through an Action input.
@@ -120,6 +161,7 @@ npm run build
 npm run validate:release
 ```
 
+The test runners serialize files because build-safety tests rewrite `dist/` while other tests read it.
 The build produces the bundled Action, scorer, detector assets, metadata, and third-party notices in `dist/`.
 Include those files in a release commit; the Action does not install packages or download models at runtime.
 
@@ -131,5 +173,5 @@ See [dependency trust](docs/dependencies.md) and [classification limits](docs/cl
 
 Concurrent runs serialize per repository and item, but they do not guarantee exactly-once execution.
 A comment can remain if a later closure fails.
-Reopening an item does not exempt it from a rerun of its original event.
+Reopening an item alone does not exempt it from a rerun of its original event; an outcome label prevents renewed pending labeling and closure.
 To roll back, pin a previously reviewed commit or disable the workflow; existing comments and closures remain.

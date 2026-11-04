@@ -1,4 +1,5 @@
 import { createEligibleContinuation } from './inputs.mjs';
+import { OUTCOME_LABELS } from './github.mjs';
 import { prepareSubmission } from './prepare.mjs';
 
 export const CUTOFF = 0.8;
@@ -49,6 +50,21 @@ async function hasReviewLabel(api, context) {
   return labels.some(label => label.name === REVIEW_LABEL);
 }
 
+async function hasOutcomeLabel(api, context) {
+  const labels = await api.getItemLabels(context);
+  if (!Array.isArray(labels) || labels.some(label => !label || typeof label !== 'object' || typeof label.name !== 'string')) {
+    throw new Error('Current label response is invalid.');
+  }
+  const outcomeNames = new Set(OUTCOME_LABELS.map(({ name }) => name));
+  return labels.some(label => outcomeNames.has(label.name.toLowerCase()));
+}
+
+async function checkBeforeLabelWrite(api, context) {
+  if (!await currentMatches(api, context)) return { stale: true };
+  if (await hasOutcomeLabel(api, context)) return { completed: true };
+  return { stale: false };
+}
+
 const LABEL_WRITE_ATTEMPTS = 3;
 const LABEL_RETRY_DELAY_MS = 25;
 
@@ -60,12 +76,13 @@ function labelRetryDelay() {
   return new Promise(resolve => setTimeout(resolve, LABEL_RETRY_DELAY_MS));
 }
 
-async function ensureReviewLabel(api, context, isCurrent) {
+async function ensureReviewLabel(api, context, checkCurrent) {
   let label = await api.getReviewLabel(context);
   if (!label || typeof label !== 'object' || typeof label.exists !== 'boolean') throw new Error('Label lookup response is invalid.');
   if (label.exists) return { stale: false };
   for (let attempt = 0; attempt < LABEL_WRITE_ATTEMPTS; attempt++) {
-    if (!await isCurrent()) return { stale: true };
+    const check = await checkCurrent();
+    if (check.stale || check.completed) return check;
     try {
       const created = await api.createReviewLabel(context);
       if (created?.confirmed === true) return { stale: false };
@@ -80,9 +97,49 @@ async function ensureReviewLabel(api, context, isCurrent) {
   }
 }
 
-async function applyReviewLabel(api, context, isCurrent) {
+async function ensureOutcomeLabel(api, context, name) {
+  let label;
+  try { label = await api.getOutcomeLabel({ repository: context.repository, name }); }
+  catch { return false; }
+  if (!label || typeof label !== 'object' || typeof label.exists !== 'boolean') return false;
+  if (label.exists) return true;
+
   for (let attempt = 0; attempt < LABEL_WRITE_ATTEMPTS; attempt++) {
-    if (!await isCurrent()) return { stale: true };
+    let error;
+    try {
+      const created = await api.createOutcomeLabel({ repository: context.repository, name });
+      if (created?.confirmed === true) return true;
+      error = new Error('Outcome label creation was not confirmed.');
+    } catch (creationError) {
+      error = creationError;
+    }
+
+    try { label = await api.getOutcomeLabel({ repository: context.repository, name }); }
+    catch { return false; }
+    if (!label || typeof label !== 'object' || typeof label.exists !== 'boolean') return false;
+    if (label.exists) return true;
+    if (!retryableLabelFailure(error) || attempt === LABEL_WRITE_ATTEMPTS - 1) return false;
+    await labelRetryDelay();
+  }
+  return false;
+}
+
+async function provisionOutcomeLabels(api, context) {
+  let complete = true;
+  for (const { name } of OUTCOME_LABELS) {
+    try {
+      if (!await ensureOutcomeLabel(api, context, name)) complete = false;
+    } catch {
+      complete = false;
+    }
+  }
+  return complete;
+}
+
+async function applyReviewLabel(api, context, checkCurrent) {
+  for (let attempt = 0; attempt < LABEL_WRITE_ATTEMPTS; attempt++) {
+    const check = await checkCurrent();
+    if (check.stale || check.completed) return check;
     try {
       const applied = await api.addLabel(context);
       if (applied?.confirmed === true) return { stale: false };
@@ -98,8 +155,9 @@ async function applyReviewLabel(api, context, isCurrent) {
 
 export async function moderate({ getContext, getInputs, api, score, prepare = prepareSubmission } = {}) {
   const eligible = createEligibleContinuation({ getContext, getInputs });
+  let outcomeLabelsIncomplete = false;
   try {
-    return await eligible(async (context, policy) => {
+    const result = await eligible(async (context, policy) => {
       const prepared = prepare(context.title, context.body);
       if (!prepared.trim()) return { outcome: 'empty_input', cutoff: CUTOFF, score: null, partial: false };
       const classified = await score({ protocol_version: 1, text: prepared });
@@ -128,8 +186,17 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
         if (!matches) return { outcome: 'skipped', reason: 'stale_before_label', cutoff: CUTOFF,
           score: classified.robot_score, partial: false };
         try {
-          const ensured = await ensureReviewLabel(api, context, () => currentMatches(api, context));
-          const applied = ensured.stale ? ensured : await applyReviewLabel(api, context, () => currentMatches(api, context));
+          if (await hasOutcomeLabel(api, context)) return { outcome: 'skipped', reason: 'review_complete',
+            cutoff: CUTOFF, score: classified.robot_score, partial: false };
+        } catch { return safeFailure('Current review outcome could not be checked safely.'); }
+        outcomeLabelsIncomplete = !await provisionOutcomeLabels(api, context);
+        try {
+          const checkCurrent = () => checkBeforeLabelWrite(api, context);
+          const ensured = await ensureReviewLabel(api, context, checkCurrent);
+          const applied = ensured.stale || ensured.completed ? ensured
+            : await applyReviewLabel(api, context, checkCurrent);
+          if (applied.completed) return { outcome: 'skipped', reason: 'review_complete', cutoff: CUTOFF,
+            score: classified.robot_score, partial: false };
           if (applied.stale) return { outcome: 'skipped', reason: 'stale_before_label', cutoff: CUTOFF,
             score: classified.robot_score, partial: false };
         } catch {
@@ -172,12 +239,27 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
             detector_revision: classified.detector_revision, model_sha256: classified.model_sha256,
             input_sha256: classified.input_sha256,
           };
+          if (await hasOutcomeLabel(api, context)) return {
+            outcome: 'skipped', reason: 'review_complete', cutoff: CUTOFF,
+            score: classified.robot_score, comment_id: existing.id, partial: posted,
+            detector_revision: classified.detector_revision, model_sha256: classified.model_sha256,
+            input_sha256: classified.input_sha256,
+          };
         } catch {
           return safeFailure('Response is confirmed, but current state could not be checked before labeling.', partial);
         }
+        outcomeLabelsIncomplete = !await provisionOutcomeLabels(api, context);
         try {
-          const ensured = await ensureReviewLabel(api, context, () => currentMatches(api, context));
-          const applied = ensured.stale ? ensured : await applyReviewLabel(api, context, () => currentMatches(api, context));
+          const checkCurrent = () => checkBeforeLabelWrite(api, context);
+          const ensured = await ensureReviewLabel(api, context, checkCurrent);
+          const applied = ensured.stale || ensured.completed ? ensured
+            : await applyReviewLabel(api, context, checkCurrent);
+          if (applied.completed) return {
+            outcome: 'skipped', reason: 'review_complete', cutoff: CUTOFF,
+            score: classified.robot_score, comment_id: existing.id, partial: posted,
+            detector_revision: classified.detector_revision, model_sha256: classified.model_sha256,
+            input_sha256: classified.input_sha256,
+          };
           if (applied.stale) return {
             outcome: 'skipped', reason: 'stale_before_label', cutoff: CUTOFF,
             score: classified.robot_score, comment_id: existing.id, partial: posted,
@@ -208,6 +290,12 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
           outcome: 'skipped', reason: 'stale_before_close', cutoff: CUTOFF,
           score: classified.robot_score, comment_id: existing.id, partial: posted,
         };
+        if (await hasOutcomeLabel(api, context)) return {
+          outcome: 'skipped', reason: 'review_complete', cutoff: CUTOFF,
+          score: classified.robot_score, comment_id: existing.id, partial: posted,
+          detector_revision: classified.detector_revision, model_sha256: classified.model_sha256,
+          input_sha256: classified.input_sha256,
+        };
       } catch {
         return safeFailure('Response is confirmed, but closure state could not be checked.', partial);
       }
@@ -222,7 +310,9 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
         input_sha256: classified.input_sha256, comment_id: existing.id, partial: false,
       };
     });
+    return outcomeLabelsIncomplete ? { ...result, outcome_labels_incomplete: true } : result;
   } catch {
-    return safeFailure('Moderation failed safely.');
+    return safeFailure('Moderation failed safely.',
+      outcomeLabelsIncomplete ? { outcome_labels_incomplete: true } : {});
   }
 }

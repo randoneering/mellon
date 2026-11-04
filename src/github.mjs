@@ -2,6 +2,11 @@ const API_ROOT = 'https://api.github.com';
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_PAGES = 100;
 const REVIEW_LABEL = 'mellon: review';
+export const OUTCOME_LABELS = Object.freeze([
+  Object.freeze({ name: 'mellon: reviewed-human', color: '0e8a16', description: 'Maintainer assessed the submission text as human-like.' }),
+  Object.freeze({ name: 'mellon: reviewed-ai', color: 'd73a4a', description: 'Maintainer assessed the submission text as AI-like.' }),
+  Object.freeze({ name: 'mellon: reviewed-unsure', color: 'fbca04', description: 'Maintainer could not confidently assess the submission text.' }),
+]);
 
 function safeError(status) {
   const error = new Error('GitHub API request failed safely.');
@@ -19,7 +24,8 @@ function parseLinkNext(header, current) {
   if (!header) return null;
   const next = header.split(',').map((part) => {
     const match = part.match(/^\s*<([^>]+)>\s*;\s*rel="([^"]+)"\s*$/);
-    if (match?.[2].split(/\s+/).includes('next')) return match[1];
+    if (!match) throw safeError();
+    if (match[2].split(/\s+/).includes('next')) return match[1];
     return null;
   }).find(Boolean);
   if (!next) return null;
@@ -92,6 +98,12 @@ function labelName(value) {
   return value.name;
 }
 
+function outcomeLabel(name) {
+  const label = OUTCOME_LABELS.find((candidate) => candidate.name === name);
+  if (!label) throw safeError();
+  return label;
+}
+
 export function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 30_000, signal, maxBodyBytes = MAX_BODY_BYTES } = {}) {
   if (typeof token !== 'string' || !token || typeof fetchImpl !== 'function' ||
       !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || !Number.isSafeInteger(maxBodyBytes) || maxBodyBytes <= 0) {
@@ -160,6 +172,27 @@ export function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 30_00
       const body = { name: REVIEW_LABEL, color: 'fbca04', description: 'Flagged by Mellon for maintainer review.' };
       const { value } = await request(url, { method: 'POST', body });
       if (labelName(value) !== REVIEW_LABEL) throw safeError();
+      return { confirmed: true };
+    },
+    async getOutcomeLabel({ repository, name }) {
+      const label = outcomeLabel(name);
+      if (typeof repository !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw safeError();
+      const url = `${API_ROOT}/repos/${repository}/labels/${encodeURIComponent(label.name)}`;
+      try {
+        const { value } = await request(url);
+        if (labelName(value).toLowerCase() !== label.name) throw safeError();
+        return { exists: true };
+      } catch (error) {
+        if (error?.status === 404) return { exists: false };
+        throw safeError();
+      }
+    },
+    async createOutcomeLabel({ repository, name }) {
+      const label = outcomeLabel(name);
+      if (typeof repository !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw safeError();
+      const url = `${API_ROOT}/repos/${repository}/labels`;
+      const { value } = await request(url, { method: 'POST', body: label });
+      if (labelName(value).toLowerCase() !== label.name) throw safeError();
       return { confirmed: true };
     },
     async getItemLabels(context) {

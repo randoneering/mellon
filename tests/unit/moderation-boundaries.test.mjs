@@ -22,11 +22,14 @@ function apiFixture() {
     api: {
       async listComments() { calls.push('comments'); return []; },
       async getItem() { calls.push('state'); return current; },
+      async getItemLabels() { calls.push('item-labels'); return []; },
       async createComment({ body }) {
         calls.push('post');
         return { id: 22, body, user: { login: 'github-actions[bot]', type: 'Bot' } };
       },
       async getReviewLabel() { calls.push('label_lookup'); return { exists: true }; },
+      async getOutcomeLabel() { return { exists: true }; },
+      async createOutcomeLabel() { return { confirmed: true }; },
       async addLabel() { calls.push('label_apply'); return { confirmed: true }; },
       async closeItem() { calls.push('close'); return { state: 'closed' }; },
     },
