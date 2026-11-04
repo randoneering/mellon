@@ -180,7 +180,7 @@ export function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 30_00
       const url = `${API_ROOT}/repos/${repository}/labels/${encodeURIComponent(label.name)}`;
       try {
         const { value } = await request(url);
-        if (labelName(value) !== label.name) throw safeError();
+        if (labelName(value).toLowerCase() !== label.name) throw safeError();
         return { exists: true };
       } catch (error) {
         if (error?.status === 404) return { exists: false };
@@ -192,7 +192,7 @@ export function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 30_00
       if (typeof repository !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw safeError();
       const url = `${API_ROOT}/repos/${repository}/labels`;
       const { value } = await request(url, { method: 'POST', body: label });
-      if (labelName(value) !== label.name) throw safeError();
+      if (labelName(value).toLowerCase() !== label.name) throw safeError();
       return { confirmed: true };
     },
     async getItemLabels(context) {

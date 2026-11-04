@@ -23,7 +23,10 @@ The `0.80` cutoff is a repository policy threshold, not a calibrated authorship 
 When automatic labeling is enabled and an eligible item is flagged, Mellon attempts to create missing outcome labels with distinct colors and short descriptions.
 Existing repository labels keep their metadata.
 Creation races and uncertain writes are reconciled with at most three create attempts per outcome label.
-Outcome-label provisioning failures do not block comments, pending labeling, or closure; maintainers can create missing labels manually.
+Outcome-label setup failures do not block comments, pending labeling, or closure.
+When setup cannot be confirmed, the run result records incomplete setup and the job summary asks maintainers to create missing review outcome labels manually.
+This notice contains no API response details, credentials, or submission text.
+It does not change the moderation outcome or published Action outputs.
 Mellon never applies an outcome label.
 
 After review, remove `mellon: review` and apply exactly one outcome label.
@@ -31,7 +34,7 @@ Labels describe a maintainer's fallible assessment of the text, not the contribu
 Labels are visible to anyone who can see the item.
 Mellon handles only opening events, so the review-to-outcome swap is manual.
 It does not react to label changes, enforce exclusivity, or change historical items.
-Old `mellon: checked` and `mellon: follow-up` labels remain untouched; maintainers can replace them manually after review.
+Retired labels remain untouched; maintainers can replace them manually after review.
 
 | Pending search | Typical use |
 | --- | --- |
@@ -93,6 +96,7 @@ Optional outcome-label creation does not gate closure.
 
 Mellon checks current state and content before item writes, and checks current outcome labels before pending-label writes, their retries, and closure.
 Any outcome label marks the review complete and prevents renewed pending labeling or closure, even if the pending label is also present or automatic labeling is disabled.
+These checks ignore capitalization, matching GitHub's label identity rules without renaming existing labels.
 Unreadable or malformed outcome-label state stops the affected pending-label or closure action safely.
 Outcome labels do not suppress an enforcement response when no matching bot response exists.
 

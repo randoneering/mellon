@@ -66,6 +66,24 @@ test('GitHub client looks up fixed outcome labels without changing existing meta
   ]));
 });
 
+test('GitHub client accepts existing outcome label identities with different capitalization', async () => {
+  for (const [name, returnedName] of [
+    ['mellon: reviewed-human', 'Mellon: Reviewed-Human'],
+    ['mellon: reviewed-ai', 'MELLON: REVIEWED-AI'],
+    ['mellon: reviewed-unsure', 'mellon: Reviewed-Unsure'],
+  ]) {
+    const calls = [];
+    const client = createGitHubClient({ token: 'token', fetchImpl: async (url, options) => {
+      calls.push({ method: options.method, url: String(url) });
+      return new Response(JSON.stringify({ name: returnedName, color: 'abcdef', description: 'Kept by maintainer' }), { status: 200 });
+    } });
+    assert.deepEqual(await client.getOutcomeLabel({ repository: 'o/r', name }), { exists: true });
+    assert.deepEqual(await client.createOutcomeLabel({ repository: 'o/r', name }), { confirmed: true });
+    assert.deepEqual(calls.map(call => call.method), ['GET', 'POST']);
+    assert.equal(calls[0].url, `https://api.github.com/repos/o/r/labels/${encodeURIComponent(name)}`);
+  }
+});
+
 test('GitHub client creates only fixed outcome labels with distinct metadata', async () => {
   const calls = [];
   const client = createGitHubClient({ token: 'token', fetchImpl: async (url, options) => {

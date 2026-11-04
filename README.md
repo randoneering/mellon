@@ -77,7 +77,8 @@ Both modes apply only `mellon: review` to eligible submissions at or above the c
 Observation mode does not comment or close submissions.
 With automatic labeling enabled, mellon also attempts to create the three outcome labels so they appear in the label picker.
 Existing labels keep their color and description; newly created outcome labels have distinct colors and short descriptions.
-Outcome-label creation failures do not block moderation; maintainers can create missing labels manually.
+Outcome-label setup failures do not block moderation.
+The job summary reports incomplete setup and asks maintainers to create missing outcome labels manually.
 
 ### Review labels
 
@@ -93,6 +94,7 @@ Labels describe the maintainer's fallible assessment of the text, not the contri
 They are visible to anyone who can see the issue or PR.
 mellon never applies outcome labels, reacts to label changes, or swaps labels automatically.
 Any outcome label prevents a rerun from reapplying `mellon: review` or closing the item, including with `review-label: 'false'`.
+Outcome-label checks ignore capitalization and preserve existing label names.
 It does not suppress an enforcement response if no matching bot response exists.
 
 Find pending reviews in both states:
@@ -106,7 +108,8 @@ Find pending reviews in both states:
 Manual closes and reopens can change state, so check both queues.
 Set `review-label: 'false'` to disable automatic label creation and application in either mode, and therefore automatic label-based metrics.
 Observe mode with labeling disabled still reports flagged submissions without GitHub reads or writes.
-Existing labels and past items are not migrated; maintainers can manually replace old `mellon: checked` and `mellon: follow-up` labels after review.
+Existing labels and past items are not migrated.
+Maintainers can replace retired labels manually after reviewing each item.
 
 ### Review metrics
 

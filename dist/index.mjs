@@ -7701,7 +7701,7 @@ function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 3e4, signal,
       const url = `${API_ROOT}/repos/${repository}/labels/${encodeURIComponent(label.name)}`;
       try {
         const { value } = await request(url);
-        if (labelName(value) !== label.name) throw safeError();
+        if (labelName(value).toLowerCase() !== label.name) throw safeError();
         return { exists: true };
       } catch (error) {
         if (error?.status === 404) return { exists: false };
@@ -7713,7 +7713,7 @@ function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 3e4, signal,
       if (typeof repository !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw safeError();
       const url = `${API_ROOT}/repos/${repository}/labels`;
       const { value } = await request(url, { method: "POST", body: label });
-      if (labelName(value) !== label.name) throw safeError();
+      if (labelName(value).toLowerCase() !== label.name) throw safeError();
       return { confirmed: true };
     },
     async getItemLabels(context) {
@@ -13006,7 +13006,7 @@ async function hasOutcomeLabel(api, context) {
     throw new Error("Current label response is invalid.");
   }
   const outcomeNames = new Set(OUTCOME_LABELS.map(({ name }) => name));
-  return labels.some((label) => outcomeNames.has(label.name));
+  return labels.some((label) => outcomeNames.has(label.name.toLowerCase()));
 }
 async function checkBeforeLabelWrite(api, context) {
   if (!await currentMatches(api, context)) return { stale: true };
@@ -13046,14 +13046,15 @@ async function ensureOutcomeLabel(api, context, name) {
   try {
     label = await api.getOutcomeLabel({ repository: context.repository, name });
   } catch {
-    return;
+    return false;
   }
-  if (!label || typeof label !== "object" || typeof label.exists !== "boolean" || label.exists) return;
+  if (!label || typeof label !== "object" || typeof label.exists !== "boolean") return false;
+  if (label.exists) return true;
   for (let attempt = 0; attempt < LABEL_WRITE_ATTEMPTS; attempt++) {
     let error;
     try {
       const created = await api.createOutcomeLabel({ repository: context.repository, name });
-      if (created?.confirmed === true) return;
+      if (created?.confirmed === true) return true;
       error = new Error("Outcome label creation was not confirmed.");
     } catch (creationError) {
       error = creationError;
@@ -13061,20 +13062,25 @@ async function ensureOutcomeLabel(api, context, name) {
     try {
       label = await api.getOutcomeLabel({ repository: context.repository, name });
     } catch {
-      return;
+      return false;
     }
-    if (!label || typeof label !== "object" || typeof label.exists !== "boolean" || label.exists) return;
-    if (!retryableLabelFailure(error) || attempt === LABEL_WRITE_ATTEMPTS - 1) return;
+    if (!label || typeof label !== "object" || typeof label.exists !== "boolean") return false;
+    if (label.exists) return true;
+    if (!retryableLabelFailure(error) || attempt === LABEL_WRITE_ATTEMPTS - 1) return false;
     await labelRetryDelay();
   }
+  return false;
 }
 async function provisionOutcomeLabels(api, context) {
+  let complete = true;
   for (const { name } of OUTCOME_LABELS) {
     try {
-      await ensureOutcomeLabel(api, context, name);
+      if (!await ensureOutcomeLabel(api, context, name)) complete = false;
     } catch {
+      complete = false;
     }
   }
+  return complete;
 }
 async function applyReviewLabel(api, context, checkCurrent) {
   for (let attempt = 0; attempt < LABEL_WRITE_ATTEMPTS; attempt++) {
@@ -13094,8 +13100,9 @@ async function applyReviewLabel(api, context, checkCurrent) {
 }
 async function moderate({ getContext, getInputs, api, score, prepare = prepareSubmission } = {}) {
   const eligible = createEligibleContinuation({ getContext, getInputs });
+  let outcomeLabelsIncomplete = false;
   try {
-    return await eligible(async (context, policy) => {
+    const result = await eligible(async (context, policy) => {
       const prepared = prepare(context.title, context.body);
       if (!prepared.trim()) return { outcome: "empty_input", cutoff: CUTOFF, score: null, partial: false };
       const classified = await score({ protocol_version: 1, text: prepared });
@@ -13154,7 +13161,7 @@ async function moderate({ getContext, getInputs, api, score, prepare = prepareSu
         } catch {
           return safeFailure("Current review outcome could not be checked safely.");
         }
-        await provisionOutcomeLabels(api, context);
+        outcomeLabelsIncomplete = !await provisionOutcomeLabels(api, context);
         try {
           const checkCurrent = () => checkBeforeLabelWrite(api, context);
           const ensured = await ensureReviewLabel(api, context, checkCurrent);
@@ -13250,7 +13257,7 @@ ${marker}`;
         } catch {
           return safeFailure("Response is confirmed, but current state could not be checked before labeling.", partial);
         }
-        await provisionOutcomeLabels(api, context);
+        outcomeLabelsIncomplete = !await provisionOutcomeLabels(api, context);
         try {
           const checkCurrent = () => checkBeforeLabelWrite(api, context);
           const ensured = await ensureReviewLabel(api, context, checkCurrent);
@@ -13344,8 +13351,12 @@ ${marker}`;
         partial: false
       };
     });
+    return outcomeLabelsIncomplete ? { ...result, outcome_labels_incomplete: true } : result;
   } catch {
-    return safeFailure("Moderation failed safely.");
+    return safeFailure(
+      "Moderation failed safely.",
+      outcomeLabelsIncomplete ? { outcome_labels_incomplete: true } : {}
+    );
   }
 }
 
@@ -13419,6 +13430,7 @@ function normalizeResult(result) {
   if (hasScore && score === void 0) throw operationalError();
   const normalized = {
     outcome: result?.outcome,
+    ...result?.outcome_labels_incomplete === true ? { outcomeLabelsIncomplete: true } : {},
     ...score === void 0 ? {} : { robotScore: score },
     ...result?.outcome === "flagged" ? { labelApplied: result.label_applied === true } : {},
     ...result?.outcome === "error" || result?.outcome === "skipped" && result.partial === true ? {
@@ -13592,12 +13604,13 @@ Model SHA-256: ${result.provenance.modelSha256}
 Input SHA-256: ${result.provenance.inputSha256}` : ""}` : "";
   const labelNote = result.outcome === "flagged" && result.labelApplied ? "\n\nLabel: mellon: review" : "";
   const uncertainty = result.outcome === "error" && result.uncertainty ? "\n\nResponse confirmation: uncertain" : "";
+  const setupNote = result.outcomeLabelsIncomplete ? "\n\nOutcome-label setup is incomplete. Create missing review outcome labels manually in repository settings." : "";
   try {
     const handle = await open(filename, "a");
     try {
       await handle.writeFile(`## Mellon moderation
 
-${labels[result.outcome]}${score}${labelNote}${partial}${uncertainty}
+${labels[result.outcome]}${score}${labelNote}${partial}${uncertainty}${setupNote}
 `, "utf8");
     } finally {
       await handle.close();

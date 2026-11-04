@@ -59,6 +59,21 @@ test('an open reviewed item rerun blocks pending labels and closure in both mode
   }
 });
 
+test('mixed-case outcome labels protect reviewed issues and pull requests', async () => {
+  for (const name of ['Mellon: Reviewed-Human', 'MELLON: REVIEWED-AI', 'mellon: Reviewed-Unsure']) {
+    for (const [mode, reviewLabel] of [['observe', 'true'], ['enforce', 'true'], ['enforce', 'false']]) {
+      for (const eventName of ['issues', 'pull_request_target']) {
+        const f = fixture({ mode, reviewLabel, eventName, itemLabels: [{ name }] });
+        const outcome = await f.run();
+        assert.equal(outcome.outcome, 'skipped', `${name}/${mode}/${reviewLabel}/${eventName}`);
+        assert.equal(f.calls.some(call => call.startsWith('apply:')), false);
+        assert.equal(f.calls.includes('close'), false);
+        assert.equal(f.calls.some(call => call.startsWith('outcome-create:')), false);
+      }
+    }
+  }
+});
+
 test('enforce mode checks completed outcomes before closure when review labeling is disabled', async () => {
   for (const outcomeLabel of names) {
     const f = fixture({ mode: 'enforce', reviewLabel: 'false', itemLabels: [{ name: outcomeLabel }] });
@@ -293,10 +308,76 @@ test('retries uncertain outcome-label writes within a bound without blocking mod
   assert.doesNotMatch(JSON.stringify(outcome), /private uncertain write/);
 });
 
+test('reports incomplete outcome-label setup without blocking moderation', async () => {
+  for (const mode of ['observe', 'enforce']) {
+    for (const failure of ['lookup', 'malformed', 'create', 'unconfirmed', 'reconcile']) {
+      const f = fixture({ mode });
+      let lookups = 0;
+      f.api.getOutcomeLabel = async () => {
+        lookups++;
+        if (failure === 'lookup' || failure === 'reconcile' && lookups > 1) throw new Error('private setup response');
+        return failure === 'malformed' ? { exists: 'unknown' } : { exists: false };
+      };
+      f.api.createOutcomeLabel = async () => {
+        if (failure === 'unconfirmed') return { confirmed: false, detail: 'private setup response' };
+        const error = new Error('private setup response');
+        error.status = 403;
+        throw error;
+      };
+      const outcome = await f.run();
+      assert.equal(outcome.outcome, mode === 'observe' ? 'flagged' : 'closed', failure);
+      assert.equal(outcome.outcome_labels_incomplete, true, failure);
+      assert.equal(f.calls.includes('close'), mode === 'enforce');
+      assert.doesNotMatch(JSON.stringify(outcome), /private setup response/);
+    }
+  }
+});
+
+test('confirmed outcome-label setup has no incomplete status after reconciliation', async () => {
+  for (const status of [422, 503]) {
+    const f = fixture({ mode: 'observe' });
+    const created = new Set();
+    f.api.getOutcomeLabel = async ({ name }) => ({ exists: created.has(name) });
+    f.api.createOutcomeLabel = async ({ name }) => {
+      created.add(name);
+      const error = new Error('private create error');
+      error.status = status;
+      throw error;
+    };
+    const outcome = await f.run();
+    assert.equal(outcome.outcome, 'flagged');
+    assert.equal(outcome.outcome_labels_incomplete, undefined);
+    assert.equal(created.size, 3);
+  }
+});
+
+test('incomplete setup status survives later pending-label and closure failures', async () => {
+  for (const failure of ['pending', 'close']) {
+    const f = fixture();
+    f.api.getOutcomeLabel = async () => { throw new Error('private setup response'); };
+    if (failure === 'pending') {
+      f.api.addLabel = async () => {
+        const error = new Error('private pending failure');
+        error.status = 403;
+        throw error;
+      };
+    } else {
+      f.api.closeItem = async () => { throw new Error('private close failure'); };
+    }
+    const outcome = await f.run();
+    assert.equal(outcome.outcome, 'error');
+    assert.equal(outcome.partial, true);
+    assert.equal(outcome.comment_id, 8);
+    assert.equal(outcome.outcome_labels_incomplete, true);
+    assert.doesNotMatch(JSON.stringify(outcome), /private (setup response|pending failure|close failure)/);
+  }
+});
+
 test('does not provision outcomes when labeling is disabled, score is below cutoff, or event is ineligible', async () => {
   for (const mode of ['observe', 'enforce']) {
     const disabled = fixture({ mode, reviewLabel: 'false' });
-    await disabled.run();
+    const disabledOutcome = await disabled.run();
+    assert.equal(disabledOutcome.outcome_labels_incomplete, undefined);
     assert.equal(disabled.calls.some(call => call.startsWith('outcome-')), false);
 
     const below = fixture({ mode, robotScore: 0.799999 });

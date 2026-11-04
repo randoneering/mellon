@@ -56,7 +56,7 @@ async function hasOutcomeLabel(api, context) {
     throw new Error('Current label response is invalid.');
   }
   const outcomeNames = new Set(OUTCOME_LABELS.map(({ name }) => name));
-  return labels.some(label => outcomeNames.has(label.name));
+  return labels.some(label => outcomeNames.has(label.name.toLowerCase()));
 }
 
 async function checkBeforeLabelWrite(api, context) {
@@ -100,32 +100,40 @@ async function ensureReviewLabel(api, context, checkCurrent) {
 async function ensureOutcomeLabel(api, context, name) {
   let label;
   try { label = await api.getOutcomeLabel({ repository: context.repository, name }); }
-  catch { return; }
-  if (!label || typeof label !== 'object' || typeof label.exists !== 'boolean' || label.exists) return;
+  catch { return false; }
+  if (!label || typeof label !== 'object' || typeof label.exists !== 'boolean') return false;
+  if (label.exists) return true;
 
   for (let attempt = 0; attempt < LABEL_WRITE_ATTEMPTS; attempt++) {
     let error;
     try {
       const created = await api.createOutcomeLabel({ repository: context.repository, name });
-      if (created?.confirmed === true) return;
+      if (created?.confirmed === true) return true;
       error = new Error('Outcome label creation was not confirmed.');
     } catch (creationError) {
       error = creationError;
     }
 
     try { label = await api.getOutcomeLabel({ repository: context.repository, name }); }
-    catch { return; }
-    if (!label || typeof label !== 'object' || typeof label.exists !== 'boolean' || label.exists) return;
-    if (!retryableLabelFailure(error) || attempt === LABEL_WRITE_ATTEMPTS - 1) return;
+    catch { return false; }
+    if (!label || typeof label !== 'object' || typeof label.exists !== 'boolean') return false;
+    if (label.exists) return true;
+    if (!retryableLabelFailure(error) || attempt === LABEL_WRITE_ATTEMPTS - 1) return false;
     await labelRetryDelay();
   }
+  return false;
 }
 
 async function provisionOutcomeLabels(api, context) {
+  let complete = true;
   for (const { name } of OUTCOME_LABELS) {
-    try { await ensureOutcomeLabel(api, context, name); }
-    catch { /* Optional labels must not block moderation. */ }
+    try {
+      if (!await ensureOutcomeLabel(api, context, name)) complete = false;
+    } catch {
+      complete = false;
+    }
   }
+  return complete;
 }
 
 async function applyReviewLabel(api, context, checkCurrent) {
@@ -147,8 +155,9 @@ async function applyReviewLabel(api, context, checkCurrent) {
 
 export async function moderate({ getContext, getInputs, api, score, prepare = prepareSubmission } = {}) {
   const eligible = createEligibleContinuation({ getContext, getInputs });
+  let outcomeLabelsIncomplete = false;
   try {
-    return await eligible(async (context, policy) => {
+    const result = await eligible(async (context, policy) => {
       const prepared = prepare(context.title, context.body);
       if (!prepared.trim()) return { outcome: 'empty_input', cutoff: CUTOFF, score: null, partial: false };
       const classified = await score({ protocol_version: 1, text: prepared });
@@ -180,7 +189,7 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
           if (await hasOutcomeLabel(api, context)) return { outcome: 'skipped', reason: 'review_complete',
             cutoff: CUTOFF, score: classified.robot_score, partial: false };
         } catch { return safeFailure('Current review outcome could not be checked safely.'); }
-        await provisionOutcomeLabels(api, context);
+        outcomeLabelsIncomplete = !await provisionOutcomeLabels(api, context);
         try {
           const checkCurrent = () => checkBeforeLabelWrite(api, context);
           const ensured = await ensureReviewLabel(api, context, checkCurrent);
@@ -239,7 +248,7 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
         } catch {
           return safeFailure('Response is confirmed, but current state could not be checked before labeling.', partial);
         }
-        await provisionOutcomeLabels(api, context);
+        outcomeLabelsIncomplete = !await provisionOutcomeLabels(api, context);
         try {
           const checkCurrent = () => checkBeforeLabelWrite(api, context);
           const ensured = await ensureReviewLabel(api, context, checkCurrent);
@@ -301,7 +310,9 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
         input_sha256: classified.input_sha256, comment_id: existing.id, partial: false,
       };
     });
+    return outcomeLabelsIncomplete ? { ...result, outcome_labels_incomplete: true } : result;
   } catch {
-    return safeFailure('Moderation failed safely.');
+    return safeFailure('Moderation failed safely.',
+      outcomeLabelsIncomplete ? { outcome_labels_incomplete: true } : {});
   }
 }
