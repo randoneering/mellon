@@ -133,7 +133,7 @@ test('observe mode validates before inference and reports safe flagged output an
   assert.equal(result.robotScore, 0.8);
   assert.deepEqual(requests.map(([method, pathname]) => [method, pathname]), [
     ['GET', '/repos/owner/repo/issues/7'], ['GET', '/repos/owner/repo/labels/mellon%3A%20review'],
-    ['POST', '/repos/owner/repo/labels'], ['GET', '/repos/owner/repo/issues/7'],
+    ['GET', '/repos/owner/repo/issues/7'], ['POST', '/repos/owner/repo/labels'], ['GET', '/repos/owner/repo/issues/7'],
     ['POST', '/repos/owner/repo/issues/7/labels'],
   ]);
   assert.equal(requests.some(([method, pathname]) => method === 'PATCH' || method === 'POST' && pathname.endsWith('/comments')), false);

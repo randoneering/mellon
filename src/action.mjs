@@ -80,8 +80,9 @@ function normalizeResult(result) {
     outcome: result?.outcome,
     ...(score === undefined ? {} : { robotScore: score }),
     ...(result?.outcome === 'flagged' ? { labelApplied: result.label_applied === true } : {}),
-    ...(result?.outcome === 'error' ? { partial: result.partial === true, commentId: validCommentId(result.comment_id),
-      uncertainty: result.uncertainty === true, provenance: validProvenance(result) } : {}),
+    ...(result?.outcome === 'error' || result?.outcome === 'skipped' && result.partial === true
+      ? { partial: result.partial === true, commentId: validCommentId(result.comment_id),
+        uncertainty: result.uncertainty === true, provenance: validProvenance(result) } : {}),
   };
   formatOutputs(normalized);
   return normalized;
@@ -232,7 +233,7 @@ async function writeSummary(filename, result) {
     flagged: 'Flagged for review', error: 'Operational error',
   };
   const score = result.robotScore === undefined ? '' : `\n\nRobot score: ${result.robotScore}.`;
-  const partial = result.outcome === 'error' && result.partial
+  const partial = result.partial
     ? `\n\nResponse confirmed: yes\nClosure completed: no${result.commentId === undefined ? '' : `\nComment ID: ${result.commentId}`}${result.provenance ? `\nDetector revision: ${result.provenance.detectorRevision}\nModel SHA-256: ${result.provenance.modelSha256}\nInput SHA-256: ${result.provenance.inputSha256}` : ''}`
     : '';
   const labelNote = result.outcome === 'flagged' && result.labelApplied

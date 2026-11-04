@@ -36,8 +36,8 @@ test('enforce mode applies enabled review labels after responses for issues and 
     for (const autoClose of ['true', 'false']) {
       const fixture = setup();
       fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: false }; };
-      fixture.api.createReviewLabel = async () => { fixture.calls.push('label_create'); };
-      fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+      fixture.api.createReviewLabel = async () => { fixture.calls.push('label_create'); return { confirmed: true }; };
+      fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
       const context = { eventName, repository: 'o/r', payload: {
         action: 'opened', repository: { full_name: 'o/r' },
         [itemKey]: { number: 4, title: 'Title', body: 'Body', user: { login: 'contributor' } },
@@ -48,8 +48,8 @@ test('enforce mode applies enabled review labels after responses for issues and 
       assert.equal(outcome.comment_id, 22);
       assert.equal(outcome.partial, false);
       assert.deepEqual(fixture.calls, autoClose === 'true'
-        ? ['comments', 'state', 'post', 'state', 'label_lookup', 'label_create', 'state', 'label_apply', 'state', 'close']
-        : ['comments', 'state', 'post', 'state', 'label_lookup', 'label_create', 'state', 'label_apply', 'state']);
+        ? ['comments', 'state', 'post', 'state', 'label_lookup', 'state', 'label_create', 'state', 'label_apply', 'state', 'close']
+        : ['comments', 'state', 'post', 'state', 'label_lookup', 'state', 'label_create', 'state', 'label_apply', 'state']);
     }
   }
 });
@@ -63,8 +63,8 @@ test('enforce mode skips disabled labels and reuses genuine responses for issues
       const fixture = setup(0.8, { comments: [{ id: 3, body: marker,
         user: { login: 'github-actions[bot]', type: 'Bot' } }] });
       fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
-      fixture.api.createReviewLabel = async () => { fixture.calls.push('label_create'); };
-      fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+      fixture.api.createReviewLabel = async () => { fixture.calls.push('label_create'); return { confirmed: true }; };
+      fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
       const context = { eventName, repository: 'o/r', payload: {
         action: 'opened', repository: { full_name: 'o/r' },
         [itemKey]: { number: 4, title: 'Title', body: 'Body', user: { login: 'contributor' } },
@@ -85,11 +85,11 @@ test('enforce mode skips disabled labels and reuses genuine responses for issues
 test('enforce mode defaults labeling on for existing Action input fixtures', async () => {
   const fixture = setup();
   fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: false }; };
-  fixture.api.createReviewLabel = async () => { fixture.calls.push('label_create'); };
-  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+  fixture.api.createReviewLabel = async () => { fixture.calls.push('label_create'); return { confirmed: true }; };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
   const outcome = await moderate({ getContext, getInputs, api: fixture.api, score: fixture.score });
   assert.equal(outcome.outcome, 'closed');
-  assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state', 'label_lookup', 'label_create', 'state',
+  assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state', 'label_lookup', 'state', 'label_create', 'state',
     'label_apply', 'state', 'close']);
 });
 
@@ -100,7 +100,7 @@ test('response-only mode confirms issue and pull request responses without closi
   ]) {
     const fixture = setup();
     fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
-    fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+    fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
     const context = { eventName, repository: 'o/r', payload: {
       action: 'opened', repository: { full_name: 'o/r' },
       [itemKey]: { number: 4, title: 'Title', body: 'Body', user: { login: 'contributor' } },
@@ -117,7 +117,7 @@ test('response-only mode confirms issue and pull request responses without closi
 test('response-only mode defaults to existing closure behavior unless explicitly disabled', async () => {
   const fixture = setup();
   fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
-  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
   const outcome = await moderate({ getContext, getInputs: () => ({ reviewLabel: 'false' }), api: fixture.api, score: fixture.score });
   assert.equal(outcome.outcome, 'closed');
   assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state', 'close']);
@@ -127,7 +127,7 @@ test('uses real classifier result and enforces inclusive unrounded cutoff', asyn
   for (const [value, expected] of [[0.6, 'below_cutoff'], [0.799999, 'below_cutoff'], [0.8, 'closed'], [0.800001, 'closed']]) {
     const fixture = setup(value);
     fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
-    fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+    fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
     const outcome = await moderate({ getContext, getInputs: () => ({ reviewLabel: 'false' }), api: fixture.api, score: fixture.score });
     assert.equal(outcome.outcome, expected);
     assert.equal(fixture.scored, 1);
@@ -147,12 +147,12 @@ test('observe mode skips all GitHub calls when review labeling is disabled', asy
 test('observe mode flags at the inclusive cutoff using only state checks and label operations for an issue', async () => {
   const fixture = setup(0.8);
   fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: false }; };
-  fixture.api.createReviewLabel = async () => { fixture.calls.push('label_create'); };
-  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+  fixture.api.createReviewLabel = async () => { fixture.calls.push('label_create'); return { confirmed: true }; };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
   const outcome = await moderate({ getContext, getInputs: observeInputs, api: fixture.api, score: fixture.score });
   assert.equal(outcome.outcome, 'flagged');
   assert.equal(outcome.score, 0.8);
-  assert.deepEqual(fixture.calls, ['state', 'label_lookup', 'label_create', 'state', 'label_apply']);
+  assert.deepEqual(fixture.calls, ['state', 'label_lookup', 'state', 'label_create', 'state', 'label_apply']);
 });
 
 test('observe mode flags pull requests through issue-label operations', async () => {
@@ -163,8 +163,8 @@ test('observe mode flags pull requests through issue-label operations', async ()
   const api = {
     async getItem() { calls.push('state'); return { state: 'open', title: 'Title', body: 'Body', merged: false }; },
     async getReviewLabel() { calls.push('label_lookup'); return { exists: true }; },
-    async createReviewLabel() { calls.push('label_create'); },
-    async addLabel(item) { calls.push(`label_apply:${item.kind}`); },
+    async createReviewLabel() { calls.push('label_create'); return { confirmed: true }; },
+    async addLabel(item) { calls.push(`label_apply:${item.kind}`); return { confirmed: true }; },
   };
   const outcome = await moderate({ getContext: () => context, getInputs: observeInputs, api, score: async () => result(0.85) });
   assert.equal(outcome.outcome, 'flagged');
@@ -175,24 +175,24 @@ test('observe mode does not mask a definite label creation failure', async () =>
   const fixture = setup(0.9);
   fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: false }; };
   fixture.api.createReviewLabel = async () => { fixture.calls.push('label_create'); const error = new Error('safe API failure'); error.status = 403; throw error; };
-  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
   const outcome = await moderate({ getContext, getInputs: observeInputs, api: fixture.api, score: fixture.score });
   assert.equal(outcome.outcome, 'error');
-  assert.deepEqual(fixture.calls, ['state', 'label_lookup', 'label_create']);
+  assert.deepEqual(fixture.calls, ['state', 'label_lookup', 'state', 'label_create', 'label_lookup']);
 });
 
 test('observe mode reuses existing label and skips stale state without any label write', async () => {
   const existing = setup(0.9);
   existing.api.getReviewLabel = async () => { existing.calls.push('label_lookup'); return { exists: true }; };
   existing.api.createReviewLabel = async () => { existing.calls.push('label_create'); };
-  existing.api.addLabel = async () => { existing.calls.push('label_apply'); };
+  existing.api.addLabel = async () => { existing.calls.push('label_apply'); return { confirmed: true }; };
   const observed = await moderate({ getContext, getInputs: observeInputs, api: existing.api, score: existing.score });
   assert.equal(observed.outcome, 'flagged');
   assert.deepEqual(existing.calls, ['state', 'label_lookup', 'state', 'label_apply']);
   const stale = setup(0.9, { states: [{ state: 'closed', title: 'Title', body: 'Body' }] });
   stale.api.getReviewLabel = async () => { stale.calls.push('label_lookup'); return { exists: false }; };
-  stale.api.createReviewLabel = async () => { stale.calls.push('label_create'); };
-  stale.api.addLabel = async () => { stale.calls.push('label_apply'); };
+  stale.api.createReviewLabel = async () => { stale.calls.push('label_create'); return { confirmed: true }; };
+  stale.api.addLabel = async () => { stale.calls.push('label_apply'); return { confirmed: true }; };
   assert.equal((await moderate({ getContext, getInputs: observeInputs, api: stale.api, score: stale.score })).outcome, 'skipped');
   assert.deepEqual(stale.calls, ['state']);
 });
@@ -211,7 +211,7 @@ test('observe mode below cutoff does not read or write GitHub and enforce defaul
 test('reuses genuine matching response only in response-only mode', async () => {
   const fixture = setup(0.8, { comments: [{ id: 3, body: marker, user: { login: 'github-actions[bot]', type: 'Bot' } }] });
   fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
-  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
   const outcome = await moderate({ getContext, getInputs: responseOnlyInputs, api: fixture.api, score: fixture.score });
   assert.equal(outcome.outcome, 'commented');
   assert.equal(outcome.comment_id, 3);
@@ -236,7 +236,7 @@ test('response-only rerun retains confirmed response when state read fails', asy
 test('spoofed matching markers from contributors never count as genuine response', async () => {
   const fixture = setup(0.8, { comments: [{ id: 3, body: marker, user: { login: 'contributor', type: 'User' } }] });
   fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
-  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
   const outcome = await moderate({ getContext, getInputs: responseOnlyInputs, api: fixture.api, score: fixture.score });
   assert.equal(outcome.outcome, 'commented');
   assert.equal(outcome.comment_id, 22);
@@ -246,7 +246,7 @@ test('spoofed matching markers from contributors never count as genuine response
 test('reuses only a genuine bot comment and checks state before response and closure', async () => {
   const fixture = setup(0.8, { comments: [{ id: 3, body: `spoof ${marker}`, user: { login: 'contributor', type: 'User' } }] });
   fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
-  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
   const outcome = await moderate({ getContext, getInputs, api: fixture.api, score: fixture.score });
   assert.equal(outcome.outcome, 'closed');
   assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state', 'label_lookup', 'state', 'label_apply', 'state', 'close']);
@@ -291,7 +291,7 @@ test('empty input is reported without API calls and requires real provenance', a
 test('uncertain response-only write reconciles once and does not blindly repost or close', async () => {
   const fixture = setup();
   fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
-  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
   let listings = 0;
   fixture.api.listComments = async () => { listings++; return listings === 1 ? [] : [{ id: 22, body: marker, user: { login: 'github-actions[bot]', type: 'Bot' } }]; };
   fixture.api.createComment = async () => { fixture.calls.push('post'); throw new Error('timeout secret'); };
@@ -330,7 +330,7 @@ test('response-only stale submissions do not post and state changes after respon
 test('response-only mode leaves observe mode label-only and never posts or closes', async () => {
   const fixture = setup(0.9);
   fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
-  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
   const outcome = await moderate({ getContext, getInputs: () => ({ mode: 'observe', autoClose: 'false' }),
     api: fixture.api, score: fixture.score });
   assert.equal(outcome.outcome, 'flagged');
@@ -346,9 +346,13 @@ test('failed reconciliation and close failures are safe partial errors', async (
   assert.equal(uncertain.uncertainty, true);
   assert.equal(fixture.calls.includes('close'), false);
   const closeFailure = setup();
-  closeFailure.api.closeItem = async () => { throw new Error('raw token'); };
+  closeFailure.api.getReviewLabel = async () => { closeFailure.calls.push('label_lookup'); return { exists: true }; };
+  closeFailure.api.addLabel = async () => { closeFailure.calls.push('label_apply'); return { confirmed: true }; };
+  closeFailure.api.closeItem = async () => { closeFailure.calls.push('close'); throw new Error('raw token'); };
   const partial = await moderate({ getContext, getInputs, api: closeFailure.api, score: closeFailure.score });
   assert.equal(partial.outcome, 'error');
   assert.equal(partial.partial, true);
   assert.equal(partial.error.includes('raw token'), false);
+  assert.ok(closeFailure.calls.indexOf('label_apply') < closeFailure.calls.lastIndexOf('state'));
+  assert.ok(closeFailure.calls.indexOf('close') > closeFailure.calls.lastIndexOf('state'));
 });

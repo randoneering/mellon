@@ -26,6 +26,8 @@ function apiFixture() {
         calls.push('post');
         return { id: 22, body, user: { login: 'github-actions[bot]', type: 'Bot' } };
       },
+      async getReviewLabel() { calls.push('label_lookup'); return { exists: true }; },
+      async addLabel() { calls.push('label_apply'); return { confirmed: true }; },
       async closeItem() { calls.push('close'); return { state: 'closed' }; },
     },
   };
@@ -112,5 +114,9 @@ for (const phase of ['pre-close state', 'close request']) {
     assert.equal(result.input_sha256, classified.input_sha256);
     assert.ok(!JSON.stringify(result).includes('PRIVATE_API_FIXTURE'));
     if (phase === 'pre-close state') assert.ok(!fixture.calls.includes('close'));
+    if (phase === 'close request') {
+      assert.ok(fixture.calls.indexOf('label_apply') < fixture.calls.lastIndexOf('state'));
+      assert.ok(fixture.calls.indexOf('close') > fixture.calls.lastIndexOf('state'));
+    }
   });
 }

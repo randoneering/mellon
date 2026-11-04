@@ -236,6 +236,7 @@ test('built observe mode flags issue and PR using only repository label writes',
     assert.deepEqual(run.requests.map(({ method, pathname }) => [method, pathname]), [
       ['GET', `/repos/owner/repo/${kind === 'issue' ? 'issues' : 'pulls'}/${item}`],
       ['GET', '/repos/owner/repo/labels/mellon%3A%20review'],
+      ['GET', `/repos/owner/repo/${kind === 'issue' ? 'issues' : 'pulls'}/${item}`],
       ['POST', '/repos/owner/repo/labels'],
       ['GET', `/repos/owner/repo/${kind === 'issue' ? 'issues' : 'pulls'}/${item}`],
       ['POST', `/repos/owner/repo/issues/${item}/labels`],

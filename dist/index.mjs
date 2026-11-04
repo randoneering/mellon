@@ -7534,8 +7534,10 @@ var API_ROOT = "https://api.github.com";
 var MAX_BODY_BYTES = 1024 * 1024;
 var MAX_PAGES = 100;
 var REVIEW_LABEL = "mellon: review";
-function safeError() {
-  return new Error("GitHub API request failed safely.");
+function safeError(status) {
+  const error = new Error("GitHub API request failed safely.");
+  if (Number.isInteger(status)) Object.defineProperty(error, "status", { value: status });
+  return error;
 }
 function resource(repository, number, suffix = "") {
   if (typeof repository !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) || !Number.isSafeInteger(number) || number <= 0) throw safeError();
@@ -7649,15 +7651,6 @@ function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 3e4, signal,
       signal?.removeEventListener("abort", onAbort);
     }
   }
-  async function retryLabelRequest(url, options, validate) {
-    try {
-      const result = await request(url, options);
-      return validate(result.value);
-    } catch (error) {
-      if (error?.status && error.status < 500) throw error?.status === 422 ? error : safeError();
-      throw safeError();
-    }
-  }
   async function listLabels(context) {
     const base = resource(context.repository, context.number, "/labels") + "?per_page=100";
     let url = base;
@@ -7686,22 +7679,9 @@ function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 3e4, signal,
     async createReviewLabel({ repository }) {
       if (typeof repository !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw safeError();
       const url = `${API_ROOT}/repos/${repository}/labels`;
-      const body = { name: REVIEW_LABEL, color: "fbca04", description: "Flagged by Mellon observation mode." };
-      try {
-        await retryLabelRequest(url, { method: "POST", body }, (value) => {
-          if (labelName(value) !== REVIEW_LABEL) throw safeError();
-          return value;
-        });
-      } catch (error) {
-        if (error?.status !== 422 && error?.status && error.status < 500) throw safeError();
-        try {
-          const { value } = await request(`${API_ROOT}/repos/${repository}/labels/${encodeURIComponent(REVIEW_LABEL)}`);
-          if (labelName(value) === REVIEW_LABEL) return { confirmed: true };
-        } catch {
-          throw safeError();
-        }
-        throw safeError();
-      }
+      const body = { name: REVIEW_LABEL, color: "fbca04", description: "Flagged by Mellon for maintainer review." };
+      const { value } = await request(url, { method: "POST", body });
+      if (labelName(value) !== REVIEW_LABEL) throw safeError();
       return { confirmed: true };
     },
     async getItemLabels(context) {
@@ -7709,21 +7689,10 @@ function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 3e4, signal,
     },
     async addLabel({ repository, number }) {
       const url = resource(repository, number, "/labels");
-      try {
-        const result = await retryLabelRequest(url, { method: "POST", body: { labels: [REVIEW_LABEL] } }, (value) => {
-          const labels = validateLabels(value);
-          if (!labels.some((label) => label.name === REVIEW_LABEL)) throw safeError();
-          return labels;
-        });
-        return { confirmed: result.some((label) => label.name === REVIEW_LABEL) };
-      } catch {
-        try {
-          const labels = await listLabels({ repository, number });
-          return { confirmed: labels.some((label) => label.name === REVIEW_LABEL) };
-        } catch {
-          throw safeError();
-        }
-      }
+      const { value } = await request(url, { method: "POST", body: { labels: [REVIEW_LABEL] } });
+      const labels = validateLabels(value);
+      if (!labels.some((label) => label.name === REVIEW_LABEL)) throw safeError();
+      return { confirmed: true };
     },
     async getItem({ repository, number, kind }) {
       if (kind !== "issue" && kind !== "pull_request") throw safeError();
@@ -12999,41 +12968,47 @@ async function hasReviewLabel(api, context) {
   }
   return labels.some((label) => label.name === REVIEW_LABEL2);
 }
-async function ensureReviewLabel(api, context) {
+var LABEL_WRITE_ATTEMPTS = 3;
+var LABEL_RETRY_DELAY_MS = 25;
+function retryableLabelFailure(error) {
+  return !Number.isInteger(error?.status) || error.status >= 500;
+}
+function labelRetryDelay() {
+  return new Promise((resolve) => setTimeout(resolve, LABEL_RETRY_DELAY_MS));
+}
+async function ensureReviewLabel(api, context, isCurrent) {
   let label = await api.getReviewLabel(context);
   if (!label || typeof label !== "object" || typeof label.exists !== "boolean") throw new Error("Label lookup response is invalid.");
-  if (!label.exists) {
+  if (label.exists) return { stale: false };
+  for (let attempt = 0; attempt < LABEL_WRITE_ATTEMPTS; attempt++) {
+    if (!await isCurrent()) return { stale: true };
     try {
       const created = await api.createReviewLabel(context);
-      if (created !== void 0 && (!created || typeof created !== "object" || created.confirmed !== true)) {
-        throw new Error("Label creation was not confirmed.");
-      }
+      if (created?.confirmed === true) return { stale: false };
+      throw new Error("Label creation was not confirmed.");
     } catch (error) {
-      if (Number.isInteger(error?.status) && error.status < 500 && error.status !== 422) throw error;
       label = await api.getReviewLabel(context);
-      if (!label || typeof label !== "object" || label.exists !== true) throw new Error("Label creation could not be confirmed.");
+      if (!label || typeof label !== "object" || typeof label.exists !== "boolean") throw new Error("Label lookup response is invalid.");
+      if (label.exists) return { stale: false };
+      if (!retryableLabelFailure(error) || attempt === LABEL_WRITE_ATTEMPTS - 1) throw new Error("Label creation could not be confirmed.");
+      await labelRetryDelay();
     }
   }
 }
-async function applyReviewLabel(api, context) {
-  try {
-    const applied = await api.addLabel(context);
-    if (applied !== void 0 && (!applied || typeof applied !== "object" || applied.confirmed !== true)) {
+async function applyReviewLabel(api, context, isCurrent) {
+  for (let attempt = 0; attempt < LABEL_WRITE_ATTEMPTS; attempt++) {
+    if (!await isCurrent()) return { stale: true };
+    try {
+      const applied = await api.addLabel(context);
+      if (applied?.confirmed === true) return { stale: false };
       throw new Error("Label application was not confirmed.");
+    } catch (error) {
+      if (await hasReviewLabel(api, context)) return { stale: false };
+      if (!retryableLabelFailure(error) || attempt === LABEL_WRITE_ATTEMPTS - 1) throw new Error("Label application could not be confirmed.");
+      await labelRetryDelay();
     }
-  } catch {
-    if (!await hasReviewLabel(api, context)) throw new Error("Label application could not be confirmed.");
   }
-}
-async function reconcileReviewLabel(api, context) {
-  const current = await currentItem(api, context);
-  if (current.state !== "open" || current.merged === true || current.title !== context.title || current.body !== context.body) {
-    return { matches: false, labeled: false };
-  }
-  let labeled = Array.isArray(current.labels) && current.labels.some((label) => label.name === REVIEW_LABEL2);
-  if (!labeled) labeled = await hasReviewLabel(api, context);
-  if (!labeled) return { matches: true, labeled: false };
-  return { matches: true, labeled: true };
+  throw new Error("Label application could not be confirmed.");
 }
 async function moderate({ getContext, getInputs, api, score, prepare = prepareSubmission } = {}) {
   const eligible = createEligibleContinuation({ getContext, getInputs });
@@ -13087,15 +13062,15 @@ async function moderate({ getContext, getInputs, api, score, prepare = prepareSu
           partial: false
         };
         try {
-          await ensureReviewLabel(api, context);
-          if (!await currentMatches(api, context)) return {
+          const ensured = await ensureReviewLabel(api, context, () => currentMatches(api, context));
+          const applied = ensured.stale ? ensured : await applyReviewLabel(api, context, () => currentMatches(api, context));
+          if (applied.stale) return {
             outcome: "skipped",
             reason: "stale_before_label",
             cutoff: CUTOFF,
             score: classified.robot_score,
             partial: false
           };
-          await applyReviewLabel(api, context);
         } catch {
           return safeFailure("Observation label could not be applied safely.");
         }
@@ -13154,38 +13129,30 @@ ${marker}`;
             cutoff: CUTOFF,
             score: classified.robot_score,
             comment_id: existing.id,
-            partial: posted
+            partial: posted,
+            detector_revision: classified.detector_revision,
+            model_sha256: classified.model_sha256,
+            input_sha256: classified.input_sha256
           };
         } catch {
           return safeFailure("Response is confirmed, but current state could not be checked before labeling.", partial);
         }
         try {
-          await ensureReviewLabel(api, context);
-          if (!await currentMatches(api, context)) return {
+          const ensured = await ensureReviewLabel(api, context, () => currentMatches(api, context));
+          const applied = ensured.stale ? ensured : await applyReviewLabel(api, context, () => currentMatches(api, context));
+          if (applied.stale) return {
             outcome: "skipped",
             reason: "stale_before_label",
             cutoff: CUTOFF,
             score: classified.robot_score,
             comment_id: existing.id,
-            partial: posted
+            partial: posted,
+            detector_revision: classified.detector_revision,
+            model_sha256: classified.model_sha256,
+            input_sha256: classified.input_sha256
           };
-          await applyReviewLabel(api, context);
         } catch {
-          let reconciliation;
-          try {
-            reconciliation = await reconcileReviewLabel(api, context);
-          } catch {
-            return safeFailure("Response is confirmed, but label reconciliation failed.", partial);
-          }
-          if (!reconciliation.matches) return {
-            outcome: "skipped",
-            reason: "stale_before_label",
-            cutoff: CUTOFF,
-            score: classified.robot_score,
-            comment_id: existing.id,
-            partial: posted
-          };
-          if (!reconciliation.labeled) return safeFailure("Response is confirmed, but the review label could not be applied.", partial);
+          return safeFailure("Response is confirmed, but the review label could not be applied.", partial);
         }
       }
       if (!policy.autoClose) {
@@ -13317,7 +13284,7 @@ function normalizeResult(result) {
     outcome: result?.outcome,
     ...score === void 0 ? {} : { robotScore: score },
     ...result?.outcome === "flagged" ? { labelApplied: result.label_applied === true } : {},
-    ...result?.outcome === "error" ? {
+    ...result?.outcome === "error" || result?.outcome === "skipped" && result.partial === true ? {
       partial: result.partial === true,
       commentId: validCommentId(result.comment_id),
       uncertainty: result.uncertainty === true,
@@ -13476,7 +13443,7 @@ async function writeSummary(filename, result) {
   const score = result.robotScore === void 0 ? "" : `
 
 Robot score: ${result.robotScore}.`;
-  const partial = result.outcome === "error" && result.partial ? `
+  const partial = result.partial ? `
 
 Response confirmed: yes
 Closure completed: no${result.commentId === void 0 ? "" : `

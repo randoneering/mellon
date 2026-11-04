@@ -37,28 +37,22 @@ test('GitHub client supports fixed review-label lookup, create, and application 
     ['POST', '/repos/o/r/labels'],
     ['POST', '/repos/o/r/issues/4/labels'],
   ]);
-  assert.deepEqual(JSON.parse(calls[1].options.body), { name: 'mellon: review', color: 'fbca04', description: 'Flagged by Mellon observation mode.' });
+  assert.deepEqual(JSON.parse(calls[1].options.body), { name: 'mellon: review', color: 'fbca04', description: 'Flagged by Mellon for maintainer review.' });
   assert.deepEqual(JSON.parse(calls[2].options.body), { labels: ['mellon: review'] });
 });
 
-test('label creation 422 race is reconciled, while unrelated failures remain errors', async () => {
+test('label write errors expose only status for safe caller reconciliation', async () => {
   const calls = [];
-  let labelAvailable = false;
   const client = createGitHubClient({ token: 'token', fetchImpl: async (url, options) => {
-    const pathname = new URL(url).pathname;
-    calls.push([options.method, pathname]);
-    if (options.method === 'POST' && pathname === '/repos/o/r/labels') {
-      return new Response(JSON.stringify({ message: 'Validation Failed' }), { status: 422 });
-    }
-    if (pathname.includes('/labels/mellon%3A%20review')) {
-      labelAvailable = true;
-      return new Response(JSON.stringify({ name: 'mellon: review' }), { status: 200 });
-    }
-    return new Response('private failure', { status: 500 });
+    calls.push(options.method);
+    return new Response('private failure detail', { status: 503 });
   } });
-  await client.createReviewLabel({ repository: 'o/r' });
-  assert.equal(labelAvailable, true);
-  assert.deepEqual(calls, [['POST', '/repos/o/r/labels'], ['GET', '/repos/o/r/labels/mellon%3A%20review']]);
+  await assert.rejects(client.createReviewLabel({ repository: 'o/r' }), error => {
+    assert.equal(error.status, 503);
+    assert.equal(error.message.includes('private failure detail'), false);
+    return true;
+  });
+  assert.deepEqual(calls, ['POST']);
   const unavailable = createGitHubClient({ token: 'token', fetchImpl: async () => new Response('private failure', { status: 500 }) });
   await assert.rejects(unavailable.getReviewLabel({ repository: 'o/r' }), /failed safely/);
 });
@@ -129,65 +123,17 @@ test('GitHub comment pagination is same-origin and includes every page', async (
   assert.equal(urls.length, 2);
 });
 
-test('uncertain label application reconciles before any repeated POST', async () => {
-  const urls = [];
-  const client = createGitHubClient({ token: 'token', fetchImpl: async (url, options) => {
-    const parsed = new URL(url);
-    urls.push([options.method ?? 'GET', parsed.pathname, parsed.search]);
-    if (options.method === 'POST') return new Response(null, { status: 500 });
-    if (options.method === 'GET' && parsed.searchParams.get('page') === '2') {
-      return new Response('[{"name":"mellon: review"}]', { status: 200 });
-    }
-    if (options.method === 'GET' && parsed.pathname === '/repos/o/r/issues/4/labels') {
-      return new Response('[{"name":"other"}]', { status: 200, headers: {
-        link: '<https://api.github.com/repos/o/r/issues/4/labels?page=2&per_page=100>; rel="next"',
-      } });
-    }
-    throw new Error('unexpected endpoint');
+test('label application does not retry or reconcile outside moderation state checks', async () => {
+  let calls = 0;
+  const client = createGitHubClient({ token: 'token', fetchImpl: async () => {
+    calls++;
+    return new Response(null, { status: 503 });
   } });
-  const result = await client.addLabel({ repository: 'o/r', number: 4 });
-  assert.deepEqual(result, { confirmed: true });
-  assert.deepEqual(urls, [
-    ['POST', '/repos/o/r/issues/4/labels', ''],
-    ['GET', '/repos/o/r/issues/4/labels', '?per_page=100'],
-    ['GET', '/repos/o/r/issues/4/labels', '?page=2&per_page=100'],
-  ]);
+  await assert.rejects(client.addLabel({ repository: 'o/r', number: 4 }), error => error.status === 503);
+  assert.equal(calls, 1);
 });
 
-test('uncertain label creation reconciles before any repeated POST', async () => {
-  const calls = [];
-  const client = createGitHubClient({ token: 'token', fetchImpl: async (url, options) => {
-    const pathname = new URL(url).pathname;
-    calls.push([options.method ?? 'GET', pathname]);
-    if (options.method === 'POST') return new Response(null, { status: 503 });
-    return new Response('{"name":"mellon: review"}', { status: 200 });
-  } });
-  assert.deepEqual(await client.createReviewLabel({ repository: 'o/r' }), { confirmed: true });
-  assert.deepEqual(calls, [
-    ['POST', '/repos/o/r/labels'],
-    ['GET', '/repos/o/r/labels/mellon%3A%20review'],
-  ]);
-});
 
-test('uncertain label writes do not proceed after reconciliation finds stale state', async () => {
-  const calls = [];
-  const client = createGitHubClient({ token: 'token', fetchImpl: async (url, options) => {
-    const parsed = new URL(url);
-    calls.push([options.method ?? 'GET', parsed.pathname]);
-    if (options.method === 'POST') return new Response(null, { status: 500 });
-    if (parsed.pathname === '/repos/o/r/labels/mellon%3A%20review') return new Response(null, { status: 404 });
-    if (parsed.pathname === '/repos/o/r/issues/4/labels') return new Response('[{"name":"other"}]', { status: 200 });
-    throw new Error('unexpected endpoint');
-  } });
-  await assert.rejects(client.createReviewLabel({ repository: 'o/r' }), /failed safely/);
-  await assert.deepEqual(await client.addLabel({ repository: 'o/r', number: 4 }), { confirmed: false });
-  assert.deepEqual(calls, [
-    ['POST', '/repos/o/r/labels'],
-    ['GET', '/repos/o/r/labels/mellon%3A%20review'],
-    ['POST', '/repos/o/r/issues/4/labels'],
-    ['GET', '/repos/o/r/issues/4/labels'],
-  ]);
-});
 
 test('GitHub client rejects malformed label arrays during reconciliation', async () => {
   const client = createGitHubClient({ token: 'token', fetchImpl: async () => new Response('[{"name":3}]', { status: 200 }) });

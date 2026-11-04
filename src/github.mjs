@@ -2,10 +2,11 @@ const API_ROOT = 'https://api.github.com';
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_PAGES = 100;
 const REVIEW_LABEL = 'mellon: review';
-const LABEL_RETRY_LIMIT = 3;
 
-function safeError() {
-  return new Error('GitHub API request failed safely.');
+function safeError(status) {
+  const error = new Error('GitHub API request failed safely.');
+  if (Number.isInteger(status)) Object.defineProperty(error, 'status', { value: status });
+  return error;
 }
 
 function resource(repository, number, suffix = '') {
@@ -128,15 +129,6 @@ export function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 30_00
       signal?.removeEventListener('abort', onAbort);
     }
   }
-  async function retryLabelRequest(url, options, validate) {
-    try {
-      const result = await request(url, options);
-      return validate(result.value);
-    } catch (error) {
-      if (error?.status && error.status < 500) throw error?.status === 422 ? error : safeError();
-      throw safeError();
-    }
-  }
   async function listLabels(context) {
     const base = resource(context.repository, context.number, '/labels') + '?per_page=100';
     let url = base;
@@ -165,23 +157,9 @@ export function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 30_00
     async createReviewLabel({ repository }) {
       if (typeof repository !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) throw safeError();
       const url = `${API_ROOT}/repos/${repository}/labels`;
-      const body = { name: REVIEW_LABEL, color: 'fbca04', description: 'Flagged by Mellon observation mode.' };
-      try {
-        await retryLabelRequest(url, { method: 'POST', body }, value => {
-          if (labelName(value) !== REVIEW_LABEL) throw safeError();
-          return value;
-        });
-      } catch (error) {
-        if (error?.status !== 422 && error?.status && error.status < 500) throw safeError();
-        try {
-          // A concurrent or uncertain creation is accepted only after state confirms the label.
-          const { value } = await request(`${API_ROOT}/repos/${repository}/labels/${encodeURIComponent(REVIEW_LABEL)}`);
-          if (labelName(value) === REVIEW_LABEL) return { confirmed: true };
-        } catch {
-          throw safeError();
-        }
-        throw safeError();
-      }
+      const body = { name: REVIEW_LABEL, color: 'fbca04', description: 'Flagged by Mellon for maintainer review.' };
+      const { value } = await request(url, { method: 'POST', body });
+      if (labelName(value) !== REVIEW_LABEL) throw safeError();
       return { confirmed: true };
     },
     async getItemLabels(context) {
@@ -189,21 +167,10 @@ export function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 30_00
     },
     async addLabel({ repository, number }) {
       const url = resource(repository, number, '/labels');
-      try {
-        const result = await retryLabelRequest(url, { method: 'POST', body: { labels: [REVIEW_LABEL] } }, value => {
-          const labels = validateLabels(value);
-          if (!labels.some(label => label.name === REVIEW_LABEL)) throw safeError();
-          return labels;
-        });
-        return { confirmed: result.some(label => label.name === REVIEW_LABEL) };
-      } catch {
-        try {
-          const labels = await listLabels({ repository, number });
-          return { confirmed: labels.some(label => label.name === REVIEW_LABEL) };
-        } catch {
-          throw safeError();
-        }
-      }
+      const { value } = await request(url, { method: 'POST', body: { labels: [REVIEW_LABEL] } });
+      const labels = validateLabels(value);
+      if (!labels.some(label => label.name === REVIEW_LABEL)) throw safeError();
+      return { confirmed: true };
     },
     async getItem({ repository, number, kind }) {
       if (kind !== 'issue' && kind !== 'pull_request') throw safeError();
