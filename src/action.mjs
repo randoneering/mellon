@@ -79,6 +79,7 @@ function normalizeResult(result) {
   const normalized = {
     outcome: result?.outcome,
     ...(score === undefined ? {} : { robotScore: score }),
+    ...(result?.outcome === 'flagged' ? { labelApplied: result.label_applied === true } : {}),
     ...(result?.outcome === 'error' ? { partial: result.partial === true, commentId: validCommentId(result.comment_id),
       uncertainty: result.uncertainty === true, provenance: validProvenance(result) } : {}),
   };
@@ -168,11 +169,13 @@ export async function runAction({
         const response = typeof getInput === 'function' ? getInput('response') : '';
         const mode = typeof getInput === 'function' ? getInput('mode') : '';
         const autoClose = typeof getInput === 'function' ? getInput('auto-close') : '';
+        const reviewLabel = typeof getInput === 'function' ? getInput('review-label') : '';
         return {
           ...(allowlist === '' ? {} : { allowlist }),
           ...(response === '' ? {} : { response }),
           ...(mode === '' ? {} : { mode }),
           ...(autoClose === '' ? {} : { autoClose }),
+          ...(reviewLabel === '' ? {} : { reviewLabel }),
         };
       };
       let api;
@@ -186,6 +189,7 @@ export async function runAction({
       const candidateApi = {
         listComments: (...args) => lazyApi().listComments(...args),
         getItem: (...args) => lazyApi().getItem(...args),
+        getItemLabels: (...args) => lazyApi().getItemLabels(...args),
         createComment: (...args) => lazyApi().createComment(...args),
         closeItem: (...args) => lazyApi().closeItem(...args),
         getReviewLabel: (...args) => lazyApi().getReviewLabel(...args),
@@ -231,7 +235,8 @@ async function writeSummary(filename, result) {
   const partial = result.outcome === 'error' && result.partial
     ? `\n\nResponse confirmed: yes\nClosure completed: no${result.commentId === undefined ? '' : `\nComment ID: ${result.commentId}`}${result.provenance ? `\nDetector revision: ${result.provenance.detectorRevision}\nModel SHA-256: ${result.provenance.modelSha256}\nInput SHA-256: ${result.provenance.inputSha256}` : ''}`
     : '';
-  const labelNote = result.outcome === 'flagged' ? '\n\nLabel: mellon: review' : '';
+  const labelNote = result.outcome === 'flagged' && result.labelApplied
+    ? '\n\nLabel: mellon: review' : '';
   const uncertainty = result.outcome === 'error' && result.uncertainty
     ? '\n\nResponse confirmation: uncertain' : '';
   try {

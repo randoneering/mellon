@@ -26,9 +26,66 @@ function genuine(comment, marker) {
   return Number.isSafeInteger(comment.id) && comment.id > 0 && comment.user?.login === 'github-actions[bot]' && comment.user?.type === 'Bot' && comment.body.includes(marker);
 }
 
-async function currentMatches(api, context) {
+async function currentItem(api, context) {
   const current = await api.getItem(context);
+  if (!current || typeof current !== 'object' || !['open', 'closed'].includes(current.state) ||
+      typeof current.title !== 'string' || current.body !== null && typeof current.body !== 'string' ||
+      current.merged !== undefined && typeof current.merged !== 'boolean' ||
+      current.labels !== undefined && (!Array.isArray(current.labels) || current.labels.some(label =>
+        !label || typeof label !== 'object' || typeof label.name !== 'string'))) throw new Error('Current item response is invalid.');
+  return current;
+}
+
+async function currentMatches(api, context) {
+  const current = await currentItem(api, context);
   return current.state === 'open' && current.merged !== true && current.title === context.title && current.body === context.body;
+}
+
+async function hasReviewLabel(api, context) {
+  const labels = await api.getItemLabels(context);
+  if (!Array.isArray(labels) || labels.some(label => !label || typeof label !== 'object' || typeof label.name !== 'string')) {
+    throw new Error('Current label response is invalid.');
+  }
+  return labels.some(label => label.name === REVIEW_LABEL);
+}
+
+async function ensureReviewLabel(api, context) {
+  let label = await api.getReviewLabel(context);
+  if (!label || typeof label !== 'object' || typeof label.exists !== 'boolean') throw new Error('Label lookup response is invalid.');
+  if (!label.exists) {
+    try {
+      const created = await api.createReviewLabel(context);
+      if (created !== undefined && (!created || typeof created !== 'object' || created.confirmed !== true)) {
+        throw new Error('Label creation was not confirmed.');
+      }
+    } catch (error) {
+      if (Number.isInteger(error?.status) && error.status < 500 && error.status !== 422) throw error;
+      label = await api.getReviewLabel(context);
+      if (!label || typeof label !== 'object' || label.exists !== true) throw new Error('Label creation could not be confirmed.');
+    }
+  }
+}
+
+async function applyReviewLabel(api, context) {
+  try {
+    const applied = await api.addLabel(context);
+    if (applied !== undefined && (!applied || typeof applied !== 'object' || applied.confirmed !== true)) {
+      throw new Error('Label application was not confirmed.');
+    }
+  } catch {
+    if (!await hasReviewLabel(api, context)) throw new Error('Label application could not be confirmed.');
+  }
+}
+
+async function reconcileReviewLabel(api, context) {
+  const current = await currentItem(api, context);
+  if (current.state !== 'open' || current.merged === true || current.title !== context.title || current.body !== context.body) {
+    return { matches: false, labeled: false };
+  }
+  let labeled = Array.isArray(current.labels) && current.labels.some(label => label.name === REVIEW_LABEL);
+  if (!labeled) labeled = await hasReviewLabel(api, context);
+  if (!labeled) return { matches: true, labeled: false };
+  return { matches: true, labeled: true };
 }
 
 export async function moderate({ getContext, getInputs, api, score, prepare = prepareSubmission } = {}) {
@@ -54,23 +111,25 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
         input_sha256: classified.input_sha256, partial: false,
       };
       if (policy.mode === 'observe') {
+        if (!policy.reviewLabel) return { outcome: 'flagged', cutoff: CUTOFF, score: classified.robot_score,
+          detector_revision: classified.detector_revision, model_sha256: classified.model_sha256,
+          input_sha256: classified.input_sha256, partial: false };
         let matches;
         try { matches = await currentMatches(api, context); }
         catch { return safeFailure('Current item state could not be checked safely.'); }
         if (!matches) return { outcome: 'skipped', reason: 'stale_before_label', cutoff: CUTOFF,
           score: classified.robot_score, partial: false };
         try {
-          const label = await api.getReviewLabel(context);
-          if (!label.exists) await api.createReviewLabel(context);
+          await ensureReviewLabel(api, context);
           if (!await currentMatches(api, context)) return { outcome: 'skipped', reason: 'stale_before_label',
             cutoff: CUTOFF, score: classified.robot_score, partial: false };
-          await api.addLabel(context);
+          await applyReviewLabel(api, context);
         } catch {
           return safeFailure('Observation label could not be applied safely.');
         }
         return { outcome: 'flagged', cutoff: CUTOFF, score: classified.robot_score,
           detector_revision: classified.detector_revision, model_sha256: classified.model_sha256,
-          input_sha256: classified.input_sha256, label: REVIEW_LABEL, partial: false };
+          input_sha256: classified.input_sha256, label: REVIEW_LABEL, label_applied: true, partial: false };
       }
       const marker = markerFor(context, classified);
       let comments = await api.listComments(context);
@@ -97,6 +156,33 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
         detector_revision: classified.detector_revision, model_sha256: classified.model_sha256,
         input_sha256: classified.input_sha256,
       };
+      if (policy.reviewLabel) {
+        try {
+          if (!await currentMatches(api, context)) return {
+            outcome: 'skipped', reason: 'stale_before_label', cutoff: CUTOFF,
+            score: classified.robot_score, comment_id: existing.id, partial: posted,
+          };
+        } catch {
+          return safeFailure('Response is confirmed, but current state could not be checked before labeling.', partial);
+        }
+        try {
+          await ensureReviewLabel(api, context);
+          if (!await currentMatches(api, context)) return {
+            outcome: 'skipped', reason: 'stale_before_label', cutoff: CUTOFF,
+            score: classified.robot_score, comment_id: existing.id, partial: posted,
+          };
+          await applyReviewLabel(api, context);
+        } catch {
+          let reconciliation;
+          try { reconciliation = await reconcileReviewLabel(api, context); }
+          catch { return safeFailure('Response is confirmed, but label reconciliation failed.', partial); }
+          if (!reconciliation.matches) return {
+            outcome: 'skipped', reason: 'stale_before_label', cutoff: CUTOFF,
+            score: classified.robot_score, comment_id: existing.id, partial: posted,
+          };
+          if (!reconciliation.labeled) return safeFailure('Response is confirmed, but the review label could not be applied.', partial);
+        }
+      }
       if (!policy.autoClose) {
         try {
           if (!await currentMatches(api, context)) return {

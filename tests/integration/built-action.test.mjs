@@ -59,6 +59,9 @@ globalThis.fetch = async (input, init = {}) => {
       ? new Response(JSON.stringify({ name: 'mellon: review' }), { status: 200 })
       : new Response(null, { status: 404 });
   }
+  if (url.pathname.startsWith('/repos/owner/repo/issues/') && url.pathname.endsWith('/labels') && (init.method || 'GET') === 'GET') {
+    return new Response(JSON.stringify([]), { status: 200 });
+  }
   if (url.pathname === '/repos/owner/repo/labels' && init.method === 'POST') {
     if (process.env.TEST_LABEL_FAILURE === 'true') return new Response('sensitive label API failure', { status: 403 });
     return new Response(JSON.stringify({ name: 'mellon: review' }), { status: 201 });
@@ -198,16 +201,19 @@ test('built issue Action uses packaged score and rejects an exact matching contr
   const sourceResult = await score.scoreRequest({ protocol_version: 1, text: `${title}\n\n${body}` }, path.join(artifactDirectory, 'detector'));
   const run = await runBuilt(t, { eventName: 'issues', fixture: eventFor('issues', { item: 32, title, body }), pages: [[{
     id: 9, body: marker(32, sourceResult.input_sha256), user: { login: 'contributor', type: 'User' },
-  }]] });
+  }]], labelExists: true });
   assert.equal(run.result.status, 0, `${run.result.stderr} stdout=${run.result.stdout}`);
   assert.match(run.output, /^outcome=closed\nrobot-score=0\.\d+\n$/);
-  assert.equal(run.requests.some(request => request.method === 'POST'), true);
-  assert.equal(run.requests.at(-1).method, 'PATCH');
-  assert.equal(run.requests.at(-1).pathname, '/repos/owner/repo/issues/32');
+  assert.equal(run.requests.filter(request => request.method === 'POST' && request.pathname.endsWith('/comments')).length, 1);
+  assert.deepEqual(run.requests.slice(-3).map(({ method, pathname }) => [method, pathname]), [
+    ['POST', '/repos/owner/repo/issues/32/labels'],
+    ['GET', '/repos/owner/repo/issues/32'],
+    ['PATCH', '/repos/owner/repo/issues/32'],
+  ]);
   assert.equal(run.requests.some(request => request.body?.body?.includes(injectionText)), false);
   assert.ok(run.requests.every(request => request.authorization === `Bearer ${token}`));
   const existingMarker = marker(32, sourceResult.input_sha256);
-  const botComments = run.requests.filter(request => request.method === 'POST').map(request => request.body.body);
+  const botComments = run.requests.filter(request => request.method === 'POST' && request.pathname.endsWith('/comments')).map(request => request.body.body);
   assert.equal(botComments.length, 1);
   assert.ok(botComments[0].includes(existingMarker));
   assertNoSensitiveOutput(run, [token, body, injectionText]);
@@ -310,8 +316,12 @@ test('built pull request Action reports confirmed response when closure fails', 
   assert.match(run.summary, /Detector revision: [a-f0-9]{40}/);
   assert.match(run.summary, /Model SHA-256: [a-f0-9]{64}/);
   assert.match(run.summary, /Input SHA-256: [a-f0-9]{64}/);
-  assert.equal(run.requests.filter(request => request.method === 'POST').length, 1);
-  assert.equal(run.requests.some(request => request.method === 'PATCH'), true);
+  assert.equal(run.requests.filter(request => request.method === 'POST' && request.pathname.endsWith('/comments')).length, 1);
+  assert.deepEqual(run.requests.slice(-3).map(({ method, pathname }) => [method, pathname]), [
+    ['POST', '/repos/owner/repo/issues/42/labels'],
+    ['GET', '/repos/owner/repo/pulls/42'],
+    ['PATCH', '/repos/owner/repo/pulls/42'],
+  ]);
   assertNoSensitiveOutput(run, [token, body, 'sensitive close failure']);
 });
 
@@ -353,11 +363,15 @@ test('built Action reuses a verified matching bot comment without reposting', as
   const sourceResult = await score.scoreRequest({ protocol_version: 1, text: `${title}\n\n${body}` }, path.join(artifactDirectory, 'detector'));
   const existing = { id: 27, body: marker(38, sourceResult.input_sha256), user: { login: 'github-actions[bot]', type: 'Bot' } };
   const run = await runBuilt(t, { eventName: 'issues', fixture: eventFor('issues', { item: 38, title, body }),
-    pages: [[existing]], responseMode: 'post_failure' });
+    pages: [[existing]], responseMode: 'post_failure', labelExists: true });
   assert.equal(run.result.status, 0);
   assert.equal(run.output.startsWith('outcome=closed\n'), true);
-  assert.equal(run.requests.filter(request => request.method === 'POST').length, 0);
-  assert.equal(run.requests.some(request => request.method === 'PATCH'), true);
+  assert.equal(run.requests.filter(request => request.method === 'POST' && request.pathname.endsWith('/comments')).length, 0);
+  assert.deepEqual(run.requests.slice(-3).map(({ method, pathname }) => [method, pathname]), [
+    ['POST', '/repos/owner/repo/issues/38/labels'],
+    ['GET', '/repos/owner/repo/issues/38'],
+    ['PATCH', '/repos/owner/repo/issues/38'],
+  ]);
   assertNoSensitiveOutput(run, [token, body]);
 });
 

@@ -129,6 +129,71 @@ test('GitHub comment pagination is same-origin and includes every page', async (
   assert.equal(urls.length, 2);
 });
 
+test('uncertain label application reconciles before any repeated POST', async () => {
+  const urls = [];
+  const client = createGitHubClient({ token: 'token', fetchImpl: async (url, options) => {
+    const parsed = new URL(url);
+    urls.push([options.method ?? 'GET', parsed.pathname, parsed.search]);
+    if (options.method === 'POST') return new Response(null, { status: 500 });
+    if (options.method === 'GET' && parsed.searchParams.get('page') === '2') {
+      return new Response('[{"name":"mellon: review"}]', { status: 200 });
+    }
+    if (options.method === 'GET' && parsed.pathname === '/repos/o/r/issues/4/labels') {
+      return new Response('[{"name":"other"}]', { status: 200, headers: {
+        link: '<https://api.github.com/repos/o/r/issues/4/labels?page=2&per_page=100>; rel="next"',
+      } });
+    }
+    throw new Error('unexpected endpoint');
+  } });
+  const result = await client.addLabel({ repository: 'o/r', number: 4 });
+  assert.deepEqual(result, { confirmed: true });
+  assert.deepEqual(urls, [
+    ['POST', '/repos/o/r/issues/4/labels', ''],
+    ['GET', '/repos/o/r/issues/4/labels', '?per_page=100'],
+    ['GET', '/repos/o/r/issues/4/labels', '?page=2&per_page=100'],
+  ]);
+});
+
+test('uncertain label creation reconciles before any repeated POST', async () => {
+  const calls = [];
+  const client = createGitHubClient({ token: 'token', fetchImpl: async (url, options) => {
+    const pathname = new URL(url).pathname;
+    calls.push([options.method ?? 'GET', pathname]);
+    if (options.method === 'POST') return new Response(null, { status: 503 });
+    return new Response('{"name":"mellon: review"}', { status: 200 });
+  } });
+  assert.deepEqual(await client.createReviewLabel({ repository: 'o/r' }), { confirmed: true });
+  assert.deepEqual(calls, [
+    ['POST', '/repos/o/r/labels'],
+    ['GET', '/repos/o/r/labels/mellon%3A%20review'],
+  ]);
+});
+
+test('uncertain label writes do not proceed after reconciliation finds stale state', async () => {
+  const calls = [];
+  const client = createGitHubClient({ token: 'token', fetchImpl: async (url, options) => {
+    const parsed = new URL(url);
+    calls.push([options.method ?? 'GET', parsed.pathname]);
+    if (options.method === 'POST') return new Response(null, { status: 500 });
+    if (parsed.pathname === '/repos/o/r/labels/mellon%3A%20review') return new Response(null, { status: 404 });
+    if (parsed.pathname === '/repos/o/r/issues/4/labels') return new Response('[{"name":"other"}]', { status: 200 });
+    throw new Error('unexpected endpoint');
+  } });
+  await assert.rejects(client.createReviewLabel({ repository: 'o/r' }), /failed safely/);
+  await assert.deepEqual(await client.addLabel({ repository: 'o/r', number: 4 }), { confirmed: false });
+  assert.deepEqual(calls, [
+    ['POST', '/repos/o/r/labels'],
+    ['GET', '/repos/o/r/labels/mellon%3A%20review'],
+    ['POST', '/repos/o/r/issues/4/labels'],
+    ['GET', '/repos/o/r/issues/4/labels'],
+  ]);
+});
+
+test('GitHub client rejects malformed label arrays during reconciliation', async () => {
+  const client = createGitHubClient({ token: 'token', fetchImpl: async () => new Response('[{"name":3}]', { status: 200 }) });
+  await assert.rejects(client.getItemLabels({ repository: 'o/r', number: 4 }), /failed safely/);
+});
+
 test('GitHub client rejects cross-origin pagination before issuing another request', async () => {
   let calls = 0;
   const client = createGitHubClient({ token: 'token', fetchImpl: async () => {

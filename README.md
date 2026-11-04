@@ -54,6 +54,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           mode: observe
           allowlist: '["dependabot[bot]"]'
+          review-label: 'true'
 ```
 
 Replace the example allowlist with the exact GitHub logins you want to skip, or omit it to review every author.
@@ -66,12 +67,14 @@ mellon runs on Node 24 and requires a non-root runner.
 | Input | Default | What it does |
 | --- | --- | --- |
 | `token` | None | GitHub token with issue and pull request write permissions. |
-| `mode` | `enforce` | `observe` labels flagged submissions; `enforce` comments and closes them. |
+| `mode` | `enforce` | `observe` labels flagged submissions; `enforce` responds and closes them after confirming each step. |
 | `allowlist` | `[]` | JSON array of exact account logins to skip. |
 | `response` | Packaged message | Literal comment text used in enforcement mode. |
 | `auto-close` | `'true'` | `'false'` posts the enforcement response without closing the issue or pull request. |
+| `review-label` | `'true'` | Shared across modes. `'false'` disables automatic review labeling. |
 
-Observation mode creates `mellon: review` if needed and applies it to submissions at or above the cutoff.
+Observation mode creates `mellon: review` if needed and applies it to submissions at or above the cutoff by default.
+Set `review-label: 'false'` to disable automatic labeling in either mode; observe mode still reports flagged submissions without GitHub reads or writes.
 The label is visible to anyone who can see the issue or PR.
 Observation mode does not comment or close submissions.
 Existing labels keep their color and description.
@@ -88,8 +91,9 @@ After review, remove `mellon: review` and apply the appropriate outcome label.
 Maintainers create and apply the outcome labels themselves.
 Labels are public, so use them to describe next steps rather than assert authorship.
 
-Enforcement mode posts the response and then closes a flagged submission by default.
-Set `auto-close: 'false'` to post the response without closing it.
+Enforcement mode confirms a response first, applies `mellon: review` by default, then follows the existing auto-close setting.
+Set `review-label: 'false'` to disable automatic labeling in either mode.
+If label creation or application fails, the confirmed response remains partial work and mellon does not close the item; a later run reconciles GitHub state before retrying, without blindly reposting the response.
 The Action reports `commented` when it confirms the response but does not close the submission.
 It reuses a matching bot response on reruns rather than posting a duplicate.
 Changing `auto-close` affects later runs: turning it off does not reopen a closed item, and turning it on can close an eligible open item after reusing its response.

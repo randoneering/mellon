@@ -25,7 +25,73 @@ const getInputs = () => ({});
 const responseOnlyInputs = () => ({ autoClose: 'false' });
 const responseOnlyInputsWithMode = () => ({ mode: 'enforce', autoClose: 'false' });
 const observeInputs = () => ({ mode: 'observe' });
+const observeWithoutLabelInputs = () => ({ mode: 'observe', reviewLabel: 'false' });
 const marker = `<!-- mellon-submission-moderation-v1 repo=o/r item=4 input=${inputHash} detector=${revision} model=${hash} -->`;
+
+test('enforce mode applies enabled review labels after responses for issues and pull requests', async () => {
+  for (const [eventName, itemKey] of [
+    ['issues', 'issue'],
+    ['pull_request_target', 'pull_request'],
+  ]) {
+    for (const autoClose of ['true', 'false']) {
+      const fixture = setup();
+      fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: false }; };
+      fixture.api.createReviewLabel = async () => { fixture.calls.push('label_create'); };
+      fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+      const context = { eventName, repository: 'o/r', payload: {
+        action: 'opened', repository: { full_name: 'o/r' },
+        [itemKey]: { number: 4, title: 'Title', body: 'Body', user: { login: 'contributor' } },
+      } };
+      const outcome = await moderate({ getContext: () => context,
+        getInputs: () => ({ autoClose, reviewLabel: 'true' }), api: fixture.api, score: fixture.score });
+      assert.equal(outcome.outcome, autoClose === 'true' ? 'closed' : 'commented');
+      assert.equal(outcome.comment_id, 22);
+      assert.equal(outcome.partial, false);
+      assert.deepEqual(fixture.calls, autoClose === 'true'
+        ? ['comments', 'state', 'post', 'state', 'label_lookup', 'label_create', 'state', 'label_apply', 'state', 'close']
+        : ['comments', 'state', 'post', 'state', 'label_lookup', 'label_create', 'state', 'label_apply', 'state']);
+    }
+  }
+});
+
+test('enforce mode skips disabled labels and reuses genuine responses for issues and pull requests', async () => {
+  for (const [eventName, itemKey] of [
+    ['issues', 'issue'],
+    ['pull_request_target', 'pull_request'],
+  ]) {
+    for (const autoClose of ['true', 'false']) {
+      const fixture = setup(0.8, { comments: [{ id: 3, body: marker,
+        user: { login: 'github-actions[bot]', type: 'Bot' } }] });
+      fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
+      fixture.api.createReviewLabel = async () => { fixture.calls.push('label_create'); };
+      fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+      const context = { eventName, repository: 'o/r', payload: {
+        action: 'opened', repository: { full_name: 'o/r' },
+        [itemKey]: { number: 4, title: 'Title', body: 'Body', user: { login: 'contributor' } },
+      } };
+      const outcome = await moderate({ getContext: () => context,
+        getInputs: () => ({ autoClose, reviewLabel: 'false' }), api: fixture.api, score: fixture.score });
+      assert.equal(outcome.outcome, autoClose === 'true' ? 'closed' : 'commented');
+      assert.equal(outcome.comment_id, 3);
+      assert.equal(fixture.calls.includes('label_lookup'), false);
+      assert.equal(fixture.calls.includes('label_apply'), false);
+      assert.deepEqual(fixture.calls, autoClose === 'true'
+        ? ['comments', 'state', 'close']
+        : ['comments', 'state']);
+    }
+  }
+});
+
+test('enforce mode defaults labeling on for existing Action input fixtures', async () => {
+  const fixture = setup();
+  fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: false }; };
+  fixture.api.createReviewLabel = async () => { fixture.calls.push('label_create'); };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+  const outcome = await moderate({ getContext, getInputs, api: fixture.api, score: fixture.score });
+  assert.equal(outcome.outcome, 'closed');
+  assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state', 'label_lookup', 'label_create', 'state',
+    'label_apply', 'state', 'close']);
+});
 
 test('response-only mode confirms issue and pull request responses without closing', async () => {
   for (const [eventName, kind, itemKey] of [
@@ -33,6 +99,8 @@ test('response-only mode confirms issue and pull request responses without closi
     ['pull_request_target', 'pull_request', 'pull_request'],
   ]) {
     const fixture = setup();
+    fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
+    fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
     const context = { eventName, repository: 'o/r', payload: {
       action: 'opened', repository: { full_name: 'o/r' },
       [itemKey]: { number: 4, title: 'Title', body: 'Body', user: { login: 'contributor' } },
@@ -42,13 +110,15 @@ test('response-only mode confirms issue and pull request responses without closi
     assert.equal(outcome.outcome, 'commented');
     assert.equal(outcome.comment_id, 22);
     assert.equal(outcome.partial, false);
-    assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state']);
+    assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state', 'label_lookup', 'state', 'label_apply', 'state']);
   }
 });
 
 test('response-only mode defaults to existing closure behavior unless explicitly disabled', async () => {
   const fixture = setup();
-  const outcome = await moderate({ getContext, getInputs, api: fixture.api, score: fixture.score });
+  fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+  const outcome = await moderate({ getContext, getInputs: () => ({ reviewLabel: 'false' }), api: fixture.api, score: fixture.score });
   assert.equal(outcome.outcome, 'closed');
   assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state', 'close']);
 });
@@ -56,11 +126,22 @@ test('response-only mode defaults to existing closure behavior unless explicitly
 test('uses real classifier result and enforces inclusive unrounded cutoff', async () => {
   for (const [value, expected] of [[0.6, 'below_cutoff'], [0.799999, 'below_cutoff'], [0.8, 'closed'], [0.800001, 'closed']]) {
     const fixture = setup(value);
-    const outcome = await moderate({ getContext, getInputs, api: fixture.api, score: fixture.score });
+    fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
+    fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
+    const outcome = await moderate({ getContext, getInputs: () => ({ reviewLabel: 'false' }), api: fixture.api, score: fixture.score });
     assert.equal(outcome.outcome, expected);
     assert.equal(fixture.scored, 1);
     assert.equal(fixture.calls.includes('post'), expected === 'closed');
   }
+});
+
+test('observe mode skips all GitHub calls when review labeling is disabled', async () => {
+  const fixture = setup(0.8);
+  const outcome = await moderate({ getContext, getInputs: observeWithoutLabelInputs, api: fixture.api, score: fixture.score });
+  assert.equal(outcome.outcome, 'flagged');
+  assert.equal(outcome.label, undefined);
+  assert.equal(outcome.score, 0.8);
+  assert.deepEqual(fixture.calls, []);
 });
 
 test('observe mode flags at the inclusive cutoff using only state checks and label operations for an issue', async () => {
@@ -121,16 +202,20 @@ test('observe mode below cutoff does not read or write GitHub and enforce defaul
   assert.equal((await moderate({ getContext, getInputs: observeInputs, api: below.api, score: below.score })).outcome, 'below_cutoff');
   assert.deepEqual(below.calls, []);
   const enforce = setup(0.8);
-  assert.equal((await moderate({ getContext, getInputs, api: enforce.api, score: enforce.score })).outcome, 'closed');
+  enforce.api.getReviewLabel = async () => { enforce.calls.push('label_lookup'); return { exists: true }; };
+  enforce.api.addLabel = async () => { enforce.calls.push('label_apply'); };
+  assert.equal((await moderate({ getContext, getInputs: () => ({ reviewLabel: 'false' }), api: enforce.api, score: enforce.score })).outcome, 'closed');
   assert.deepEqual(enforce.calls, ['comments', 'state', 'post', 'state', 'close']);
 });
 
 test('reuses genuine matching response only in response-only mode', async () => {
   const fixture = setup(0.8, { comments: [{ id: 3, body: marker, user: { login: 'github-actions[bot]', type: 'Bot' } }] });
+  fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
   const outcome = await moderate({ getContext, getInputs: responseOnlyInputs, api: fixture.api, score: fixture.score });
   assert.equal(outcome.outcome, 'commented');
   assert.equal(outcome.comment_id, 3);
-  assert.deepEqual(fixture.calls, ['comments', 'state']);
+  assert.deepEqual(fixture.calls, ['comments', 'state', 'label_lookup', 'state', 'label_apply', 'state']);
 });
 
 test('response-only rerun retains confirmed response when state read fails', async () => {
@@ -150,17 +235,21 @@ test('response-only rerun retains confirmed response when state read fails', asy
 
 test('spoofed matching markers from contributors never count as genuine response', async () => {
   const fixture = setup(0.8, { comments: [{ id: 3, body: marker, user: { login: 'contributor', type: 'User' } }] });
+  fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
   const outcome = await moderate({ getContext, getInputs: responseOnlyInputs, api: fixture.api, score: fixture.score });
   assert.equal(outcome.outcome, 'commented');
   assert.equal(outcome.comment_id, 22);
-  assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state']);
+  assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state', 'label_lookup', 'state', 'label_apply', 'state']);
 });
 
 test('reuses only a genuine bot comment and checks state before response and closure', async () => {
   const fixture = setup(0.8, { comments: [{ id: 3, body: `spoof ${marker}`, user: { login: 'contributor', type: 'User' } }] });
+  fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
   const outcome = await moderate({ getContext, getInputs, api: fixture.api, score: fixture.score });
   assert.equal(outcome.outcome, 'closed');
-  assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state', 'close']);
+  assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'state', 'label_lookup', 'state', 'label_apply', 'state', 'close']);
 });
 
 test('changed current state prevents response and post-response change reports partial skip', async () => {
@@ -201,6 +290,8 @@ test('empty input is reported without API calls and requires real provenance', a
 
 test('uncertain response-only write reconciles once and does not blindly repost or close', async () => {
   const fixture = setup();
+  fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
+  fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); };
   let listings = 0;
   fixture.api.listComments = async () => { listings++; return listings === 1 ? [] : [{ id: 22, body: marker, user: { login: 'github-actions[bot]', type: 'Bot' } }]; };
   fixture.api.createComment = async () => { fixture.calls.push('post'); throw new Error('timeout secret'); };

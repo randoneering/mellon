@@ -22,6 +22,10 @@ inputs:
     description: 'Close flagged issues and pull requests after posting a response. Set to "false" to post a response without closing. Defaults to "true".'
     required: false
     default: 'true'
+  review-label:
+    description: 'Shared across modes. Apply the mellon: review label to flagged submissions. Set to "false" to disable automatic labeling. Defaults to "true".'
+    required: false
+    default: 'true'
 outputs:
   outcome:
     description: Safe moderation outcome enum.

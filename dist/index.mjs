@@ -7534,7 +7534,6 @@ var API_ROOT = "https://api.github.com";
 var MAX_BODY_BYTES = 1024 * 1024;
 var MAX_PAGES = 100;
 var REVIEW_LABEL = "mellon: review";
-var LABEL_RETRY_LIMIT = 3;
 function safeError() {
   return new Error("GitHub API request failed safely.");
 }
@@ -7600,6 +7599,14 @@ function validateComments(value) {
   if (!Array.isArray(value) || value.some((comment) => !comment || typeof comment !== "object" || !Number.isSafeInteger(comment.id) || comment.id <= 0 || typeof comment.body !== "string" || !comment.user || typeof comment.user.login !== "string" || typeof comment.user.type !== "string")) throw safeError();
   return value.map((comment) => ({ id: comment.id, body: comment.body, user: { login: comment.user.login, type: comment.user.type } }));
 }
+function validateLabels(value) {
+  if (!Array.isArray(value) || value.some((label) => !label || typeof label !== "object" || typeof label.name !== "string")) throw safeError();
+  return value.map((label) => ({ name: label.name }));
+}
+function labelName(value) {
+  if (!value || typeof value !== "object" || typeof value.name !== "string") throw safeError();
+  return value.name;
+}
 function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 3e4, signal, maxBodyBytes = MAX_BODY_BYTES } = {}) {
   if (typeof token !== "string" || !token || typeof fetchImpl !== "function" || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || !Number.isSafeInteger(maxBodyBytes) || maxBodyBytes <= 0) {
     throw new TypeError("A token, fetch implementation, and positive limits are required.");
@@ -7643,16 +7650,25 @@ function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 3e4, signal,
     }
   }
   async function retryLabelRequest(url, options, validate) {
-    for (let attempt = 0; attempt < LABEL_RETRY_LIMIT; attempt++) {
-      try {
-        const result = await request(url, options);
-        return validate(result.value);
-      } catch (error) {
-        if (error?.status === 422 || attempt + 1 === LABEL_RETRY_LIMIT || error?.status && error.status < 500) throw error?.status === 422 ? error : safeError();
-        await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
-      }
+    try {
+      const result = await request(url, options);
+      return validate(result.value);
+    } catch (error) {
+      if (error?.status && error.status < 500) throw error?.status === 422 ? error : safeError();
+      throw safeError();
     }
-    throw safeError();
+  }
+  async function listLabels(context) {
+    const base = resource(context.repository, context.number, "/labels") + "?per_page=100";
+    let url = base;
+    const labels = [];
+    for (let page = 0; url && page < MAX_PAGES; page++) {
+      const result = await request(url);
+      labels.push(...validateLabels(result.value));
+      url = parseLinkNext(result.link, url);
+    }
+    if (url) throw safeError();
+    return labels;
   }
   return {
     async getReviewLabel({ repository }) {
@@ -7660,7 +7676,7 @@ function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 3e4, signal,
       const url = `${API_ROOT}/repos/${repository}/labels/${encodeURIComponent(REVIEW_LABEL)}`;
       try {
         const { value } = await request(url);
-        if (!value || value.name !== REVIEW_LABEL) throw safeError();
+        if (labelName(value) !== REVIEW_LABEL) throw safeError();
         return { exists: true };
       } catch (error) {
         if (error?.status === 404) return { exists: false };
@@ -7673,21 +7689,41 @@ function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 3e4, signal,
       const body = { name: REVIEW_LABEL, color: "fbca04", description: "Flagged by Mellon observation mode." };
       try {
         await retryLabelRequest(url, { method: "POST", body }, (value) => {
-          if (!value || value.name !== REVIEW_LABEL) throw safeError();
+          if (labelName(value) !== REVIEW_LABEL) throw safeError();
           return value;
         });
       } catch (error) {
-        if (error?.status !== 422) throw safeError();
-        const { value } = await request(`${API_ROOT}/repos/${repository}/labels/${encodeURIComponent(REVIEW_LABEL)}`);
-        if (!value || value.name !== REVIEW_LABEL) throw safeError();
+        if (error?.status !== 422 && error?.status && error.status < 500) throw safeError();
+        try {
+          const { value } = await request(`${API_ROOT}/repos/${repository}/labels/${encodeURIComponent(REVIEW_LABEL)}`);
+          if (labelName(value) === REVIEW_LABEL) return { confirmed: true };
+        } catch {
+          throw safeError();
+        }
+        throw safeError();
       }
+      return { confirmed: true };
+    },
+    async getItemLabels(context) {
+      return listLabels(context);
     },
     async addLabel({ repository, number }) {
       const url = resource(repository, number, "/labels");
-      await retryLabelRequest(url, { method: "POST", body: { labels: [REVIEW_LABEL] } }, (value) => {
-        if (!Array.isArray(value) || !value.some((label) => label?.name === REVIEW_LABEL)) throw safeError();
-        return value;
-      });
+      try {
+        const result = await retryLabelRequest(url, { method: "POST", body: { labels: [REVIEW_LABEL] } }, (value) => {
+          const labels = validateLabels(value);
+          if (!labels.some((label) => label.name === REVIEW_LABEL)) throw safeError();
+          return labels;
+        });
+        return { confirmed: result.some((label) => label.name === REVIEW_LABEL) };
+      } catch {
+        try {
+          const labels = await listLabels({ repository, number });
+          return { confirmed: labels.some((label) => label.name === REVIEW_LABEL) };
+        } catch {
+          throw safeError();
+        }
+      }
     },
     async getItem({ repository, number, kind }) {
       if (kind !== "issue" && kind !== "pull_request") throw safeError();
@@ -7792,9 +7828,10 @@ function parsePolicy(inputs = {}) {
   const response = inputs.response === void 0 ? DEFAULT_RESPONSE : inputs.response;
   const mode = inputs.mode === void 0 ? "enforce" : inputs.mode;
   const autoClose = inputs.autoClose === void 0 || inputs.autoClose === "" ? true : inputs.autoClose === "true" ? true : inputs.autoClose === "false" ? false : null;
-  if (typeof response !== "string" || !validText(response) || Buffer.byteLength(response, "utf8") > RESPONSE_LIMIT || mode !== "enforce" && mode !== "observe" || autoClose === null) throw invalidInput();
-  if (Object.keys(inputs).some((key) => !["allowlist", "response", "mode", "autoClose"].includes(key))) throw invalidInput();
-  return { allowlist, response, cutoff: 0.8, mode, autoClose };
+  const reviewLabel = inputs.reviewLabel === void 0 || inputs.reviewLabel === "" ? true : inputs.reviewLabel === "true" ? true : inputs.reviewLabel === "false" ? false : null;
+  if (typeof response !== "string" || !validText(response) || Buffer.byteLength(response, "utf8") > RESPONSE_LIMIT || mode !== "enforce" && mode !== "observe" || autoClose === null || reviewLabel === null) throw invalidInput();
+  if (Object.keys(inputs).some((key) => !["allowlist", "response", "mode", "autoClose", "reviewLabel"].includes(key))) throw invalidInput();
+  return { allowlist, response, cutoff: 0.8, mode, autoClose, reviewLabel };
 }
 function createEligibleContinuation({ getContext, getInputs }) {
   return async function run(continueEligible) {
@@ -12946,9 +12983,57 @@ function markerFor(context, result) {
 function genuine(comment, marker) {
   return Number.isSafeInteger(comment.id) && comment.id > 0 && comment.user?.login === "github-actions[bot]" && comment.user?.type === "Bot" && comment.body.includes(marker);
 }
-async function currentMatches(api, context) {
+async function currentItem(api, context) {
   const current = await api.getItem(context);
+  if (!current || typeof current !== "object" || !["open", "closed"].includes(current.state) || typeof current.title !== "string" || current.body !== null && typeof current.body !== "string" || current.merged !== void 0 && typeof current.merged !== "boolean" || current.labels !== void 0 && (!Array.isArray(current.labels) || current.labels.some((label) => !label || typeof label !== "object" || typeof label.name !== "string"))) throw new Error("Current item response is invalid.");
+  return current;
+}
+async function currentMatches(api, context) {
+  const current = await currentItem(api, context);
   return current.state === "open" && current.merged !== true && current.title === context.title && current.body === context.body;
+}
+async function hasReviewLabel(api, context) {
+  const labels = await api.getItemLabels(context);
+  if (!Array.isArray(labels) || labels.some((label) => !label || typeof label !== "object" || typeof label.name !== "string")) {
+    throw new Error("Current label response is invalid.");
+  }
+  return labels.some((label) => label.name === REVIEW_LABEL2);
+}
+async function ensureReviewLabel(api, context) {
+  let label = await api.getReviewLabel(context);
+  if (!label || typeof label !== "object" || typeof label.exists !== "boolean") throw new Error("Label lookup response is invalid.");
+  if (!label.exists) {
+    try {
+      const created = await api.createReviewLabel(context);
+      if (created !== void 0 && (!created || typeof created !== "object" || created.confirmed !== true)) {
+        throw new Error("Label creation was not confirmed.");
+      }
+    } catch (error) {
+      if (Number.isInteger(error?.status) && error.status < 500 && error.status !== 422) throw error;
+      label = await api.getReviewLabel(context);
+      if (!label || typeof label !== "object" || label.exists !== true) throw new Error("Label creation could not be confirmed.");
+    }
+  }
+}
+async function applyReviewLabel(api, context) {
+  try {
+    const applied = await api.addLabel(context);
+    if (applied !== void 0 && (!applied || typeof applied !== "object" || applied.confirmed !== true)) {
+      throw new Error("Label application was not confirmed.");
+    }
+  } catch {
+    if (!await hasReviewLabel(api, context)) throw new Error("Label application could not be confirmed.");
+  }
+}
+async function reconcileReviewLabel(api, context) {
+  const current = await currentItem(api, context);
+  if (current.state !== "open" || current.merged === true || current.title !== context.title || current.body !== context.body) {
+    return { matches: false, labeled: false };
+  }
+  let labeled = Array.isArray(current.labels) && current.labels.some((label) => label.name === REVIEW_LABEL2);
+  if (!labeled) labeled = await hasReviewLabel(api, context);
+  if (!labeled) return { matches: true, labeled: false };
+  return { matches: true, labeled: true };
 }
 async function moderate({ getContext, getInputs, api, score, prepare = prepareSubmission } = {}) {
   const eligible = createEligibleContinuation({ getContext, getInputs });
@@ -12979,6 +13064,15 @@ async function moderate({ getContext, getInputs, api, score, prepare = prepareSu
         partial: false
       };
       if (policy.mode === "observe") {
+        if (!policy.reviewLabel) return {
+          outcome: "flagged",
+          cutoff: CUTOFF,
+          score: classified.robot_score,
+          detector_revision: classified.detector_revision,
+          model_sha256: classified.model_sha256,
+          input_sha256: classified.input_sha256,
+          partial: false
+        };
         let matches;
         try {
           matches = await currentMatches(api, context);
@@ -12993,8 +13087,7 @@ async function moderate({ getContext, getInputs, api, score, prepare = prepareSu
           partial: false
         };
         try {
-          const label = await api.getReviewLabel(context);
-          if (!label.exists) await api.createReviewLabel(context);
+          await ensureReviewLabel(api, context);
           if (!await currentMatches(api, context)) return {
             outcome: "skipped",
             reason: "stale_before_label",
@@ -13002,7 +13095,7 @@ async function moderate({ getContext, getInputs, api, score, prepare = prepareSu
             score: classified.robot_score,
             partial: false
           };
-          await api.addLabel(context);
+          await applyReviewLabel(api, context);
         } catch {
           return safeFailure("Observation label could not be applied safely.");
         }
@@ -13014,6 +13107,7 @@ async function moderate({ getContext, getInputs, api, score, prepare = prepareSu
           model_sha256: classified.model_sha256,
           input_sha256: classified.input_sha256,
           label: REVIEW_LABEL2,
+          label_applied: true,
           partial: false
         };
       }
@@ -13052,6 +13146,48 @@ ${marker}`;
         model_sha256: classified.model_sha256,
         input_sha256: classified.input_sha256
       };
+      if (policy.reviewLabel) {
+        try {
+          if (!await currentMatches(api, context)) return {
+            outcome: "skipped",
+            reason: "stale_before_label",
+            cutoff: CUTOFF,
+            score: classified.robot_score,
+            comment_id: existing.id,
+            partial: posted
+          };
+        } catch {
+          return safeFailure("Response is confirmed, but current state could not be checked before labeling.", partial);
+        }
+        try {
+          await ensureReviewLabel(api, context);
+          if (!await currentMatches(api, context)) return {
+            outcome: "skipped",
+            reason: "stale_before_label",
+            cutoff: CUTOFF,
+            score: classified.robot_score,
+            comment_id: existing.id,
+            partial: posted
+          };
+          await applyReviewLabel(api, context);
+        } catch {
+          let reconciliation;
+          try {
+            reconciliation = await reconcileReviewLabel(api, context);
+          } catch {
+            return safeFailure("Response is confirmed, but label reconciliation failed.", partial);
+          }
+          if (!reconciliation.matches) return {
+            outcome: "skipped",
+            reason: "stale_before_label",
+            cutoff: CUTOFF,
+            score: classified.robot_score,
+            comment_id: existing.id,
+            partial: posted
+          };
+          if (!reconciliation.labeled) return safeFailure("Response is confirmed, but the review label could not be applied.", partial);
+        }
+      }
       if (!policy.autoClose) {
         try {
           if (!await currentMatches(api, context)) return {
@@ -13180,6 +13316,7 @@ function normalizeResult(result) {
   const normalized = {
     outcome: result?.outcome,
     ...score === void 0 ? {} : { robotScore: score },
+    ...result?.outcome === "flagged" ? { labelApplied: result.label_applied === true } : {},
     ...result?.outcome === "error" ? {
       partial: result.partial === true,
       commentId: validCommentId(result.comment_id),
@@ -13274,11 +13411,13 @@ async function runAction({
         const response = typeof getInput === "function" ? getInput("response") : "";
         const mode = typeof getInput === "function" ? getInput("mode") : "";
         const autoClose = typeof getInput === "function" ? getInput("auto-close") : "";
+        const reviewLabel = typeof getInput === "function" ? getInput("review-label") : "";
         return {
           ...allowlist === "" ? {} : { allowlist },
           ...response === "" ? {} : { response },
           ...mode === "" ? {} : { mode },
-          ...autoClose === "" ? {} : { autoClose }
+          ...autoClose === "" ? {} : { autoClose },
+          ...reviewLabel === "" ? {} : { reviewLabel }
         };
       };
       let api;
@@ -13292,6 +13431,7 @@ async function runAction({
       const candidateApi = {
         listComments: (...args) => lazyApi().listComments(...args),
         getItem: (...args) => lazyApi().getItem(...args),
+        getItemLabels: (...args) => lazyApi().getItemLabels(...args),
         createComment: (...args) => lazyApi().createComment(...args),
         closeItem: (...args) => lazyApi().closeItem(...args),
         getReviewLabel: (...args) => lazyApi().getReviewLabel(...args),
@@ -13344,7 +13484,7 @@ Comment ID: ${result.commentId}`}${result.provenance ? `
 Detector revision: ${result.provenance.detectorRevision}
 Model SHA-256: ${result.provenance.modelSha256}
 Input SHA-256: ${result.provenance.inputSha256}` : ""}` : "";
-  const labelNote = result.outcome === "flagged" ? "\n\nLabel: mellon: review" : "";
+  const labelNote = result.outcome === "flagged" && result.labelApplied ? "\n\nLabel: mellon: review" : "";
   const uncertainty = result.outcome === "error" && result.uncertainty ? "\n\nResponse confirmation: uncertain" : "";
   try {
     const handle = await open(filename, "a");
