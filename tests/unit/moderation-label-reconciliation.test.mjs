@@ -23,9 +23,12 @@ function fixture({ mode = 'enforce', states, labelExists = false } = {}) {
       calls.push('state');
       return itemStates.length ? itemStates.shift() : { state: 'open', title: 'Original title', body: 'Original body' };
     },
+    async getItemLabels() { calls.push('item-labels'); return []; },
     async createComment({ body }) { calls.push('comment'); return { id: 51, body, user: { login: 'github-actions[bot]', type: 'Bot' } }; },
     async getReviewLabel() { calls.push('lookup'); return { exists: labelExists }; },
     async createReviewLabel() { calls.push('create-label'); return { confirmed: true }; },
+    async getOutcomeLabel() { return { exists: true }; },
+    async createOutcomeLabel() { return { confirmed: true }; },
     async addLabel() { calls.push('apply-label'); return { confirmed: true }; },
     async closeItem() { calls.push('close'); },
   };
@@ -138,13 +141,14 @@ test('5xx label application retries after complete paginated state confirms abse
   };
   f.api.getItemLabels = async () => {
     f.calls.push('labels');
-    return ++reads === 1 ? [] : [{ name: 'mellon: review' }];
+    reads++;
+    return [];
   };
   const result = await f.run();
   assert.equal(result.outcome, 'closed');
   assert.equal(writes, 2);
   assert.deepEqual(f.calls.filter(call => ['apply-label', 'labels'].includes(call)),
-    ['apply-label', 'labels', 'apply-label']);
+    ['labels', 'labels', 'apply-label', 'labels', 'labels', 'apply-label', 'labels']);
 });
 
 test('issue-label write does not retry after uncertain state read or definite 4xx', async () => {
@@ -163,7 +167,7 @@ test('issue-label write does not retry after uncertain state read or definite 4x
     };
     const result = await f.run();
     assert.equal(result.outcome, 'error');
-    assert.equal(writes, 1);
+    assert.equal(writes, failure === 'read' ? 0 : 1);
     assert.equal(f.calls.includes('close'), false);
     assert.equal(JSON.stringify(result).includes('private'), false);
   }
@@ -206,14 +210,19 @@ test('uncertain label application reconciles current labels and avoids repeating
   const outcome = await f.run();
   assert.equal(outcome.outcome, 'closed');
   assert.equal(f.calls.filter(call => call === 'apply-label').length, 1);
-  assert.ok(f.calls.indexOf('labels') > f.calls.indexOf('apply-label'));
-  assert.ok(f.calls.indexOf('close') > f.calls.indexOf('labels'));
+  assert.ok(f.calls.lastIndexOf('labels') > f.calls.indexOf('apply-label'));
+  assert.ok(f.calls.indexOf('close') > f.calls.lastIndexOf('labels'));
 });
 
 test('failed label reconciliation preserves confirmed response metadata and prevents closure', async () => {
   const f = fixture({ mode: 'enforce', labelExists: true });
   f.api.addLabel = async () => { f.calls.push('apply-label'); throw new Error('uncertain private error'); };
-  f.api.getLabels = async () => { f.calls.push('labels'); throw new Error('private response'); };
+  let labelReads = 0;
+  f.api.getItemLabels = async () => {
+    f.calls.push('labels');
+    if (++labelReads === 3) throw new Error('private response');
+    return [];
+  };
   const outcome = await f.run();
   assert.equal(outcome.outcome, 'error');
   assert.equal(outcome.partial, true);

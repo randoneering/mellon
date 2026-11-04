@@ -25,7 +25,7 @@ async function isolatedRelease(t) {
   return directory;
 }
 
-async function runBuilt(t, { eventName, fixture, pages = [[]], apiFailureAt, responseMode, initialState, unexpectedNetwork = false, merged = false, failClose = false, mode, labelFailure = false, labelExists = false }) {
+async function runBuilt(t, { eventName, fixture, pages = [[]], apiFailureAt, responseMode, initialState, unexpectedNetwork = false, merged = false, failClose = false, mode, labelFailure = false, labelExists = false, outcomeLookupFailure = false, itemLabelPages = [[]], malformedLabelPagination = false, reviewLabel }) {
   const directory = await isolatedRelease(t);
   const harness = await mkdtemp(path.join(os.tmpdir(), 'mellon-harness-'));
   t.after(() => rm(harness, { recursive: true, force: true }));
@@ -59,12 +59,22 @@ globalThis.fetch = async (input, init = {}) => {
       ? new Response(JSON.stringify({ name: 'mellon: review' }), { status: 200 })
       : new Response(null, { status: 404 });
   }
+  if (url.pathname.startsWith('/repos/owner/repo/labels/mellon%3A%20reviewed-')) {
+    if (process.env.TEST_OUTCOME_LOOKUP_FAILURE === 'true') return new Response('private label lookup failure', { status: 503 });
+    return process.env.TEST_LABEL_EXISTS === 'true'
+      ? new Response(JSON.stringify({ name: decodeURIComponent(url.pathname.split('/').at(-1)) }), { status: 200 })
+      : new Response(null, { status: 404 });
+  }
   if (url.pathname.startsWith('/repos/owner/repo/issues/') && url.pathname.endsWith('/labels') && (init.method || 'GET') === 'GET') {
-    return new Response(JSON.stringify([]), { status: 200 });
+    const page = Number(url.searchParams.get('page') || '1');
+    const pages = JSON.parse(process.env.TEST_ITEM_LABEL_PAGES);
+    const link = process.env.TEST_MALFORMED_LABEL_PAGINATION === 'true' ? 'unparseable pagination'
+      : page < pages.length ? '<' + url.origin + url.pathname + '?per_page=100&page=' + (page + 1) + '>; rel="next"' : '';
+    return new Response(JSON.stringify(pages[page - 1] || []), { status: 200, headers: { link } });
   }
   if (url.pathname === '/repos/owner/repo/labels' && init.method === 'POST') {
     if (process.env.TEST_LABEL_FAILURE === 'true') return new Response('sensitive label API failure', { status: 403 });
-    return new Response(JSON.stringify({ name: 'mellon: review' }), { status: 201 });
+    return new Response(JSON.stringify({ name: entry.body.name }), { status: 201 });
   }
   if (url.pathname.startsWith('/repos/owner/repo/issues/') && url.pathname.endsWith('/labels') && init.method === 'POST') {
     if (process.env.TEST_LABEL_FAILURE === 'true') return new Response('sensitive label API failure', { status: 403 });
@@ -129,6 +139,10 @@ globalThis.fetch = async (input, init = {}) => {
       INPUT_RESPONSE: 'This automated review is fallible. Please describe your own work.',
       INPUT_MODE: mode ?? '',
       INPUT_TOKEN: token,
+      'INPUT_REVIEW-LABEL': reviewLabel ?? '',
+      TEST_ITEM_LABEL_PAGES: JSON.stringify(itemLabelPages),
+      TEST_MALFORMED_LABEL_PAGINATION: malformedLabelPagination ? 'true' : '',
+      TEST_OUTCOME_LOOKUP_FAILURE: outcomeLookupFailure ? 'true' : '',
       TEST_LABEL_FAILURE: labelFailure ? 'true' : '',
       TEST_LABEL_EXISTS: labelExists ? 'true' : '',
       TEST_API_LOG: logPath,
@@ -205,9 +219,10 @@ test('built issue Action uses packaged score and rejects an exact matching contr
   assert.equal(run.result.status, 0, `${run.result.stderr} stdout=${run.result.stdout}`);
   assert.match(run.output, /^outcome=closed\nrobot-score=0\.\d+\n$/);
   assert.equal(run.requests.filter(request => request.method === 'POST' && request.pathname.endsWith('/comments')).length, 1);
+  assert.equal(run.requests.filter(request => request.method === 'POST' && request.pathname === '/repos/owner/repo/issues/32/labels').length, 1);
   assert.deepEqual(run.requests.slice(-3).map(({ method, pathname }) => [method, pathname]), [
-    ['POST', '/repos/owner/repo/issues/32/labels'],
     ['GET', '/repos/owner/repo/issues/32'],
+    ['GET', '/repos/owner/repo/issues/32/labels'],
     ['PATCH', '/repos/owner/repo/issues/32'],
   ]);
   assert.equal(run.requests.some(request => request.body?.body?.includes(injectionText)), false);
@@ -219,7 +234,7 @@ test('built issue Action uses packaged score and rejects an exact matching contr
   assertNoSensitiveOutput(run, [token, body, injectionText]);
 });
 
-test('built observe mode flags issue and PR using only repository label writes', async t => {
+test('built observe mode provisions repository labels but applies only the pending label', async t => {
   const cases = [
     ['issues', 'issue', 61],
     ['pull_request_target', 'pull_request', 62],
@@ -233,17 +248,58 @@ test('built observe mode flags issue and PR using only repository label writes',
     const run = await runBuilt(t, { eventName, fixture: eventFor(eventName, { item, title, body }), mode: 'observe' });
     assert.equal(run.result.status, 0, `${run.result.stderr} output=${run.output} requests=${JSON.stringify(run.requests)}`);
     assert.match(run.output, /^outcome=flagged\nrobot-score=0\.\d+\n$/);
+    const outcomeLabelNames = ['mellon: reviewed-human', 'mellon: reviewed-ai', 'mellon: reviewed-unsure'];
     assert.deepEqual(run.requests.map(({ method, pathname }) => [method, pathname]), [
       ['GET', `/repos/owner/repo/${kind === 'issue' ? 'issues' : 'pulls'}/${item}`],
+      ['GET', `/repos/owner/repo/issues/${item}/labels`],
+      ...outcomeLabelNames.flatMap(name => [
+        ['GET', `/repos/owner/repo/labels/${encodeURIComponent(name)}`],
+        ['POST', '/repos/owner/repo/labels'],
+      ]),
       ['GET', '/repos/owner/repo/labels/mellon%3A%20review'],
       ['GET', `/repos/owner/repo/${kind === 'issue' ? 'issues' : 'pulls'}/${item}`],
+      ['GET', `/repos/owner/repo/issues/${item}/labels`],
       ['POST', '/repos/owner/repo/labels'],
       ['GET', `/repos/owner/repo/${kind === 'issue' ? 'issues' : 'pulls'}/${item}`],
+      ['GET', `/repos/owner/repo/issues/${item}/labels`],
       ['POST', `/repos/owner/repo/issues/${item}/labels`],
     ]);
+    assert.deepEqual(run.requests.filter(({ method, pathname }) => method === 'POST' && pathname === '/repos/owner/repo/labels')
+      .map(({ body }) => body.name), [...outcomeLabelNames, 'mellon: review']);
     assert.equal(run.requests.some(({ method, pathname }) => method === 'PATCH' || pathname.endsWith('/comments')), false);
     assert.deepEqual(run.requests.at(-1).body, { labels: ['mellon: review'] });
     assertNoSensitiveOutput(run, [token, body]);
+  }
+});
+
+test('built Action rejects malformed label pagination before pending labeling or closure', async t => {
+  const title = 'Describe your work';
+  const body = 'The implementation provides a comprehensive, robust, and seamless solution that leverages systematic methods to enhance maintainability and functionality.';
+  for (const [mode, reviewLabel] of [['observe', 'true'], ['enforce', 'true'], ['enforce', 'false']]) {
+    const run = await runBuilt(t, { eventName: 'issues', fixture: eventFor('issues', { item: 66, title, body }),
+      mode, reviewLabel, malformedLabelPagination: true });
+    assert.equal(run.result.status, 1);
+    assert.equal(run.output.startsWith('outcome=error\n'), true);
+    assert.equal(run.requests.some(request => request.method === 'PATCH'), false);
+    assert.equal(run.requests.some(request => request.method === 'POST' && request.pathname.endsWith('/labels')), false);
+    assertNoSensitiveOutput(run, [token, body]);
+  }
+});
+
+test('built Action respects completed outcomes on later label pages', async t => {
+  const title = 'Describe your work';
+  const body = 'The implementation provides a comprehensive, robust, and seamless solution that leverages systematic methods to enhance maintainability and functionality.';
+  for (const [mode, reviewLabel] of [['observe', 'true'], ['enforce', 'true'], ['enforce', 'false']]) {
+    for (const name of ['mellon: reviewed-human', 'mellon: reviewed-ai', 'mellon: reviewed-unsure']) {
+      const run = await runBuilt(t, { eventName: 'pull_request_target', fixture: eventFor('pull_request_target', { item: 67, title, body }),
+        mode, reviewLabel, itemLabelPages: [[{ name: 'unrelated' }], [{ name }]] });
+      assert.equal(run.result.status, 0, run.result.stderr);
+      assert.match(run.output, /^outcome=skipped\nrobot-score=0\.\d+\n$/);
+      assert.ok(run.requests.some(request => request.pathname === '/repos/owner/repo/issues/67/labels' && request.search.includes('page=2')));
+      assert.equal(run.requests.some(request => request.method === 'PATCH'), false);
+      assert.equal(run.requests.some(request => request.method === 'POST' && request.pathname.endsWith('/labels')), false);
+      assertNoSensitiveOutput(run, [token, body]);
+    }
   }
 });
 
@@ -318,9 +374,10 @@ test('built pull request Action reports confirmed response when closure fails', 
   assert.match(run.summary, /Model SHA-256: [a-f0-9]{64}/);
   assert.match(run.summary, /Input SHA-256: [a-f0-9]{64}/);
   assert.equal(run.requests.filter(request => request.method === 'POST' && request.pathname.endsWith('/comments')).length, 1);
+  assert.equal(run.requests.filter(request => request.method === 'POST' && request.pathname === '/repos/owner/repo/issues/42/labels').length, 1);
   assert.deepEqual(run.requests.slice(-3).map(({ method, pathname }) => [method, pathname]), [
-    ['POST', '/repos/owner/repo/issues/42/labels'],
     ['GET', '/repos/owner/repo/pulls/42'],
+    ['GET', '/repos/owner/repo/issues/42/labels'],
     ['PATCH', '/repos/owner/repo/pulls/42'],
   ]);
   assertNoSensitiveOutput(run, [token, body, 'sensitive close failure']);
@@ -368,9 +425,10 @@ test('built Action reuses a verified matching bot comment without reposting', as
   assert.equal(run.result.status, 0);
   assert.equal(run.output.startsWith('outcome=closed\n'), true);
   assert.equal(run.requests.filter(request => request.method === 'POST' && request.pathname.endsWith('/comments')).length, 0);
+  assert.equal(run.requests.filter(request => request.method === 'POST' && request.pathname === '/repos/owner/repo/issues/38/labels').length, 1);
   assert.deepEqual(run.requests.slice(-3).map(({ method, pathname }) => [method, pathname]), [
-    ['POST', '/repos/owner/repo/issues/38/labels'],
     ['GET', '/repos/owner/repo/issues/38'],
+    ['GET', '/repos/owner/repo/issues/38/labels'],
     ['PATCH', '/repos/owner/repo/issues/38'],
   ]);
   assertNoSensitiveOutput(run, [token, body]);
@@ -388,12 +446,24 @@ test('built Action fails safely when uncertain POST reconciliation fails', async
   assertNoSensitiveOutput(run, [token, body, 'reconcile failure']);
 });
 
-test('built pull request Action reports a partial safe error on API failure', async t => {
+test('built pull request Action keeps moderating after an outcome-label lookup fails', async t => {
+  const title = 'Check the math';
+  const body = 'This change introduces a structured approach to configuration management and improves maintainability. It provides a comprehensive solution that enhances reliability, streamlines workflows, and ensures consistent behavior across the application.';
+  const run = await runBuilt(t, { eventName: 'pull_request_target', fixture: eventFor('pull_request_target', { item: 34, title, body }), pages: [[]], outcomeLookupFailure: true });
+  assert.equal(run.result.status, 0, run.result.stderr);
+  assert.match(run.output, /^outcome=closed\nrobot-score=0\.\d+\n$/);
+  assert.ok(run.requests.some(request => request.method === 'POST' && request.pathname.endsWith('/comments')));
+  assert.equal(run.requests.at(-1).method, 'PATCH');
+  assertNoSensitiveOutput(run, [token, body, 'private label lookup failure']);
+});
+
+test('built pull request Action reports a safe error on required API failure', async t => {
   const title = 'Check the math';
   const body = 'This change introduces a structured approach to configuration management and improves maintainability. It provides a comprehensive solution that enhances reliability, streamlines workflows, and ensures consistent behavior across the application.';
   const run = await runBuilt(t, { eventName: 'pull_request_target', fixture: eventFor('pull_request_target', { item: 34, title, body }), pages: [[]], apiFailureAt: 1 });
   assert.equal(run.result.status, 1);
   assert.equal(run.output, 'outcome=error\n');
+  assert.equal(run.requests.some(request => request.method !== 'GET'), false);
   assertNoSensitiveOutput(run, [token, body, 'fixture API failure']);
 });
 

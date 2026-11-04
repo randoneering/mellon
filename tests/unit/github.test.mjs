@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createGitHubClient } from '../../src/github.mjs';
+import { createGitHubClient, OUTCOME_LABELS } from '../../src/github.mjs';
 
 test('GitHub client requests fixed trusted issue resources with bounded credentials', async () => {
   const calls = [];
@@ -39,6 +39,80 @@ test('GitHub client supports fixed review-label lookup, create, and application 
   ]);
   assert.deepEqual(JSON.parse(calls[1].options.body), { name: 'mellon: review', color: 'fbca04', description: 'Flagged by Mellon for maintainer review.' });
   assert.deepEqual(JSON.parse(calls[2].options.body), { labels: ['mellon: review'] });
+});
+
+test('GitHub client looks up fixed outcome labels without changing existing metadata', async () => {
+  const calls = [];
+  const labels = [
+    'mellon: reviewed-human',
+    'mellon: reviewed-ai',
+    'mellon: reviewed-unsure',
+  ];
+  const client = createGitHubClient({ token: 'token', fetchImpl: async (url, options) => {
+    calls.push({ url: String(url), options });
+    return new Response(JSON.stringify({
+      name: decodeURIComponent(new URL(url).pathname.split('/').at(-1)),
+      color: 'custom-color',
+      description: 'Existing maintainer metadata',
+    }), { status: 200 });
+  } });
+
+  assert.deepEqual(OUTCOME_LABELS.map(({ name }) => name), labels);
+  for (const name of labels) {
+    assert.deepEqual(await client.getOutcomeLabel({ repository: 'o/r', name }), { exists: true });
+  }
+  assert.deepEqual(calls.map(({ url, options }) => [options.method, new URL(url).pathname]), labels.map(name => [
+    'GET', `/repos/o/r/labels/${encodeURIComponent(name)}`,
+  ]));
+});
+
+test('GitHub client creates only fixed outcome labels with distinct metadata', async () => {
+  const calls = [];
+  const client = createGitHubClient({ token: 'token', fetchImpl: async (url, options) => {
+    calls.push({ url: String(url), options });
+    return new Response(JSON.stringify({ name: JSON.parse(options.body).name }), { status: 201 });
+  } });
+  const definitions = [
+    { name: 'mellon: reviewed-human', color: '0e8a16', description: 'Maintainer assessed the submission text as human-like.' },
+    { name: 'mellon: reviewed-ai', color: 'd73a4a', description: 'Maintainer assessed the submission text as AI-like.' },
+    { name: 'mellon: reviewed-unsure', color: 'fbca04', description: 'Maintainer could not confidently assess the submission text.' },
+  ];
+
+  for (const { name } of definitions) {
+    assert.deepEqual(await client.createOutcomeLabel({ repository: 'o/r', name }), { confirmed: true });
+  }
+  assert.deepEqual(calls.map(({ url, options }) => [
+    options.method, new URL(url).pathname, JSON.parse(options.body),
+  ]), definitions.map(definition => ['POST', '/repos/o/r/labels', definition]));
+});
+
+test('GitHub client rejects unknown outcome labels and malformed label identities safely', async () => {
+  let calls = 0;
+  const client = createGitHubClient({ token: 'token', fetchImpl: async () => {
+    calls++;
+    return new Response('{"name":"mellon: review"}', { status: 200 });
+  } });
+  for (const name of ['mellon: review', 'custom label', '../issues/1']) {
+    await assert.rejects(client.getOutcomeLabel({ repository: 'o/r', name }), /failed safely/);
+    await assert.rejects(client.createOutcomeLabel({ repository: 'o/r', name }), /failed safely/);
+  }
+  await assert.rejects(client.getOutcomeLabel({ repository: 'o/r/other', name: 'mellon: reviewed-human' }), /failed safely/);
+  await assert.rejects(client.createOutcomeLabel({ repository: 'o/r/other', name: 'mellon: reviewed-human' }), /failed safely/);
+  const mismatched = createGitHubClient({ token: 'token', fetchImpl: async () => new Response('{"name":"mellon: review"}', { status: 200 }) });
+  await assert.rejects(mismatched.getOutcomeLabel({ repository: 'o/r', name: 'mellon: reviewed-human' }), /failed safely/);
+  await assert.rejects(mismatched.createOutcomeLabel({ repository: 'o/r', name: 'mellon: reviewed-human' }), /failed safely/);
+  assert.equal(calls, 0);
+});
+
+test('GitHub client reports absent outcome labels and hides API error details', async () => {
+  const client = createGitHubClient({ token: 'token', fetchImpl: async () => new Response('private response', { status: 404 }) });
+  assert.deepEqual(await client.getOutcomeLabel({ repository: 'o/r', name: 'mellon: reviewed-human' }), { exists: false });
+  const unavailable = createGitHubClient({ token: 'token', fetchImpl: async () => new Response('private response', { status: 500 }) });
+  await assert.rejects(unavailable.getOutcomeLabel({ repository: 'o/r', name: 'mellon: reviewed-human' }), error => {
+    assert.equal(error.message, 'GitHub API request failed safely.');
+    assert.equal(error.message.includes('private response'), false);
+    return true;
+  });
 });
 
 test('label write errors expose only status for safe caller reconciliation', async () => {
@@ -134,6 +208,41 @@ test('label application does not retry or reconcile outside moderation state che
 });
 
 
+
+test('GitHub client reads every page of current item labels', async () => {
+  const urls = [];
+  const client = createGitHubClient({ token: 'token', fetchImpl: async (url) => {
+    urls.push(String(url));
+    const page = urls.length === 1 ? [{ name: 'mellon: review' }]
+      : [{ name: 'mellon: reviewed-unsure' }];
+    return new Response(JSON.stringify(page), { status: 200, headers: {
+      link: urls.length === 1
+        ? '<https://api.github.com/repos/o/r/issues/4/labels?page=2>; rel="next"'
+        : '',
+    } });
+  } });
+  const labels = await client.getItemLabels({ repository: 'o/r', number: 4 });
+  assert.deepEqual(labels, [{ name: 'mellon: review' }, { name: 'mellon: reviewed-unsure' }]);
+  assert.equal(urls.length, 2);
+  assert.match(urls[0], /per_page=100$/);
+  assert.match(urls[1], /page=2$/);
+});
+
+test('GitHub client rejects unparseable label pagination instead of returning incomplete labels', async () => {
+  for (const link of [
+    'unparseable pagination',
+    '<https://api.github.com/repos/o/r/issues/4/labels?page=2>; rel=next',
+    '<https://api.github.com/repos/o/r/issues/4/labels?page=2>; rel="next"; invalid',
+  ]) {
+    let calls = 0;
+    const client = createGitHubClient({ token: 'token', fetchImpl: async () => {
+      calls++;
+      return new Response('[]', { status: 200, headers: { link } });
+    } });
+    await assert.rejects(client.getItemLabels({ repository: 'o/r', number: 4 }), /failed safely/);
+    assert.equal(calls, 1);
+  }
+});
 
 test('GitHub client rejects malformed label arrays during reconciliation', async () => {
   const client = createGitHubClient({ token: 'token', fetchImpl: async () => new Response('[{"name":3}]', { status: 200 }) });

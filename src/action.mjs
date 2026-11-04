@@ -195,6 +195,8 @@ export async function runAction({
         closeItem: (...args) => lazyApi().closeItem(...args),
         getReviewLabel: (...args) => lazyApi().getReviewLabel(...args),
         createReviewLabel: (...args) => lazyApi().createReviewLabel(...args),
+        getOutcomeLabel: (...args) => lazyApi().getOutcomeLabel(...args),
+        createOutcomeLabel: (...args) => lazyApi().createOutcomeLabel(...args),
         addLabel: (...args) => lazyApi().addLabel(...args),
       };
       result = await moderate({

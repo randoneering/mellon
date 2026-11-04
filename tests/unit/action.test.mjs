@@ -119,8 +119,10 @@ test('observe mode validates before inference and reports safe flagged output an
     if (pathname === '/repos/owner/repo/issues/7') return new Response(JSON.stringify({ state: 'open', title: event.issue.title,
       body: event.issue.body, merged: false }), { status: 200 });
     if (pathname === '/repos/owner/repo/issues/7/labels') return new Response('[{"name":"mellon: review"}]', { status: 200 });
-    if (pathname.includes('/labels/mellon%3A%20review')) return new Response(null, { status: 404 });
-    if (pathname.endsWith('/labels') && options.method === 'POST') return new Response('{"name":"mellon: review"}', { status: 201 });
+    if (pathname.includes('/labels/mellon%3A%20')) return new Response(null, { status: 404 });
+    if (pathname === '/repos/owner/repo/labels' && options.method === 'POST') {
+      return new Response(JSON.stringify({ name: JSON.parse(options.body).name }), { status: 201 });
+    }
     if (pathname.endsWith('/issues/7/labels')) return new Response('[{"name":"mellon: review"}]', { status: 200 });
     throw new Error('unexpected mock endpoint');
   };
@@ -131,11 +133,23 @@ test('observe mode validates before inference and reports safe flagged output an
       detector_revision: 'c'.repeat(40), model_sha256: 'a'.repeat(64), input_sha256: 'b'.repeat(64) }), fetchImpl });
   assert.equal(result.outcome, 'flagged', JSON.stringify(requests));
   assert.equal(result.robotScore, 0.8);
+  const outcomeLabelNames = ['mellon: reviewed-human', 'mellon: reviewed-ai', 'mellon: reviewed-unsure'];
   assert.deepEqual(requests.map(([method, pathname]) => [method, pathname]), [
-    ['GET', '/repos/owner/repo/issues/7'], ['GET', '/repos/owner/repo/labels/mellon%3A%20review'],
-    ['GET', '/repos/owner/repo/issues/7'], ['POST', '/repos/owner/repo/labels'], ['GET', '/repos/owner/repo/issues/7'],
-    ['POST', '/repos/owner/repo/issues/7/labels'],
+    ['GET', '/repos/owner/repo/issues/7'],
+    ['GET', '/repos/owner/repo/issues/7/labels'],
+    ...outcomeLabelNames.flatMap(name => [
+      ['GET', `/repos/owner/repo/labels/${encodeURIComponent(name)}`],
+      ['POST', '/repos/owner/repo/labels'],
+    ]),
+    ['GET', '/repos/owner/repo/labels/mellon%3A%20review'],
+    ['GET', '/repos/owner/repo/issues/7'], ['GET', '/repos/owner/repo/issues/7/labels'],
+    ['POST', '/repos/owner/repo/labels'], ['GET', '/repos/owner/repo/issues/7'],
+    ['GET', '/repos/owner/repo/issues/7/labels'], ['POST', '/repos/owner/repo/issues/7/labels'],
   ]);
+  assert.deepEqual(requests.filter(([method, pathname]) => method === 'POST' && pathname === '/repos/owner/repo/labels')
+    .map(([, , body]) => body.name), [...outcomeLabelNames, 'mellon: review']);
+  assert.deepEqual(requests.filter(([method, pathname]) => method === 'POST' && pathname === '/repos/owner/repo/issues/7/labels')
+    .map(([, , body]) => body), [{ labels: ['mellon: review'] }]);
   assert.equal(requests.some(([method, pathname]) => method === 'PATCH' || method === 'POST' && pathname.endsWith('/comments')), false);
   assert.equal(await readFile(outputPath, 'utf8'), 'outcome=flagged\nrobot-score=0.8\n');
   assert.match(await readFile(summaryPath, 'utf8'), /Flagged for review/);
