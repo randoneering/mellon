@@ -76,10 +76,13 @@ export function parsePolicy(inputs = {}) {
 
   const response = inputs.response === undefined ? DEFAULT_RESPONSE : inputs.response;
   const mode = inputs.mode === undefined ? 'enforce' : inputs.mode;
+  const autoClose = inputs.autoClose === undefined || inputs.autoClose === ''
+    ? true
+    : inputs.autoClose === 'true' ? true : inputs.autoClose === 'false' ? false : null;
   if (typeof response !== 'string' || !validText(response) || Buffer.byteLength(response, 'utf8') > RESPONSE_LIMIT ||
-      mode !== 'enforce' && mode !== 'observe') throw invalidInput();
-  if (Object.keys(inputs).some((key) => !['allowlist', 'response', 'mode'].includes(key))) throw invalidInput();
-  return { allowlist, response, cutoff: 0.8, mode };
+      mode !== 'enforce' && mode !== 'observe' || autoClose === null) throw invalidInput();
+  if (Object.keys(inputs).some((key) => !['allowlist', 'response', 'mode', 'autoClose'].includes(key))) throw invalidInput();
+  return { allowlist, response, cutoff: 0.8, mode, autoClose };
 }
 
 export function createEligibleContinuation({ getContext, getInputs }) {

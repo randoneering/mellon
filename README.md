@@ -69,6 +69,7 @@ mellon runs on Node 24 and requires a non-root runner.
 | `mode` | `enforce` | `observe` labels flagged submissions; `enforce` comments and closes them. |
 | `allowlist` | `[]` | JSON array of exact account logins to skip. |
 | `response` | Packaged message | Literal comment text used in enforcement mode. |
+| `auto-close` | `'true'` | `'false'` posts the enforcement response without closing the issue or pull request. |
 
 Observation mode creates `mellon: review` if needed and applies it to submissions at or above the cutoff.
 The label is visible to anyone who can see the issue or PR.
@@ -87,7 +88,11 @@ After review, remove `mellon: review` and apply the appropriate outcome label.
 Maintainers create and apply the outcome labels themselves.
 Labels are public, so use them to describe next steps rather than assert authorship.
 
-Enforcement mode posts the response and then closes a flagged submission.
+Enforcement mode posts the response and then closes a flagged submission by default.
+Set `auto-close: 'false'` to post the response without closing it.
+The Action reports `commented` when it confirms the response but does not close the submission.
+It reuses a matching bot response on reruns rather than posting a duplicate.
+Changing `auto-close` affects later runs: turning it off does not reopen a closed item, and turning it on can close an eligible open item after reusing its response.
 mellon appends the score and detector details to the response.
 An empty `response` uses the packaged message.
 The cutoff is fixed and cannot be configured through an Action input.

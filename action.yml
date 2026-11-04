@@ -18,6 +18,10 @@ inputs:
     description: Enforcement behavior. Use observe to apply a review label without commenting or closing. Defaults to enforce.
     required: false
     default: enforce
+  auto-close:
+    description: 'Close flagged issues and pull requests after posting a response. Set to "false" to post a response without closing. Defaults to "true".'
+    required: false
+    default: 'true'
 outputs:
   outcome:
     description: Safe moderation outcome enum.

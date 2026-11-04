@@ -13,8 +13,9 @@ try {
 const action = yaml.parse(await readFile('action.yml', 'utf8'));
 assert.equal(action.runs?.using, 'node24');
 assert.equal(action.runs?.main, 'dist/index.mjs');
-assert.deepEqual(Object.keys(action.inputs).sort(), ['allowlist', 'mode', 'response', 'token']);
+assert.deepEqual(Object.keys(action.inputs).sort(), ['allowlist', 'auto-close', 'mode', 'response', 'token']);
 assert.equal(action.inputs.mode.default, 'enforce');
+assert.equal(action.inputs['auto-close'].default, 'true');
 assert.deepEqual(Object.keys(action.outputs).sort(), ['outcome', 'robot-score']);
 
 const workflowText = await readFile('examples/submission-moderation.yml', 'utf8');
