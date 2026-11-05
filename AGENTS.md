@@ -24,6 +24,14 @@ npm run validate:release
 
 After building, check that generated `dist/` changes are included when needed.
 
+## Completion reporting
+
+Before reporting completion, compare the final implementation with every acceptance criterion.
+Record observed results and evidence, distinguishing documentation checks, mocked tests, and live behavior.
+When a ticket requires removing identifiers, search every named code, documentation, and test location.
+Keep PR test counts aligned with the final verification run.
+Mark behavior that was not exercised as unverified.
+
 ## Project rules
 
 1. **Keep fork code out of moderation workflows.** In workflows using `pull_request_target`, never check out or run pull request code, and grant only the permissions needed for moderation.
@@ -37,6 +45,9 @@ After building, check that generated `dist/` changes are included when needed.
    Contributors control this text and can attempt injection, marker spoofing, or terminal manipulation.
 4. **Make moderation safe to retry.** In event handling and moderation code, validate inputs and check the submission's current state before applying actions.
    Reconcile uncertain GitHub writes, and never blindly repost comments or close submissions.
+   Compare GitHub label names case-insensitively when recognizing review outcomes or validating label responses.
+   Preserve existing label names and metadata.
+   Test mixed-case outcomes for issues and pull requests, including reruns with automatic labeling disabled.
    Update boundary tests when behavior changes.
    Network failures can leave GitHub writes uncertain, and retries must not create duplicate comments or unintended closures.
 5. **Keep secrets and private text out of shared output.** In Action outputs, errors, logs, and CLI status messages, never expose tokens, API response details, scorer exception messages, or submission text.
@@ -50,6 +61,12 @@ After building, check that generated `dist/` changes are included when needed.
    `action.yml` runs the bundled entry point, CI checks the generated output, and runtime downloads would make releases harder to review.
 7. **Keep detector assets traceable.** When changing detector or model assets, keep provenance and third-party notices aligned, and run `npm run verify:assets` and `npm run test:parity`.
    These checks protect asset integrity and detector parity.
+8. **Make optional setup failures visible.** Best-effort setup must not block moderation when policy declares it optional.
+   Keep the moderation outcome and published Action outputs unchanged when only optional setup fails.
+   For outcome-label provisioning, set `outcome_labels_incomplete: true` in the moderation result when setup cannot be confirmed.
+   Surface an actionable job-summary notice; for missing outcome labels, ask maintainers to create them manually.
+   Never include raw API errors, response bodies, credentials, or submission text.
+   Test that optional setup failure preserves intended moderation behavior and produces the notice.
 
 ## Specifications
 
