@@ -24,6 +24,8 @@ npm run validate:release
 
 After building, check that generated `dist/` changes are included when needed.
 
+## Completion reporting
+
 Before reporting completion, compare the final implementation with every acceptance criterion.
 Record observed results and evidence, distinguishing documentation checks, mocked tests, and live behavior.
 When a ticket requires removing identifiers, search every named code, documentation, and test location.
@@ -60,7 +62,9 @@ Mark behavior that was not exercised as unverified.
 7. **Keep detector assets traceable.** When changing detector or model assets, keep provenance and third-party notices aligned, and run `npm run verify:assets` and `npm run test:parity`.
    These checks protect asset integrity and detector parity.
 8. **Make optional setup failures visible.** Best-effort setup must not block moderation when policy declares it optional.
-   Return a safe completion status and surface an actionable job-summary notice when setup cannot be confirmed.
+   Keep the moderation outcome and published Action outputs unchanged when only optional setup fails.
+   For outcome-label provisioning, set `outcome_labels_incomplete: true` in the moderation result when setup cannot be confirmed.
+   Surface an actionable job-summary notice; for missing outcome labels, ask maintainers to create them manually.
    Never include raw API errors, response bodies, credentials, or submission text.
    Test that optional setup failure preserves intended moderation behavior and produces the notice.
 
