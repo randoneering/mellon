@@ -3,3 +3,6 @@ openspec/
 node_modules/
 detector/node_modules/
 coverage.out
+.neon
+.env
+.env.local
