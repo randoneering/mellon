@@ -146,6 +146,11 @@ mellon only handles opening events; it does not scan existing submissions.
 See [workflow configuration](docs/configuration.md) for input limits and [moderation and reruns](docs/moderation.md) for failure and retry behavior.
 A separate local experiment workflow can train and evaluate a personalized classifier; it does not change this Action. See [personalized detection experiments](docs/personalized-detection.md).
 
+## Agent work intake
+
+An optional [Neon webhook intake](docs/agent-webhook-intake.md) records any eligible issue when an authorized maintainer adds `agent: ready`.
+It queues metadata only; it does not run an agent, change moderation, or open a PR.
+
 ## Build and test
 
 Use Node 24 and the checked-in lockfiles:

@@ -10,6 +10,7 @@
     "build": "node scripts/build.mjs",
     "test": "node --test --test-concurrency=1 detector/tests/*.test.mjs tests/unit/*.test.mjs tests/integration/*.test.mjs scripts/tests/*.test.mjs",
     "test:unit": "node --test tests/unit/*.test.mjs tests/integration/*.test.mjs",
+    "test:intake:db": "node scripts/test-agent-intake-db.mjs",
     "test:build": "node --test --test-concurrency=1 scripts/tests/*.test.mjs",
     "validate:release": "node scripts/validate-release.mjs",
     "test:parity": "node --test detector/tests/parity.test.mjs",
@@ -17,12 +18,15 @@
     "verify:assets": "node scripts/verify-assets.mjs"
   },
   "dependencies": {
+    "@neon/functions": "0.11.0",
     "markdown-it": "15.0.3",
+    "pg": "8.23.1",
     "wink-eng-lite-web-model": "1.8.1",
     "wink-nlp": "2.4.0"
   },
   "devDependencies": {
     "@esbuild/linux-x64": "0.28.2",
+    "@neon/config": "1.11.3",
     "esbuild": "0.28.2",
     "yaml": "2.9.1"
   }
