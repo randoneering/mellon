@@ -155,6 +155,38 @@ test('refuses mismatched API issue identities rather than enqueueing a different
   }
 });
 
+test('logs one fixed category and stage for unavailable operations without error details or issue text', async () => {
+  for (const [overrides, category, stage] of [
+    [{ store: { async getDelivery() { throw new Error('private DATABASE_URL password'); } } }, 'persistence_unavailable', 'receipt_read'],
+    [{ github: { async authorizeSender() { throw new Error('private GitHub token'); } } }, 'github_unavailable', 'permission_read'],
+    [{ github: { async authorizeSender() { return true; }, async readIssue() { throw new Error('private issue body'); } } }, 'github_unavailable', 'issue_read'],
+    [{ store: { async getDelivery() { return null; }, async enqueue() { throw new Error('private database details'); } } }, 'persistence_unavailable', 'enqueue'],
+  ]) {
+    const deps = dependencies(overrides);
+    const response = await handler(deps)(signedRequest());
+    assert.deepEqual(await response.json(), { status: 'unavailable' });
+    assert.equal(deps.logs.length, 1);
+    assert.deepEqual(JSON.parse(deps.logs[0]), { category, stage, deliveryId });
+    assert.doesNotMatch(deps.logs[0], /private|token|password|DATABASE_URL|https?:|Private title|Private body|sha256|secret/);
+  }
+});
+
+test('a timed-out unauthenticated body emits only a safe timeout stage without trusting the delivery header', async () => {
+  const stream = new ReadableStream({ start() {}, cancel() {} });
+  const deps = dependencies({ requestTimeoutMs: 10 });
+  const request = new Request('https://intake.example/github', { method: 'POST', body: stream, duplex: 'half', headers: { 'content-type': 'application/json', 'x-github-delivery': deliveryId } });
+  const response = await handler(deps)(request);
+  assert.equal(response.status, 503);
+  assert.deepEqual(deps.logs.map(line => JSON.parse(line)), [{ category: 'request_timeout', stage: 'request_read', deliveryId: null }]);
+});
+
+test('normal skips and invalid signatures produce no operational failure diagnostics', async () => {
+  const deps = dependencies();
+  await handler(deps)(signedRequest({}, { headers: { 'x-github-event': 'ping' } }));
+  await handler(deps)(signedRequest(issueEvent(), { headers: { 'x-hub-signature-256': 'invalid' } }));
+  assert.deepEqual(deps.logs, []);
+});
+
 test('requires explicit nonempty configuration rather than accepting an empty secret', () => {
   assert.throws(() => handler(dependencies({ secret: '' })), /configuration/i);
   assert.throws(() => handler(dependencies({ repository: { id: 0, fullName: 'randoneering/mellon' } })), /configuration/i);

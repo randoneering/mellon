@@ -18,8 +18,6 @@
     "verify:assets": "node scripts/verify-assets.mjs"
   },
   "dependencies": {
-    "@neon/config": "^1.11.3",
-    "@neon/env": "^1.6.15",
     "@neon/functions": "0.11.0",
     "markdown-it": "15.0.3",
     "pg": "8.23.1",
@@ -28,6 +26,7 @@
   },
   "devDependencies": {
     "@esbuild/linux-x64": "0.28.2",
+    "@neon/config": "1.11.3",
     "esbuild": "0.28.2",
     "yaml": "2.9.1"
   }

@@ -52,9 +52,12 @@ export function jobRecord(overrides = {}) {
 export function dependencies(overrides = {}) {
   const calls = [];
   const jobs = [];
+  const logs = [];
   return {
     calls,
     jobs,
+    logs,
+    report: line => logs.push(line),
     secret: webhookSecret,
     repository,
     github: {

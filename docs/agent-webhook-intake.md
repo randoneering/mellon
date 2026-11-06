@@ -66,9 +66,14 @@ node scripts/test-agent-intake-db.mjs
 ```
 
 The runner starts a digest-pinned Postgres container with temporary memory-backed data and a random test password.
-It binds only to loopback, runs the real database tests, and stops its own disposable container afterward.
-The tests require the explicitly named local test database and reject a remote or production URL.
-Without that runner, the ordinary Node suite skips real database checks; skipped checks are not live database evidence.
+It binds only to loopback and creates a random per-run marker inside the fresh database before authorizing the integration tests.
+Three negative guard probes first confirm that missing or mismatched authorization creates no intake schema or runtime role.
+Each integration test checks both the runner token and its stored marker before running a migration or granting privileges.
+A loopback URL and test database name alone do not authorize changes.
+The runner then runs seven store/integration checks and stops its own disposable container afterward.
+It rejects remote URLs and query-string host overrides.
+Without the runner URL and token, the ordinary Node suite skips real database checks; skipped checks are not live database evidence.
+A wrong or missing database marker fails closed.
 
 ## Configure and deploy
 
@@ -94,6 +99,7 @@ The intake itself needs Postgres only; do not add AI Gateway, Object Storage, or
 3. Retrieve the restricted runtime connection privately and confirm it has only the grants described above.
    Use explicit `sslmode=verify-full`; when retrieving it through Neon CLI, select `--ssl verify-full`.
    This preserves certificate and hostname verification without relying on `pg`'s current aliases for `require`.
+   The Function rejects missing or duplicate SSL modes, any mode other than `verify-full`, and conflicting TLS, compatibility, or host override options before creating a pool.
    Do not disable certificate verification or enable weaker libpq compatibility to silence the warning.
    Do not paste role-creation output, passwords, or connection strings into issues or logs.
 4. Create a repository-limited GitHub credential with Metadata: read and Issues: read.
@@ -181,3 +187,21 @@ A 503 does not prove that a database transaction rolled back.
 Redelivery reconciles through database constraints rather than creating another job blindly.
 GitHub does not guarantee automatic failed-delivery retry; maintainers may need to request redelivery.
 Responses and application logs must not contain issue text, signatures, credentials, or raw upstream errors.
+
+## Failure diagnostics
+
+Unavailable operations log one JSON line with only fixed `category`, fixed `stage`, and `deliveryId` fields.
+Delivery IDs appear only after signature and event-identity checks; configuration and unauthenticated request failures log a null ID.
+The 503 HTTP body remains `{ "status": "unavailable" }`.
+
+| Category | Stages | Operator check |
+| --- | --- | --- |
+| `github_unavailable` | `permission_read`, `issue_read` | Check the repository-limited token, GitHub availability, and current issue access. |
+| `persistence_unavailable` | `receipt_read`, `enqueue`, `pool` | Check runtime database connectivity and SELECT/INSERT grants. |
+| `request_timeout` | `request_read` | Check webhook transport and request duration. |
+| `configuration_invalid` | `configuration` | Check required env values, repository identity, and verified TLS options. |
+| `handler_unavailable` | Other fixed handler stages | Investigate the deployed code without dumping raw request or exception data. |
+
+Normal ignores and invalid signatures do not emit operational-failure diagnostics.
+Diagnostics never include exception messages, upstream response details, URLs, or private payload fields.
+Use the validated delivery ID to locate GitHub's delivery record, and request redelivery after correcting a failure.

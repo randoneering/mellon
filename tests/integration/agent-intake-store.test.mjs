@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { currentIssue, dependencies, issueEvent, jobRecord, signedRequest } from '../support/agent-intake-fixtures.mjs';
 import { createIntake } from '../../src/automation/intake.mjs';
 import { createFunction } from '../../src/automation/function.mjs';
+import { openDisposablePool } from '../support/agent-intake-database.mjs';
 
 const storeUrl = new URL('../../src/automation/store.mjs', import.meta.url);
 const storeModule = await import(storeUrl.href).catch(error => {
@@ -17,14 +17,7 @@ function createStore(pool) {
   return storeModule.createStore(pool);
 }
 
-const url = process.env.AGENT_INTAKE_TEST_DATABASE_URL;
-const databaseTest = url ? test : test.skip;
-function testPool() {
-  const parsed = new URL(url);
-  assert.ok(['127.0.0.1', 'localhost'].includes(parsed.hostname), 'database tests require a loopback-only disposable database');
-  assert.equal(parsed.pathname, '/mellon_intake_test', 'refusing a non-test database');
-  return new pg.Pool({ connectionString: url, max: 8 });
-}
+const databaseTest = process.env.AGENT_INTAKE_TEST_DATABASE_URL && process.env.AGENT_INTAKE_TEST_RUN_ID ? test : test.skip;
 
 let migration;
 async function loadMigration() {
@@ -37,7 +30,7 @@ async function loadMigration() {
 }
 
 databaseTest('migration creates only the intake schema with durable uniqueness and restricted runtime writes', async () => {
-  const pool = testPool();
+  const pool = await openDisposablePool();
   try {
     await pool.query(await loadMigration());
     const { rows: tables } = await pool.query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'agent_intake' ORDER BY table_name");
@@ -66,7 +59,7 @@ databaseTest('migration creates only the intake schema with durable uniqueness a
 });
 
 databaseTest('store survives restart and reconciles redelivery with one persisted job', async () => {
-  const pool = testPool();
+  const pool = await openDisposablePool();
   try {
     const record = jobRecord();
     const store = createStore(pool);
@@ -82,7 +75,7 @@ databaseTest('store survives restart and reconciles redelivery with one persiste
 });
 
 databaseTest('concurrent real transactions converge on one job and retain every delivery receipt', async () => {
-  const pool = testPool();
+  const pool = await openDisposablePool();
   try {
     const store = createStore(pool);
     const records = Array.from({ length: 12 }, () => jobRecord({ issueId: 701 }));
@@ -97,7 +90,7 @@ databaseTest('concurrent real transactions converge on one job and retain every 
 });
 
 databaseTest('a conflicting delivery rolls back its new job and preserves the original receipt', async () => {
-  const pool = testPool();
+  const pool = await openDisposablePool();
   try {
     const store = createStore(pool);
     const record = jobRecord({ issueId: 703 });
@@ -110,7 +103,7 @@ databaseTest('a conflicting delivery rolls back its new job and preserves the or
 });
 
 databaseTest('lost commit acknowledgment returns 503 and redelivery finds the committed job', async () => {
-  const pool = testPool();
+  const pool = await openDisposablePool();
   try {
     const uncertainPool = {
       query: pool.query.bind(pool),
@@ -142,7 +135,7 @@ databaseTest('lost commit acknowledgment returns 503 and redelivery finds the co
 });
 
 databaseTest('full signed HTTP flow with real Postgres uses only the runtime SELECT and INSERT grants', async () => {
-  const pool = testPool();
+  const pool = await openDisposablePool();
   try {
     const runtime = {
       async query(sql, values) {
@@ -172,14 +165,16 @@ databaseTest('full signed HTTP flow with real Postgres uses only the runtime SEL
 });
 
 databaseTest('configured Function joins signed HTTP, bounded GitHub reads, and the real transactional store', async () => {
-  const pool = testPool();
+  const pool = await openDisposablePool();
   try {
     const event = issueEvent({ issue: { id: 707, number: 707, title: 'private input', body: 'never stored' } });
     const calls = [];
     const fn = createFunction({
       env: {
         GITHUB_WEBHOOK_SECRET: 'synthetic-test-webhook-secret', GITHUB_READ_TOKEN: 'synthetic-github-token',
-        GITHUB_REPOSITORY_ID: '123', GITHUB_REPOSITORY_FULL_NAME: 'randoneering/mellon', AGENT_INTAKE_DATABASE_URL: url,
+        GITHUB_REPOSITORY_ID: '123', GITHUB_REPOSITORY_FULL_NAME: 'randoneering/mellon',
+        // Pool injection targets local Postgres; the production configuration still requires TLS.
+        AGENT_INTAKE_DATABASE_URL: 'postgresql://intake_runtime:synthetic@db.example/test?sslmode=verify-full',
       },
       poolFactory: () => pool,
       async fetchImpl(resource, options) {
