@@ -1,8 +1,19 @@
 import { createHash } from 'node:crypto';
+import { fstatSync, writeSync } from 'node:fs';
 import { DATABASE_SKIP_POLICY_SHA256 } from './report-annotations.mjs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 
 const RAW_PREFIX = 'MELLON_CI_RAW_V2:';
+const MAX_DIAGNOSTIC_BYTES = 24 * 1024;
+let diagnosticFd = null;
+if (process.env.MELLON_CI_DIAGNOSTIC_FD === '4') {
+  try {
+    const stat = fstatSync(4);
+    if (stat.isFIFO() || stat.isSocket()) diagnosticFd = 4;
+  } catch {}
+}
+// This private controller channel must not propagate into test subprocesses.
+delete process.env.MELLON_CI_DIAGNOSTIC_FD;
 const MAX_EVENTS = 20000;
 const MAX_TESTS = 4096;
 const MAX_FAILURES = 64;
@@ -116,7 +127,9 @@ function testIdentity(data, details) {
       || !validPositiveInteger(line) || !validPositiveInteger(column)
       || !validNonNegativeInteger(nesting, MAX_NESTING) || type !== 'test') return null;
   const identity = { column, entryFile, line, name, nesting, type };
-  return { identitySha256: hashJson(identity), entryFile };
+  const sourceFile = normalizedFile(ownValue(data, 'file'));
+  return { identitySha256: hashJson(identity), entryFile,
+    ...(sourceFile === entryFile ? { line, column } : {}) };
 }
 
 function errorCategory(error, rootFailure) {
@@ -150,6 +163,7 @@ function buildReport(source, contextInfo) {
   const counts = makeCounts();
   const failures = [];
   const rootFailures = [];
+  const diagnostics = [];
   const skippedTestIdentitySha256s = [];
   const enqueued = new Set();
   const completed = new Set();
@@ -172,12 +186,16 @@ function buildReport(source, contextInfo) {
     return canonicalJson({ entryFile, testId });
   }
 
-  function addFailure(category, identitySha256 = null, rootFailure = false) {
+  function addFailure(category, identitySha256 = null, rootFailure = false, location = null) {
     counts[`${category}FailureCount`] += 1;
     if (rootFailure) {
       counts.rootFailureCount += 1;
-      if (rootFailures.length < MAX_FAILURES) rootFailures.push({ category });
-      else markIncomplete('failure_limit', true);
+      if (rootFailures.length < MAX_FAILURES) {
+        rootFailures.push({ category });
+        if (location && diagnostics.length < MAX_FAILURES) {
+          diagnostics.push({ root: true, category, entryFile: location.entryFile });
+        }
+      } else markIncomplete('failure_limit', true);
       return;
     }
     counts.failedTestCount += 1;
@@ -185,8 +203,14 @@ function buildReport(source, contextInfo) {
       markIncomplete('malformed_event');
       return;
     }
-    if (failures.length < MAX_FAILURES) failures.push({ testIdentitySha256: identitySha256, category });
-    else markIncomplete('failure_limit', true);
+    if (failures.length < MAX_FAILURES) {
+      failures.push({ testIdentitySha256: identitySha256, category });
+      if (location && diagnostics.length < MAX_FAILURES) {
+        diagnostics.push({ category, testIdentitySha256: identitySha256,
+          entryFile: location.entryFile,
+          ...(location.line === undefined ? {} : { line: location.line, column: location.column }) });
+      }
+    } else markIncomplete('failure_limit', true);
   }
 
   function readSummary(data) {
@@ -259,7 +283,8 @@ function buildReport(source, contextInfo) {
           const error = ownValue(details, 'error');
           if (error !== undefined && error !== null) {
             if (ownValue(error, 'failureType') !== 'subtestsFailed') {
-              addFailure(errorCategory(error, true), null, true);
+              const entryFile = normalizedFile(ownValue(data, 'file'));
+              addFailure(errorCategory(error, true), null, true, entryFile ? { entryFile } : null);
             }
           }
           continue;
@@ -326,7 +351,7 @@ function buildReport(source, contextInfo) {
           counts.aggregateFailureCount += 1;
           continue;
         }
-        addFailure(errorCategory(error, false), identity.identitySha256);
+        addFailure(errorCategory(error, false), identity.identitySha256, false, identity);
       }
       streamEnded = true;
     } catch {
@@ -386,6 +411,14 @@ function buildReport(source, contextInfo) {
       json = JSON.stringify(report);
     }
     if (!report.complete) process.exitCode = 1;
+    if (diagnosticFd !== null) {
+      const packet = { version: 1, context: report.context, producerSha256: report.producerSha256,
+        entries: report.complete ? diagnostics : [] };
+      while (packet.entries.length && Buffer.byteLength(JSON.stringify(packet)) > MAX_DIAGNOSTIC_BYTES) {
+        packet.entries.pop();
+      }
+      try { writeSync(diagnosticFd, JSON.stringify(packet)); } catch {}
+    }
     return `${RAW_PREFIX}${Buffer.from(json, 'utf8').toString('base64url')}\n`;
   })();
 }

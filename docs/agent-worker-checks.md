@@ -64,7 +64,8 @@ Approval and the check reader independently reject missing, unknown, or changed 
 ## Reporter schema
 
 The protected Node 24 reporter consumes native `node:test` events and returns one `MELLON_CI_RAW_V2:<base64url JSON>` record to the runner.
-The runner writes only encoded job outputs; the separate reviewed formatter emits the `MELLON_CI_REPORT_V2:<base64url JSON>` notice.
+The runner's job outputs remain only the encoded report and exit code; the separate reviewed formatter emits the `MELLON_CI_REPORT_V2:<base64url JSON>` notice.
+Human-readable failure locations travel through a separately validated local pipe and are not part of this machine schema or accepted readiness evidence.
 The closed version 2 annotation has exactly these fields: `schemaVersion`, `complete`, `truncated`, `reason`, `context`, `producerSha256`, `counts`, `failures`, `rootFailures`, `skipPolicySha256`, `skippedTestIdentitySha256s`, `processExitCode`, and `formatterRevision`.
 The raw report omits the last two fields.
 Version 1 reports are unsupported.
@@ -148,7 +149,8 @@ Every repository-code command outside the protected `npm test` step uses a fixed
 That includes both dependency installs, asset verification, `test:build`, parity, build, distribution comparison, and release validation.
 The wrapper uses `shell: false`, fixed arguments, a fixed working directory, bounded UTF-8 output, and isolated process-group termination on the workflow's Linux runner when a command times out or exceeds the output limit.
 It escapes control characters and neutralizes both `::` and legacy `##[` markers before it writes any child output to the workflow log.
-The protected `npm test` runner writes only encoded job outputs.
+The protected `npm test` runner writes only encoded job outputs and bounded human-only failure coordinates.
+Raw child streams, test names, assertions and stacks stay suppressed; location text never supplies machine readiness evidence.
 Only the separate immutable `test-report` formatter publishes positive evidence annotations.
 
 Focused synthetic tests cover the earlier native Node test output, both marker forms, chunked UTF-8, carriage returns, output limits, timeout with an ignored `SIGTERM`, and exit-code preservation.

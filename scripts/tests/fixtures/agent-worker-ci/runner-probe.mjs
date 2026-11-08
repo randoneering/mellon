@@ -36,6 +36,10 @@ if (mode === 'local-green') {
     resolve(root, 'tests/integration/agent-worker-coordinator.test.mjs'),
     ...(mode === 'ci-database-red' ? [resolve(fixtures, 'assertion.test.mjs')] : []),
   ]);
+} else if (mode === 'ci-private-failure') {
+  status = runner.runInGitHubActions([resolve(fixtures, 'private-failure.test.mjs')]);
+} else if (mode === 'ci-setup') {
+  status = runner.runInGitHubActions([resolve(fixtures, 'setup.test.mjs')]);
 } else if (mode === 'ci-failure') {
   status = runner.runInGitHubActions([resolve(fixtures, 'assertion.test.mjs')]);
 } else {

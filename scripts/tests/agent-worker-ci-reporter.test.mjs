@@ -418,12 +418,102 @@ test('GitHub runner emits only bounded job outputs and preserves assertion failu
 
   const failed = runRunnerProbe('ci-failure', CONTEXT);
   assert.equal(failed.exitCode, 1);
-  assert.equal(failed.output, '');
+  assert.match(failed.output, /assertion failure at scripts\/tests\/fixtures\/agent-worker-ci\/assertion\.test\.mjs:4:1/);
+  assert.doesNotMatch(failed.output, /selected assertion regression|missing behavior|implemented behavior|AssertionError|::error::/);
   const failureReport = JSON.parse(Buffer.from(failed.fields.encoded_report, 'base64url').toString('utf8'));
   assert.equal(failed.fields.test_exit_code, '1');
   assert.equal(failureReport.complete, true);
   assert.equal(failureReport.counts.assertionFailureCount, 1);
   assert.deepEqual(failureReport.failures.map(item => item.category), ['assertion']);
+  assert.deepEqual(failureReport, requireReport('assertion').report);
+});
+
+test('CI failure locations omit private names, assertion text and arbitrary child streams', () => {
+  const failed = runRunnerProbe('ci-private-failure', CONTEXT);
+  assert.equal(failed.exitCode, 1);
+  assert.match(failed.output, /private-failure\.test\.mjs:4:1/);
+  assert.doesNotMatch(failed.output + failed.errorOutput,
+    /SYNTHETIC_PRIVATE|AssertionError|::error::|\u001b/);
+  const report = JSON.parse(Buffer.from(failed.fields.encoded_report, 'base64url').toString('utf8'));
+  assert.equal(report.schemaVersion, 2);
+  assert.equal(report.complete, true);
+  assert.deepEqual(Object.keys(report.failures[0]).sort(), ['category', 'testIdentitySha256']);
+});
+
+test('native setup failures show only a safe source location and category', () => {
+  const failed = runRunnerProbe('ci-setup', CONTEXT);
+  assert.equal(failed.exitCode, 1);
+  assert.match(failed.output, /setup failure.*setup\.test\.mjs/);
+  assert.doesNotMatch(failed.output + failed.errorOutput, /fixture setup detail|setup failure fixture|Error:/);
+});
+
+test('incomplete native evidence provides a fixed diagnostic without raw event details', async () => {
+  const runner = await runnerExports();
+  const { report } = requireReport('controlName');
+  assert.equal(report.complete, false);
+  const output = runner.formatFailureDiagnostics(report, Buffer.from('SYNTHETIC_PRIVATE'), new Map());
+  assert.match(output, /source locations unavailable/);
+  assert.doesNotMatch(output, /SYNTHETIC_PRIVATE|::|##\[/);
+});
+
+function diagnosticPacket(report, entry = {}) {
+  return Buffer.from(JSON.stringify({ version: 1, context: report.context,
+    producerSha256: report.producerSha256, entries: [{
+      category: 'assertion', testIdentitySha256: report.failures[0].testIdentitySha256,
+      entryFile: 'scripts/tests/fixtures/agent-worker-ci/assertion.test.mjs', line: 4, column: 1,
+      ...entry,
+    }] }));
+}
+
+test('safe diagnostic rendering binds source coordinates to existing failure evidence and selected files', async () => {
+  const runner = await runnerExports();
+  assert.equal(typeof runner.prepareDiagnosticSources, 'function');
+  assert.equal(typeof runner.formatFailureDiagnostics, 'function');
+  const { report } = requireReport('assertion');
+  const sources = runner.prepareDiagnosticSources([path.join(FIXTURE_ROOT, 'assertion.test.mjs')]);
+  const output = runner.formatFailureDiagnostics(report, diagnosticPacket(report), sources);
+  assert.match(output, /assertion\.test\.mjs:4:1/);
+  assert.match(output, new RegExp(report.failures[0].testIdentitySha256));
+  assert.doesNotMatch(output, /selected assertion regression|missing behavior|AssertionError/);
+});
+
+for (const [name, entry] of [
+  ['outside repository', { entryFile: '/tmp/private-name.test.mjs' }],
+  ['traversal', { entryFile: 'tests/../../private-name.test.mjs' }],
+  ['unselected file', { entryFile: 'tests/unit/action.test.mjs' }],
+  ['invalid line', { line: 999999 }],
+  ['invalid column', { column: 999999 }],
+  ['unknown identity', { testIdentitySha256: 'f'.repeat(64) }],
+  ['wrong category', { category: 'syntax' }],
+  ['private extra field', { message: 'SYNTHETIC_PRIVATE_DIAGNOSTIC' }],
+]) test(`safe diagnostics reject ${name} without echoing input`, async () => {
+  const runner = await runnerExports();
+  assert.equal(typeof runner.prepareDiagnosticSources, 'function');
+  const { report } = requireReport('assertion');
+  const sources = runner.prepareDiagnosticSources([path.join(FIXTURE_ROOT, 'assertion.test.mjs')]);
+  const output = runner.formatFailureDiagnostics(report, diagnosticPacket(report, entry), sources);
+  assert.doesNotMatch(output, /private-name|SYNTHETIC_PRIVATE|action\.test\.mjs|:999999/);
+  assert.match(output, /source locations unavailable/);
+});
+
+test('malformed or wrong-context diagnostic channels cannot alter machine evidence', async () => {
+  const runner = await runnerExports();
+  assert.equal(typeof runner.prepareDiagnosticSources, 'function');
+  const { report } = requireReport('assertion');
+  const before = JSON.stringify(report);
+  const sources = runner.prepareDiagnosticSources([path.join(FIXTURE_ROOT, 'assertion.test.mjs')]);
+  const wrong = JSON.parse(diagnosticPacket(report).toString());
+  wrong.context.headSha = 'b'.repeat(40);
+  const wrongProducer = JSON.parse(diagnosticPacket(report).toString());
+  wrongProducer.producerSha256 = 'b'.repeat(64);
+  for (const bytes of [Buffer.from('SYNTHETIC_PRIVATE_BROKEN_JSON'),
+    Buffer.from(JSON.stringify(wrong)), Buffer.from(JSON.stringify(wrongProducer)),
+    Buffer.alloc(32 * 1024, 'x')]) {
+    const output = runner.formatFailureDiagnostics(report, bytes, sources);
+    assert.match(output, /source locations unavailable/);
+    assert.doesNotMatch(output, /SYNTHETIC_PRIVATE/);
+  }
+  assert.equal(JSON.stringify(report), before);
 });
 
 test('pins the reviewed DB policy independently of the current skipped set', async () => {

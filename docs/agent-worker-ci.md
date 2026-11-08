@@ -22,6 +22,20 @@ It discards partial output after overflow, timeout, spawn error, or invalid UTF-
 It strips GitHub command-file handles and shell/Node startup hooks from child environments.
 On Linux, it terminates the command's isolated process group with `SIGTERM`, then `SIGKILL` after a bounded grace period.
 
+## Privacy-safe failure locations
+
+GitHub test logs show bounded source locations and failure categories, not raw test output.
+The reporter sends coordinates and opaque identities through a private controller pipe, separate from stdout/stderr and the unchanged V2 machine report.
+The runner checks the packet's run context and producer hash, matches known failure identities/categories, and accepts only selected regular test files and valid source coordinates.
+Root failures use a file-level location when an exact test location is unavailable.
+Invalid, incomplete or oversized location data produces a fixed unavailable message.
+
+The private packet is limited to 24 KiB; visible diagnostics stay within 16 KiB.
+No test names, assertion text, stacks, source snippets or arbitrary child streams enter these messages.
+The controller removes its private channel setting before starting test subprocesses.
+Location messages are human diagnostics only and never positive worker evidence or workflow commands.
+The machine report, child exit status and trusted formatter boundary remain unchanged.
+
 ## Separate trusted reporting job
 
 The `test` job runs the native reporter and publishes only two bounded, base64url-safe step outputs: the encoded report and the test exit code.
@@ -38,7 +52,9 @@ Missing or malformed configuration fails closed.
 
 The formatter accepts bounded encoded data, checks the closed version 2 schema, reviewed skip policy, complete counts, and exact repository/head/run/attempt context, and emits one base64url-encoded `MELLON_CI_REPORT_V2` notice.
 The report carries the formatter revision.
-A formatter pin has not been configured or exercised in a live GitHub workflow in this implementation session.
+The maintainer approves formatter revision `cc44c0fd57fa6dc26f1431e9a7436ac45e097cb1` for the foundation PR.
+Both full GitHub workflow reruns pass with that pin.
+The new source-location channel is separately covered by controlled privacy and tampering tests; its next published run still needs observation.
 
 ## Worker evidence boundary
 
@@ -54,7 +70,8 @@ Diagnostics remain untrusted data and cannot authorize progress by themselves.
 The trusted caller must compare a verified assertion regression with approved acceptance criteria.
 
 Focused tests exercise native test events, forged child output, bounded output handling, child environment filtering, formatter payload validation, and workflow structure.
-They do not exercise a live reporting job, an actual configured formatter revision, or live GitHub API annotations.
+Controlled tests do not prove live behavior by themselves.
+The configured foundation runs independently verify the existing V2 reporting job; future worker head/manifest/annotation binding still needs its own approved live preflight.
 GitHub-hosted CI remains an execution boundary, not network isolation.
 
 ## Reviewed database skip policy

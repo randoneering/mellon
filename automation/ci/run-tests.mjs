@@ -1,8 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { lstatSync, readFileSync, readdirSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { safeChildEnvironment } from '../../scripts/lib/output-guard.mjs';
 
@@ -68,6 +68,8 @@ const MAX_ENCODED_REPORT_BYTES = 32 * 1024;
 const MAX_CHILD_OUTPUT_BYTES = 64 * 1024;
 const CI_TEST_TIMEOUT_MS = 12 * 60 * 1000;
 const MAX_TEST_EVENTS = 20000;
+const MAX_DIAGNOSTIC_BYTES = 24 * 1024;
+const MAX_VISIBLE_DIAGNOSTIC_BYTES = 16 * 1024;
 const MAX_FAILURES = 64;
 const MAX_RUN_ATTEMPT = 1000;
 const SHA = /^[a-f0-9]{40}$/;
@@ -268,6 +270,83 @@ function decodeReporterOutput(stdout) {
   }
 }
 
+export function prepareDiagnosticSources(files) {
+  const sources = new Map();
+  if (!Array.isArray(files) || files.length > 4096) return sources;
+  for (const file of files) {
+    try {
+      if (typeof file !== 'string' || file.length > 2048) continue;
+      const absolute = resolve(ROOT, file);
+      const name = relative(ROOT, absolute).split(sep).join('/');
+      if (isAbsolute(name) || name.split('/').some(part => !part || part === '.' || part === '..')
+        || !/^(?:detector\/tests|tests\/(?:unit|integration)|scripts\/tests)\/[A-Za-z0-9._/-]+\.mjs$/.test(name)
+        || name.length > 512 || realpathSync(absolute) !== absolute) continue;
+      const stat = lstatSync(absolute);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) continue;
+      const text = new TextDecoder('utf-8', { fatal: true }).decode(readFileSync(absolute));
+      sources.set(name, text.split(/\r?\n/u).map(line => line.length + 1));
+    } catch {}
+  }
+  return sources;
+}
+
+export function formatFailureDiagnostics(report, data, sources) {
+  const unavailable = '[ci] Test failure source locations unavailable.\n';
+  if (!validRawReport(report)) return unavailable;
+  const total = report.counts.failedTestCount + report.counts.rootFailureCount;
+  if (!report.complete) return unavailable;
+  if (total === 0 && report.counts.cancelledTestCount === 0) return '';
+  if (!Buffer.isBuffer(data) || data.length === 0
+    || data.length > MAX_DIAGNOSTIC_BYTES || !(sources instanceof Map)) return unavailable;
+  let packet;
+  try { packet = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(data)); }
+  catch { return unavailable; }
+  if (!sameKeys(packet, ['version', 'context', 'producerSha256', 'entries'])
+    || packet.version !== 1 || !validContext(packet.context)
+    || canonicalJson(packet.context) !== canonicalJson(report.context)
+    || !equalHash(packet.producerSha256, report.producerSha256)
+    || !Array.isArray(packet.entries) || packet.entries.length > MAX_FAILURES) return unavailable;
+  const known = new Map(report.failures.map(item => [item.testIdentitySha256, item.category]));
+  const roots = report.rootFailures.reduce((counts, item) => {
+    counts.set(item.category, (counts.get(item.category) ?? 0) + 1); return counts;
+  }, new Map());
+  const seen = new Set();
+  const lines = [];
+  let bytes = 0;
+  for (const entry of packet.entries) {
+    if (!isRecord(entry) || typeof entry.entryFile !== 'string' || !sources.has(entry.entryFile)) return unavailable;
+    let line;
+    let identity;
+    if (entry.root === true) {
+      if (!sameKeys(entry, ['root', 'category', 'entryFile']) || !(roots.get(entry.category) > 0)) return unavailable;
+      roots.set(entry.category, roots.get(entry.category) - 1);
+      identity = `root:${entry.entryFile}:${entry.category}`;
+      line = `[ci] ${entry.category} failure in ${entry.entryFile} (file-level location).`;
+    } else {
+      const positioned = Object.hasOwn(entry, 'line') || Object.hasOwn(entry, 'column');
+      if (!sameKeys(entry, positioned
+        ? ['category', 'testIdentitySha256', 'entryFile', 'line', 'column']
+        : ['category', 'testIdentitySha256', 'entryFile'])
+        || !known.has(entry.testIdentitySha256) || known.get(entry.testIdentitySha256) !== entry.category) return unavailable;
+      identity = entry.testIdentitySha256;
+      const columns = sources.get(entry.entryFile);
+      if (positioned && (!Number.isSafeInteger(entry.line) || entry.line < 1 || entry.line > columns.length
+        || !Number.isSafeInteger(entry.column) || entry.column < 1
+        || entry.column > columns[entry.line - 1])) return unavailable;
+      const position = positioned ? `:${entry.line}:${entry.column}` : ' (entry file; exact location unavailable)';
+      line = `[ci] ${entry.category} failure at ${entry.entryFile}${position} (test ${identity}).`;
+    }
+    if (seen.has(identity)) return unavailable;
+    seen.add(identity);
+    const length = Buffer.byteLength(line) + 1;
+    if (bytes + length <= MAX_VISIBLE_DIAGNOSTIC_BYTES - 128) { lines.push(line); bytes += length; }
+  }
+  const missing = total - lines.length;
+  if (missing > 0) lines.push(`[ci] ${missing} additional failure source locations unavailable.`);
+  if (report.counts.cancelledTestCount > 0) lines.push(`[ci] ${report.counts.cancelledTestCount} native tests cancelled.`);
+  return lines.length ? lines.join('\n') + '\n' : unavailable;
+}
+
 export function runLocally(files) {
   const child = spawnSync(process.execPath, ['--test', '--test-concurrency=1', ...files], {
     cwd: ROOT,
@@ -292,16 +371,18 @@ export function runInGitHubActions(files) {
   } catch {
     return 1;
   }
-  const environment = safeChildEnvironment({
+  const sources = prepareDiagnosticSources(files);
+  const environment = { ...safeChildEnvironment({
     ...process.env,
     MELLON_CI_PRODUCER_SHA256: producerSha256,
-  });
+  }), MELLON_CI_DIAGNOSTIC_FD: '4' };
   const child = spawnSync(process.execPath, [
     '--test', '--test-concurrency=1', `--test-reporter=${REPORTER_PATH}`, ...files,
   ], {
     cwd: ROOT,
     env: environment,
     encoding: 'buffer',
+    stdio: ['ignore', 'pipe', 'pipe', 'ignore', 'pipe'],
     maxBuffer: MAX_CHILD_OUTPUT_BYTES,
     timeout: CI_TEST_TIMEOUT_MS,
     shell: false,
@@ -328,6 +409,9 @@ export function runInGitHubActions(files) {
   } catch {
     return 1;
   }
+  // Only validated coordinates cross the private channel; raw child streams stay suppressed.
+  const diagnostic = formatFailureDiagnostics(report, child.output?.[4], sources);
+  if (diagnostic) process.stdout.write(diagnostic);
   return report.complete ? child.status : Math.max(1, child.status);
 }
 

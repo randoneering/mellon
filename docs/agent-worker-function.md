@@ -19,7 +19,7 @@ The disabled declaration uses the nonsecret sentinel `disabled` when the worker 
 It also overrides `DATABASE_URL` and `DATABASE_URL_UNPOOLED`, preventing automatic owner fallback.
 `workerRuntimeEnvironment(env, databaseRole)` returns only those three worker database keys.
 It requires a matching dedicated role, exactly one `sslmode=verify-full`, and no host/TLS/user/password/database/options overrides.
-The role cannot match an available intake URL's username.
+The decoded role cannot match an available intake URL's decoded username, even when equivalent names use different percent-encoding.
 Username matching alone is not grant evidence; the [pool attestation](agent-worker-pool.md) checks actual database identity and privileges.
 The model/App bindings never enter that pool environment, intake, model messages or CI.
 

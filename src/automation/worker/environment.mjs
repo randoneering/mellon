@@ -18,7 +18,7 @@ export function workerRuntimeEnvironment(env, databaseRole) {
       }
     }
     if (env.AGENT_INTAKE_DATABASE_URL
-      && new URL(env.AGENT_INTAKE_DATABASE_URL).username === url.username) throw new Error();
+      && decodeURIComponent(new URL(env.AGENT_INTAKE_DATABASE_URL).username) === databaseRole) throw new Error();
   } catch { throw new Error('Worker configuration is invalid.'); }
   return Object.freeze({
     AGENT_WORKER_DATABASE_URL: databaseUrl,
