@@ -140,7 +140,9 @@ async function runGuided(dependencies) {
   await confirm(model);
   await confirm(report);
   output('Collecting and labeling submissions. Previously labeled URLs are skipped.');
-  await runCli(['collect', '--urls', urlFile || '-', '--dataset', dataset], { ...dependencies, ...(urls ? { urls } : {}) });
+  await runCli(['collect', '--urls', urlFile || '-', '--dataset', dataset], {
+    ...dependencies, prompt: ask, ...(urls ? { urls } : {}),
+  });
   output('Training personalized classifier.');
   try {
     await runCli(['train', '--dataset', dataset, '--model', model], dependencies);

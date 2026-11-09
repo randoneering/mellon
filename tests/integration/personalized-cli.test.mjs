@@ -206,6 +206,17 @@ test('guided manual entry can resume after re-entering URLs', async t => {
   assert.equal(JSON.parse(await readFile(files.datasetPath, 'utf8')).records[0].label, 'human');
 });
 
+test('guided treats a cancelled label prompt as cancellation and preserves prior labels', async t => {
+  const files = await fixture(t);
+  const answers = [files.urlFile, files.datasetPath, files.modelPath, files.reportPath, 'human'];
+  await assert.rejects(runCli(['guided'], {
+    ...deps([]), prompt: async () => answers.shift(),
+  }), /Guided workflow cancelled/);
+  const saved = JSON.parse(await readFile(files.datasetPath, 'utf8'));
+  assert.equal(saved.records.length, 1);
+  assert.equal(saved.records[0].label, 'human');
+});
+
 test('guided uses GITHUB_TOKEN when GH_TOKEN is empty', async t => {
   const files = await fixture(t);
   const answers = [files.urlFile, files.datasetPath, files.modelPath, files.reportPath,
