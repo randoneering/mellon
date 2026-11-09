@@ -19,7 +19,11 @@ The [default runtime](agent-worker-runtime.md) constructs it only after authenti
 
 `verifyRole({ signal, deadline, limits })` runs one read-only catalog query before model work.
 When supplied, the reviewed limits must also satisfy the actual migrated `agent_worker.valid_limits` function.
-It requires the configured current/session role and an encrypted connection.
+It requires the configured current/session role and a verified client TLS socket.
+The socket must be encrypted, certificate-authorized and on TLS 1.2 or 1.3.
+For DNS hosts, its TLS server name must match the configured host.
+IP hosts send no server name, so they rely on pg's certificate IP check.
+Neon's backend `pg_stat_ssl` view can report `false` for the internal proxy hop, so attestation does not use it.
 It rejects superuser, RLS bypass, role/database creation, replication, inheritance, role membership, database ownership, application-object ownership and schema creation.
 It verifies the required schema/table/sequence grants and rejects extra table grants within `agent_intake` and `agent_worker`.
 Worker tables require the migration-defined read/insert/update subsets; intake jobs remain read-only.
@@ -36,5 +40,5 @@ Unit tests construct an actual pg pool without connecting and use controlled dri
 They also execute the installed Neon pool error handler.
 `npm run test:worker:runtime:db` passes eight actual PostgreSQL cases plus three fresh-database marker guards.
 They execute the catalog SQL, safe/unsafe grants and roles, the 65,536 ceiling, duplicate prevention and two nonrefunded initial reservations.
-The local test adapter uses plaintext deliberately: production attestation rejects its false TLS receipt.
+The local test adapter uses plaintext deliberately: production attestation rejects its non-TLS socket.
 Live Neon TLS/grants and service isolation remain gated; these local results do not replace that preflight.

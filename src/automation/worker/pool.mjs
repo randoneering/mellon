@@ -1,3 +1,5 @@
+import tls from 'node:tls';
+import { isIP } from 'node:net';
 import pg from 'pg';
 import { attachDatabasePool } from '@neon/functions';
 import { workerRuntimeEnvironment } from './environment.mjs';
@@ -59,6 +61,19 @@ const FALSE_FIELDS = [
 ];
 const ROLE_ERROR = 'Worker database role could not be verified.';
 
+// Neon's backend view can describe an internal proxy hop, so trust the verified client socket.
+function verifiedClientTls(client, host) {
+  try {
+    const stream = client?.connection?.stream;
+    const serverNameValid = isIP(host) !== 0
+      ? stream.servername === undefined || stream.servername === false
+      : stream.servername === host;
+    return stream instanceof tls.TLSSocket && stream.encrypted === true
+      && stream.authorized === true && serverNameValid
+      && ['TLSv1.2', 'TLSv1.3'].includes(stream.getProtocol());
+  } catch { return false; }
+}
+
 function discardQuietly(client) {
   try { client?.release(true); } catch {}
 }
@@ -66,6 +81,7 @@ function discardQuietly(client) {
 export function createWorkerDatabase({ env, databaseRole, report = line => console.error(line) },
   { Pool = pg.Pool, attachPool = attachDatabasePool } = {}) {
   let pool;
+  let host;
   try {
     if (typeof report !== 'function' || typeof Pool !== 'function'
       || typeof attachPool !== 'function') throw new Error();
@@ -76,9 +92,9 @@ export function createWorkerDatabase({ env, databaseRole, report = line => conso
     const port = url.port ? Number(url.port) : 5432;
     if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error();
     // Explicit fields prevent pg's URL parser and PG* environment fallbacks from changing authority.
+    host = url.hostname.startsWith('[') ? url.hostname.slice(1, -1) : url.hostname;
     pool = new Pool({
-      host: url.hostname.startsWith('[') ? url.hostname.slice(1, -1) : url.hostname,
-      port, user: decodeURIComponent(url.username), password,
+      host, port, user: decodeURIComponent(url.username), password,
       database: decodeURIComponent(url.pathname.slice(1)),
       ssl: { rejectUnauthorized: true }, enableChannelBinding: true,
       max: 2, connectionTimeoutMillis: 5000, idleTimeoutMillis: 10000,
@@ -125,7 +141,7 @@ export function createWorkerDatabase({ env, databaseRole, report = line => conso
       const row = receipt.rows[0];
       if (row.role_name !== databaseRole || row.session_role !== databaseRole
         || (limits !== undefined && row.limits_ok !== true)
-        || row.ssl !== true || row.grants_ok !== true
+        || !verifiedClientTls(client, host) || row.grants_ok !== true
         || !FALSE_FIELDS.every(field => row[field] === false)) throw new Error();
       return true;
     } catch {

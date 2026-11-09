@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import tls from 'node:tls';
 import { createWorkerDatabase } from '../../src/automation/worker/pool.mjs';
 import { createWorkerStore } from '../../src/automation/worker/store.mjs';
 import { harness } from './worker-coordinator/harness.mjs';
@@ -74,7 +75,10 @@ export async function runtimeFixture() {
     constructor(options) { super(); this.options = options; this.closed = false; pool = this; }
     async connect() {
       events.push('database.connect');
-      return { async query() { return { rows: [{ ...role }] }; },
+      const stream = Object.setPrototypeOf({ encrypted: true, authorized: true,
+        servername: this.options.host, getProtocol() { return 'TLSv1.3'; } },
+      tls.TLSSocket.prototype);
+      return { connection: { stream }, async query() { return { rows: [{ ...role }] }; },
         release(discard) { events.push(discard ? 'database.discard' : 'database.release'); } };
     }
     async end() { this.closed = true; events.push('database.close'); }

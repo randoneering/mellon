@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import test from 'node:test';
+import tls from 'node:tls';
 import pg from 'pg';
 import { workerRuntimeEnvironment } from '../../src/automation/worker/function.mjs';
 
@@ -14,6 +15,13 @@ const validRole = {
   database_create: false, schema_create: false, grants_ok: true,
 };
 
+function tlsStream(overrides = {}) {
+  return Object.setPrototypeOf({
+    encrypted: true, authorized: true, servername: 'db.example',
+    getProtocol() { return 'TLSv1.3'; }, ...overrides,
+  }, tls.TLSSocket.prototype);
+}
+
 async function loadFactory() {
   const module = await import('../../src/automation/worker/pool.mjs').catch(() => ({}));
   assert.equal(typeof module.createWorkerDatabase, 'function',
@@ -21,7 +29,7 @@ async function loadFactory() {
   return module.createWorkerDatabase;
 }
 
-function fixture({ row = validRole, connect, query, report } = {}) {
+function fixture({ row = validRole, connect, query, report, stream = tlsStream() } = {}) {
   const released = [];
   const queries = [];
   let constructed;
@@ -30,6 +38,7 @@ function fixture({ row = validRole, connect, query, report } = {}) {
     async connect() {
       if (connect) return connect();
       return {
+        connection: { stream },
         async query(input) {
           queries.push(input);
           if (query) return query(input);
@@ -92,8 +101,65 @@ test('role attestation requires the complete restricted-role receipt', async () 
   assert.ok(f.queries[0].query_timeout <= 5000);
 });
 
+test('role attestation accepts verified client TLS when the backend view reports a proxied hop', async () => {
+  const create = await loadFactory();
+  const f = fixture({ row: { ...validRole, ssl: false } });
+  const database = create({ env: { AGENT_WORKER_DATABASE_URL: URL }, databaseRole: ROLE }, f);
+  assert.equal(await database.verifyRole(), true);
+  assert.deepEqual(f.released, [false]);
+});
+
+// Names stay free of '::' because the CI reporter rejects workflow-command markers.
+for (const [family, host] of [['IPv4', '203.0.113.10'], ['IPv6', '[2001:db8::10]']]) {
+  test(`role attestation accepts verified TLS to an ${family} host`, async () => {
+    const create = await loadFactory();
+    const url = `postgresql://${ROLE}:worker-password@${host}/neondb?sslmode=verify-full`;
+    const f = fixture({ stream: tlsStream({ servername: undefined }) });
+    const database = create({ env: { AGENT_WORKER_DATABASE_URL: url }, databaseRole: ROLE }, f);
+    assert.equal(await database.verifyRole(), true);
+  });
+}
+
+test('role attestation rejects unauthorized TLS to an IP host', async () => {
+  const create = await loadFactory();
+  const url = `postgresql://${ROLE}:worker-password@203.0.113.10/neondb?sslmode=verify-full`;
+  const f = fixture({ stream: tlsStream({ servername: undefined, authorized: false }) });
+  const database = create({ env: { AGENT_WORKER_DATABASE_URL: url }, databaseRole: ROLE }, f);
+  await assert.rejects(database.verifyRole(), { message: 'Worker database role could not be verified.' });
+});
+
+test('role attestation rejects mismatched TLS server name for an IP host', async () => {
+  const create = await loadFactory();
+  const url = `postgresql://${ROLE}:worker-password@203.0.113.10/neondb?sslmode=verify-full`;
+  const f = fixture({ stream: tlsStream({ servername: 'db.example' }) });
+  const database = create({ env: { AGENT_WORKER_DATABASE_URL: url }, databaseRole: ROLE }, f);
+  await assert.rejects(database.verifyRole(), { message: 'Worker database role could not be verified.' });
+});
+
+for (const [name, stream] of [
+  ['a missing socket', null],
+  ['a plaintext socket', new EventEmitter()],
+  ['a non-TLS socket shaped like TLS', { encrypted: true, authorized: true,
+    servername: 'db.example', getProtocol() { return 'TLSv1.3'; } }],
+  ['an unencrypted TLS socket', tlsStream({ encrypted: false })],
+  ['an unauthorized certificate', tlsStream({ authorized: false })],
+  ['a mismatched server name', tlsStream({ servername: 'other.example' })],
+  ['a missing server name', tlsStream({ servername: undefined })],
+  ['an old TLS protocol', tlsStream({ getProtocol() { return 'TLSv1.1'; } })],
+  ['an unknown TLS protocol', tlsStream({ getProtocol() { return null; } })],
+  ['a throwing protocol reader', tlsStream({ getProtocol() { throw new Error('private'); } })],
+]) {
+  test(`role attestation rejects ${name} even with a backend TLS receipt`, async () => {
+    const create = await loadFactory();
+    const f = fixture({ stream });
+    const database = create({ env: { AGENT_WORKER_DATABASE_URL: URL }, databaseRole: ROLE }, f);
+    await assert.rejects(database.verifyRole(), { message: 'Worker database role could not be verified.' });
+    assert.deepEqual(f.released, [true]);
+  });
+}
+
 for (const [field, bad] of [
-  ['role_name', 'owner'], ['session_role', 'owner'], ['ssl', false],
+  ['role_name', 'owner'], ['session_role', 'owner'],
   ['rolsuper', true], ['rolbypassrls', true], ['rolcreatedb', true],
   ['rolcreaterole', true], ['rolreplication', true], ['rolinherit', true],
   ['has_memberships', true], ['owns_database', true], ['owns_app_objects', true],
