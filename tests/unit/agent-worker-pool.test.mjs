@@ -109,8 +109,9 @@ test('role attestation accepts verified client TLS when the backend view reports
   assert.deepEqual(f.released, [false]);
 });
 
-for (const host of ['203.0.113.10', '[2001:db8::10]']) {
-  test(`role attestation accepts verified TLS to IP host ${host}`, async () => {
+// Names stay free of '::' because the CI reporter rejects workflow-command markers.
+for (const [family, host] of [['IPv4', '203.0.113.10'], ['IPv6', '[2001:db8::10]']]) {
+  test(`role attestation accepts verified TLS to an ${family} host`, async () => {
     const create = await loadFactory();
     const url = `postgresql://${ROLE}:worker-password@${host}/neondb?sslmode=verify-full`;
     const f = fixture({ stream: tlsStream({ servername: undefined }) });
