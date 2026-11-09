@@ -1,4 +1,5 @@
 import tls from 'node:tls';
+import { isIP } from 'node:net';
 import pg from 'pg';
 import { attachDatabasePool } from '@neon/functions';
 import { workerRuntimeEnvironment } from './environment.mjs';
@@ -64,9 +65,11 @@ const ROLE_ERROR = 'Worker database role could not be verified.';
 function verifiedClientTls(client, host) {
   try {
     const stream = client?.connection?.stream;
+    const serverNameValid = isIP(host) !== 0
+      ? stream.servername === undefined || stream.servername === false
+      : stream.servername === host;
     return stream instanceof tls.TLSSocket && stream.encrypted === true
-      && stream.authorized === true && typeof stream.servername === 'string'
-      && stream.servername === host
+      && stream.authorized === true && serverNameValid
       && ['TLSv1.2', 'TLSv1.3'].includes(stream.getProtocol());
   } catch { return false; }
 }

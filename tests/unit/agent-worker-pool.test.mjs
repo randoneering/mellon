@@ -109,6 +109,32 @@ test('role attestation accepts verified client TLS when the backend view reports
   assert.deepEqual(f.released, [false]);
 });
 
+for (const host of ['203.0.113.10', '[2001:db8::10]']) {
+  test(`role attestation accepts verified TLS to IP host ${host}`, async () => {
+    const create = await loadFactory();
+    const url = `postgresql://${ROLE}:worker-password@${host}/neondb?sslmode=verify-full`;
+    const f = fixture({ stream: tlsStream({ servername: undefined }) });
+    const database = create({ env: { AGENT_WORKER_DATABASE_URL: url }, databaseRole: ROLE }, f);
+    assert.equal(await database.verifyRole(), true);
+  });
+}
+
+test('role attestation rejects unauthorized TLS to an IP host', async () => {
+  const create = await loadFactory();
+  const url = `postgresql://${ROLE}:worker-password@203.0.113.10/neondb?sslmode=verify-full`;
+  const f = fixture({ stream: tlsStream({ servername: undefined, authorized: false }) });
+  const database = create({ env: { AGENT_WORKER_DATABASE_URL: url }, databaseRole: ROLE }, f);
+  await assert.rejects(database.verifyRole(), { message: 'Worker database role could not be verified.' });
+});
+
+test('role attestation rejects mismatched TLS server name for an IP host', async () => {
+  const create = await loadFactory();
+  const url = `postgresql://${ROLE}:worker-password@203.0.113.10/neondb?sslmode=verify-full`;
+  const f = fixture({ stream: tlsStream({ servername: 'db.example' }) });
+  const database = create({ env: { AGENT_WORKER_DATABASE_URL: url }, databaseRole: ROLE }, f);
+  await assert.rejects(database.verifyRole(), { message: 'Worker database role could not be verified.' });
+});
+
 for (const [name, stream] of [
   ['a missing socket', null],
   ['a plaintext socket', new EventEmitter()],
