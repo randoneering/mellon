@@ -150,6 +150,17 @@ A separate local experiment workflow can train and evaluate a personalized class
 
 An optional [Neon webhook intake](docs/agent-webhook-intake.md) records any eligible issue when an authorized maintainer adds `agent: ready`.
 It queues metadata only; it does not run an agent, change moderation, or open a PR.
+The separate [issue worker](docs/agent-issue-worker.md) is under development and remains disabled.
+Generated changes use the existing [CI execution boundary](docs/agent-worker-ci.md).
+The [Qodo evidence reader](docs/agent-worker-review.md) supports an explicitly pinned GitHub submitted-review boundary; automatic draft/re-review behavior remains a live activation gate.
+The [worker Function and schedule](docs/agent-worker-function.md) have a real [default runtime composition](docs/agent-worker-runtime.md) and remain disabled pending the [operational approval checklist](docs/agent-worker-deployment.md).
+The [GitHub App broker](docs/agent-worker-github-app.md) verifies repository-scoped reader, commit and PR tokens before publication.
+The [restricted database pool](docs/agent-worker-pool.md) supplies explicit worker-role/TLS settings and a bounded role-attestation gate.
+Run `npm run test:worker:runtime:db` for the explicit fresh-container runtime SQL checks; it adds no ordinary CI database skips.
+The [model adapter](docs/agent-worker-agent.md) supports the explicitly approved conservative Sol input reservation; strict profiles still require a reviewed tokenizer, and live Gateway preflight remains mandatory.
+[Candidate selection](docs/agent-worker-candidates.md) uses immutable reads and static parsing without executing proposals.
+Run separate [journal](docs/agent-worker-journal-db.md) and [configured Function](docs/agent-worker-coordinator-db.md) database checks.
+The [coordinator](docs/agent-worker-coordinator.md) has bounded phase contracts; production adapters remain unwired.
 
 ## Build and test
 

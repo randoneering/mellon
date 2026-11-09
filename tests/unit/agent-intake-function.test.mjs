@@ -83,13 +83,14 @@ test('entrypoint logs configuration and unexpected handler failures without prin
   }
 });
 
-test('Neon config declares only the intake and overrides automatically injected owner database URLs', () => {
-  const script = `const {default:c}=await import('./neon.ts'); const f=c.functions.githubintake; console.log(JSON.stringify({auth:c.auth,slugs:Object.keys(c.functions),source:f.source,limited:f.env.DATABASE_URL===process.env.AGENT_INTAKE_DATABASE_URL&&f.env.DATABASE_URL_UNPOOLED===process.env.AGENT_INTAKE_DATABASE_URL,noAdmin:!Object.hasOwn(f.env,'NEON_API_KEY')}));`;
+test('Neon config preserves intake isolation beside the disabled worker', () => {
+  const script = `const {default:c}=await import('./neon.ts'); const f=c.functions.githubintake; console.log(JSON.stringify({auth:c.auth,slugs:Object.keys(c.functions),source:f.source,limited:f.env.DATABASE_URL===process.env.AGENT_INTAKE_DATABASE_URL&&f.env.DATABASE_URL_UNPOOLED===process.env.AGENT_INTAKE_DATABASE_URL,noAdmin:!Object.hasOwn(f.env,'NEON_API_KEY'),workerDisabled:c.functions.issueworker.env.AGENT_WORKER_ENABLED==='false'&&c.triggers.issueworkertick.enabled===false}));`;
   const result = spawnSync('node', ['--input-type=module', '--eval', script], { encoding: 'utf8', env: { ...process.env, ...env } });
   assert.equal(result.status, 0, 'Neon config must be evaluable with explicit runtime secrets');
   const resultData = JSON.parse(result.stdout.trim());
   assert.equal(resultData.auth, true, 'preserve the existing production Auth service');
-  assert.deepEqual(resultData.slugs, ['githubintake']);
+  assert.deepEqual(resultData.slugs, ['githubintake', 'issueworker']);
+  assert.equal(resultData.workerDisabled, true);
   assert.equal(resultData.source, './src/automation/function.mjs');
   assert.equal(resultData.limited, true);
   assert.equal(resultData.noAdmin, true);
