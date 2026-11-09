@@ -182,7 +182,8 @@ function validPhaseInstructions(value, context) {
   if (!Number.isSafeInteger(cycle) || cycle < 0 || cycle > 2
     || purpose.startsWith('initial_') !== (cycle === 0)) return false;
   const expectedName = cycle === 0 ? config.initial.testName : config.repairTestNames[cycle - 1];
-  if (value.testName !== expectedName || typeof value.testName !== 'string' || value.testName.length > 200) return false;
+  // Preserve the approved manifest's test-name limit through the model handoff.
+  if (value.testName !== expectedName || typeof value.testName !== 'string' || value.testName.length > 500) return false;
   if (cycle === 0) return exactKeys(value, ['purpose', 'repairCycle', 'regressionPath', 'testName', 'criterionIndex', 'criterion'])
     && value.criterionIndex === config.initial.criterionIndex
     && value.criterion === context.manifest.acceptanceCriteria[value.criterionIndex];
@@ -318,6 +319,14 @@ export function createAgentWorker({
       let reservation, controller, outcomeAttempted = false;
       const state = { active: false, toolCalls: 0, toolCounts: Object.create(null),
         proposalAttempted: false, proposalStatus: null, changes: null, assessment: null, deadline: 0 };
+      const diagnostics = () => {
+        const accepted = state.changes !== null || state.assessment !== null;
+        return deepCloneFreeze({ proposalCategory: state.changes !== null ? 'valid_proposal'
+          : state.assessment !== null ? 'assessment_only' : state.proposalStatus
+            ?? (state.toolCalls === 0 ? 'prose_only' : state.toolCounts.proposeChanges ? 'rejected_proposal' : 'read_only'),
+        ...(!accepted && state.proposalRejection ? { proposalRejection: state.proposalRejection } : {}),
+        toolCounts: Object.fromEntries(Object.entries(state.toolCounts).slice(0, 3)) });
+      };
       const persist = async outcome => {
         outcomeAttempted = true;
         const normalized = normalizeModelCallOutcome(outcome);
@@ -495,17 +504,12 @@ export function createAgentWorker({
           return await persist({ outcome: 'unknown_contract' }) ?? stopped('model_contract_unknown');
         }
         const failure = await persist(safeUsage(result, reservation, isSol));
-        if (failure) return failure;
-        const diagnostics = () => deepCloneFreeze({ proposalCategory: state.changes !== null
-          ? 'valid_proposal' : state.proposalStatus
-            ?? (state.toolCalls === 0 ? 'prose_only' : state.toolCounts.proposeChanges ? 'rejected_proposal' : 'read_only'),
-        ...(state.proposalRejection ? { proposalRejection: state.proposalRejection } : {}),
-        toolCounts: Object.fromEntries(Object.entries(state.toolCounts).slice(0, 3)) });
+        if (failure) return deepCloneFreeze({ ...failure, diagnostics: diagnostics() });
         if (context.investigation) {
           if (!state.assessment) return { ...stopped('investigation_assessment_unavailable'), diagnostics: diagnostics() };
           if (state.assessment.disposition !== 'confirmed') return deepCloneFreeze({
             status: 'stopped', blockerCode: 'investigation_human_stop', proposal: false,
-            changes: [], assessment: state.assessment,
+            changes: [], assessment: state.assessment, diagnostics: diagnostics(),
           });
           if (!state.changes?.length) return stopped('investigation_assessment_unavailable');
         }

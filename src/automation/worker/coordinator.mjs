@@ -11,6 +11,7 @@ import { buildDraftPrOperationHash, deriveBranchName, gitBlobSha,
 import { createRecoveryCoordinator } from './recovery.mjs';
 import { createRepositoryReader } from './repository.mjs';
 import { createReviewReader } from './review.mjs';
+import { createTrustedReviewRequestPublisher } from './review-request-publisher.mjs';
 import { SOL_MODEL_PROFILE, validManifestModel } from './model-profile.mjs';
 import { CONSERVATIVE_INPUT_MODE } from './input-budget.mjs';
 import { buildCoordinatorPhaseKey, createWaitDeadline, validateClaimInput,
@@ -31,8 +32,9 @@ const MODEL_STATES = new Set(['generating_tests', 'implementing', 'repairing']);
 const WAIT_STATES = new Set(['waiting_red_ci', 'waiting_ci', 'waiting_review']);
 const PHASE_FIELDS = ['version', 'purpose', 'key', 'repairCycle', 'headSha', 'findingSha256',
   'expectedRegression', 'criterionSha256', 'findingSource', 'findingHeadSha', 'priorCheckRunId', 'priorReviewId'];
-const result = (status, reason, persisted = false, diagnostics) => Object.freeze({ status,
-  ...(reason ? { reason } : {}), persisted, ...(diagnostics ? { diagnostics } : {}) });
+const result = (status, reason, persisted = false, diagnostics, reviewDiagnostics) => Object.freeze({ status,
+  ...(reason ? { reason } : {}), persisted, ...(diagnostics ? { diagnostics } : {}),
+  ...(reviewDiagnostics ? { reviewDiagnostics: Object.freeze({ ...reviewDiagnostics }) } : {}) });
 const freeze = value => {
   if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); }
   return value;
@@ -200,10 +202,14 @@ export function createCoordinator(dependencies = {}) {
   const repository = adapters.repository ?? createRepositoryReader(repositoryConfiguration);
   const discovery = adapters.discovery ?? createWorkflowDiscovery(repositoryConfiguration);
   const review = adapters.review ?? createReviewReader({ token: readToken, repositoryId: manifest.repository.id, fetch });
+  const reviewRequestPublisher = adapters.reviewRequestPublisher ?? createTrustedReviewRequestPublisher({
+    getPullRequestContext: publicationDependencies.getPullRequestContext,
+    fetch: publicationDependencies.fetch ?? fetch,
+  });
 
   async function advanceTick(delivery) {
     const budget = createWaitDeadline(timeoutMs);
-    let lease, claimedDeadline, snapshot, terminalResult, databaseUncertain = false, agentDiagnostics = null;
+    let lease, claimedDeadline, snapshot, terminalResult, databaseUncertain = false, agentDiagnostics = null, reviewDiagnostics;
     async function database(operation) {
       if (databaseUncertain || terminalResult) stop('recovery_database_uncertain');
       try {
@@ -310,8 +316,8 @@ export function createCoordinator(dependencies = {}) {
         checkWait();
         return store.checkpoint(lease, change, options);
       });
-      return receipt ? result(WAIT_STATES.has(state) ? 'waiting' : 'advanced', undefined, true)
-        : result('needs_attention', 'recovery_lease_lost');
+      return receipt ? result(WAIT_STATES.has(state) ? 'waiting' : 'advanced', undefined, true, undefined, reviewDiagnostics)
+        : result('needs_attention', 'recovery_lease_lost', false, undefined, reviewDiagnostics);
     }
     async function checks(expectedRegression, failure = false) {
       const run = snapshot.run;
@@ -414,6 +420,62 @@ export function createCoordinator(dependencies = {}) {
         pullNumber: snapshot.run.pullRequestNumber, headSha: snapshot.run.expectedHeadSha,
         qodoIdentities: manifest.qodoIdentities, requireDraft: true, deadline: budget.deadline }));
       checkWait();
+      return value;
+    }
+    function reviewPolicyEnabled() {
+      return manifest.reviewPolicy?.version === 1
+        && manifest.reviewPolicy.profile === 'worker-command-maintainer-fallback-v1';
+    }
+    async function dispatchReviewRequest() {
+      if (!reviewPolicyEnabled()) return { status: 'disabled' };
+      const run = { ...snapshot.run, branchName: snapshot.run.branchName,
+        repositoryId: snapshot.run.repositoryId, repositoryFullName: snapshot.run.repositoryFullName,
+        pullRequestNumber: snapshot.run.pullRequestNumber, expectedHeadSha: snapshot.run.expectedHeadSha };
+      const dispatched = await budget.wait(() => reviewRequestPublisher.dispatch({
+        reviewPolicy: manifest.reviewPolicy, run, lease, workerActor: dependencies.ownedActor,
+        expectedWorkerActor: dependencies.ownedActor, deadline: budget.deadline, store,
+        database: operation => database(operation),
+        async checkApproval() { await fresh(); },
+        async checkFence() {
+          const current = await owned();
+          if (current.run.state !== 'waiting_review' || current.pendingOperation
+            || current.run.expectedHeadSha !== run.expectedHeadSha
+            || current.run.pullRequestNumber !== run.pullRequestNumber) stop('recovery_lease_lost');
+          checkWait();
+        },
+      }));
+      reviewDiagnostics = { category: dispatched.status === 'confirmed' ? 'review_request_confirmed' : dispatched.category,
+        ...(Number.isSafeInteger(dispatched.commentId) && dispatched.commentId > 0 ? { commentId: dispatched.commentId } : {}) };
+      if (databaseUncertain) stop('recovery_database_uncertain');
+      return dispatched;
+    }
+    async function recordTrustedReviewEvidence(source, reviewId, dispatched) {
+      if (!reviewPolicyEnabled()) return;
+      const run = snapshot.run;
+      const proof = await database(options => store.recordReviewEvidence(lease, {
+        headSha: run.expectedHeadSha, identitySha256: dispatched.identitySha256,
+        actorId: dependencies.ownedActor.databaseId, actorLogin: dependencies.ownedActor.login,
+        appId: dispatched.appId, pullRequestNumber: run.pullRequestNumber,
+        source, reviewId,
+      }, options));
+      if (proof?.evidenceSource !== source || proof.nativeReviewId !== reviewId) {
+        reviewDiagnostics = { ...reviewDiagnostics, category: 'review_evidence_unconfirmed' };
+        stop('recovery_effect_unconfirmed');
+      }
+      reviewDiagnostics = { ...reviewDiagnostics, source };
+    }
+    async function maintainerFallback() {
+      if (!reviewPolicyEnabled() || typeof review.readMaintainerReview !== 'function') return null;
+      const value = await budget.wait(() => review.readMaintainerReview({
+        repository: snapshot.run.repositoryFullName, repositoryId: snapshot.run.repositoryId,
+        pullNumber: snapshot.run.pullRequestNumber, headSha: snapshot.run.expectedHeadSha,
+        workerActor: dependencies.ownedActor,
+        approver: { id: manifest.approver.id, login: manifest.approver.login }, deadline: budget.deadline,
+      }));
+      checkWait();
+      if (value?.status !== 'approved' || value.headSha !== snapshot.run.expectedHeadSha
+        || value.reviewerId !== manifest.approver.id || value.reviewerLogin?.toLowerCase() !== manifest.approver.login.toLowerCase()
+        || !Number.isSafeInteger(value.reviewId) || value.reviewId < 1) return null;
       return value;
     }
     async function finding(source, value, checked, reviewId = null) {
@@ -585,10 +647,28 @@ export function createCoordinator(dependencies = {}) {
       if (WAIT_STATES.has(run.state)) {
         checkWait();
         if (run.state === 'waiting_review') {
-          const value = await reviewRead();
-          if (value?.status === 'waiting') return await checkpoint(run.state);
-          if (!reviewBinding(value)) stop();
-          if (value.findings.length) {
+          if (reviewPolicyEnabled()) {
+            const initialChecks = await checks();
+            if (initialChecks?.status === 'waiting') return await checkpoint(run.state);
+            if (initialChecks?.status !== 'success') stop();
+            const dispatched = await dispatchReviewRequest();
+            if (dispatched.status !== 'confirmed') stop('recovery_effect_unconfirmed');
+          }
+          let value = await reviewRead();
+          let maintainerProof = false;
+          if (value?.status === 'waiting') {
+            if (!reviewPolicyEnabled() || !['draft_review_absent', 'review_absent', 'stale_review'].includes(value.reason)) {
+              return await checkpoint(run.state);
+            }
+            const fallbackChecks = await checks();
+            if (fallbackChecks?.status === 'waiting') return await checkpoint(run.state);
+            if (fallbackChecks?.status !== 'success') stop();
+            value = await maintainerFallback();
+            if (!value) return await checkpoint(run.state);
+            maintainerProof = true;
+          }
+          if (!maintainerProof && !reviewBinding(value)) stop();
+          if (!maintainerProof && value.findings.length) {
             if (value.findings.length !== 1) stop();
             const sourceFinding = value.findings[0];
             const currentChecks = await checks();
@@ -601,17 +681,25 @@ export function createCoordinator(dependencies = {}) {
             if (!exact(sourceFinding, ['findingSha256', 'assertions'])) stop();
             return await finding('qodo', sourceFinding, currentChecks, value.reviewId);
           }
-          if (value.status !== 'complete') stop();
+          if (!maintainerProof && value.status !== 'complete') stop();
+          const reviewId = value.reviewId;
+          const evidenceSource = maintainerProof ? 'maintainer' : 'qodo';
           const currentChecks = await checks();
           if (currentChecks?.status === 'waiting') return await checkpoint(run.state);
           if (currentChecks?.status !== 'success') stop();
+          if (reviewPolicyEnabled()) {
+            // Reconcile the confirmed command and recheck owned head after proof/CI reads.
+            const dispatched = await dispatchReviewRequest();
+            if (dispatched.status !== 'confirmed') stop('recovery_effect_unconfirmed');
+            await recordTrustedReviewEvidence(evidenceSource, reviewId, dispatched);
+          }
           await fresh();
           const receipt = await database(options => {
             checkWait();
             return store.finishRun(lease, 'ready_for_human',
-              { evidence: evidenceFor(currentChecks, value.reviewId) }, options);
+              { evidence: evidenceFor(currentChecks, reviewId) }, options);
           });
-          return receipt ? result('ready_for_human', undefined, true) : result('needs_attention', 'recovery_lease_lost');
+          return receipt ? result('ready_for_human', undefined, true, undefined, reviewDiagnostics) : result('needs_attention', 'recovery_lease_lost', false, undefined, reviewDiagnostics);
         }
         const value = await checks(run.state === 'waiting_red_ci' ? phase.expectedRegression : undefined);
         if (value?.status === 'waiting') return await checkpoint(run.state);
@@ -641,8 +729,8 @@ export function createCoordinator(dependencies = {}) {
       stop();
     } catch (error) {
       if (terminalResult) return terminalResult;
-      if (databaseUncertain) return result('needs_attention', 'recovery_database_uncertain');
-      if (budget.isExpired()) return result('needs_attention', 'recovery_deadline');
+      if (databaseUncertain) return result('needs_attention', 'recovery_database_uncertain', false, undefined, reviewDiagnostics);
+      if (budget.isExpired()) return result('needs_attention', 'recovery_deadline', false, undefined, reviewDiagnostics);
       const reason = error instanceof Stop ? error.reason : 'coordinator_journal_conflict';
       const status = error instanceof Stop ? error.status : 'needs_attention';
       const diagnostics = agentDiagnostics
@@ -650,12 +738,12 @@ export function createCoordinator(dependencies = {}) {
           && agentDiagnostics.proposalCategory === 'valid_proposal'
           ? 'lost_valid_proposal' : agentDiagnostics.proposalCategory }
         : undefined;
-      if (!lease) return result(status, reason, false, diagnostics);
+      if (!lease) return result(status, reason, false, diagnostics, reviewDiagnostics);
       try {
         const persisted = await database(options => store.finishRun(lease, status,
           status === 'needs_attention' ? { blockerCode: reason } : {}, options));
-        return persisted ? result(status, reason, true, diagnostics) : result('needs_attention', 'recovery_lease_lost');
-      } catch { return result('needs_attention', 'recovery_database_uncertain'); }
+        return persisted ? result(status, reason, true, diagnostics, reviewDiagnostics) : result('needs_attention', 'recovery_lease_lost', false, undefined, reviewDiagnostics);
+      } catch { return result('needs_attention', 'recovery_database_uncertain', false, undefined, reviewDiagnostics); }
     } finally { budget.close(); }
   }
   return Object.freeze({ advanceTick });

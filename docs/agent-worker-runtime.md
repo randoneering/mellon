@@ -60,6 +60,21 @@ Hash checks verify its binding, not the truth of checks that have never run.
 Never create production evidence from mocked tests or credential presence.
 Live generation, App publication, draft/re-review and spend/isolation checks still need their separate approvals.
 
+## Optional review-policy preflight
+
+A manifest may opt into `reviewPolicy: { version: 1, profile: 'worker-command-maintainer-fallback-v1' }`.
+It then requires preflight version `2` with `reviewProfile: 'worker-command-maintainer-fallback-v1'`.
+The first five existing checks stay required; replace `qodo_draft_review` and `qodo_updated_head_review` with `worker_review_command` and `maintainer_exact_head_review`.
+Old version-1 preflight cannot authorize this profile, even with refreshed hashes.
+Unknown fields/profiles fail closed, and maintainer evidence never satisfies Qodo-named checks.
+All attestations still need separate live approval and observed evidence.
+
+Opt-in role attestation additionally requires the migrated `agent_worker.review_requests` table with SELECT, INSERT and UPDATE only.
+DELETE, TRUNCATE, REFERENCES and TRIGGER privileges remain forbidden.
+Migration `004-review-requests.sql` contains no deployment-role grant because the role comes from separately approved configuration.
+Review that migration and the three table privileges before any production application.
+Policy-source, manifest, config and preflight pins must be regenerated and approved after this change; no existing live pin is updated by local tests.
+
 ## Tick lifecycle
 
 1. Validate route, method, documented Neon-edge provenance and native delivery shape.

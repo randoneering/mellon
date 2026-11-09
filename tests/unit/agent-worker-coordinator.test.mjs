@@ -208,6 +208,19 @@ test('coordinator actual current review reader never authorizes readiness on a d
   assert.equal((await tick(h)).status, 'waiting');
 });
 
+test('legacy coordinator never reads maintainer fallback or publishes the command', async () => {
+  const h = await setup();
+  await through(h, 'waiting_review');
+  h.state.reviewResult = syntheticFutureReview(h.state);
+  let maintainerReads = 0;
+  h.adapters.review.readMaintainerReview = async () => { maintainerReads += 1; };
+  const result = await tick(h);
+  assert.equal(result.status, 'ready_for_human');
+  assert.equal(maintainerReads, 0);
+  assert.equal(h.state.calls.some(call => call[0] === 'reserveReviewRequest'), false);
+  assert.equal(h.state.calls.some(call => call[0] === 'attemptReviewRequest'), false);
+});
+
 test('coordinator SYNTHETIC FUTURE Qodo: completed authenticated empty findings and fresh checks finish still draft', async () => {
   const h = await setup(); await through(h, 'waiting_review'); h.state.checkStatus = 'success';
   h.state.reviewResult = syntheticFutureReview(h.state);

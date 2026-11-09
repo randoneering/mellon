@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -137,6 +137,185 @@ test('guided manual entry collects, trains, and evaluates without leaking submis
   assert.equal(JSON.parse(await readFile(files.datasetPath, 'utf8')).records.length, 10);
   assert.ok(JSON.parse(await readFile(files.reportPath, 'utf8')).detectors.baseline);
   assert.doesNotMatch(output.join('\n'), /do-not-leak-token|Title 1|Body 1/);
+});
+
+for (const occupied of ['model', 'report']) {
+  for (const kind of ['file', 'directory', 'dangling symlink']) {
+    test(`guided refuses an existing ${occupied} ${kind} before collection`, async t => {
+      const files = await fixture(t);
+      const originalDataset = '{"version":1,"records":[]}';
+      await writeFile(files.datasetPath, originalDataset);
+      const target = occupied === 'model' ? files.modelPath : files.reportPath;
+      if (kind === 'file') await writeFile(target, 'preserve me');
+      else if (kind === 'directory') await mkdir(target);
+      else await symlink('missing-target.json', target);
+      let fetches = 0;
+      const answers = [files.urlFile, files.datasetPath, files.modelPath, files.reportPath];
+      await assert.rejects(runCli(['guided'], {
+        ...deps([]), prompt: async () => answers.shift(),
+        fetchImpl: async () => { fetches++; throw new Error('unexpected fetch'); },
+      }), /already exists|choose a new/i);
+      assert.equal(fetches, 0);
+      assert.equal(await readFile(files.datasetPath, 'utf8'), originalDataset);
+      if (kind === 'file') assert.equal(await readFile(target, 'utf8'), 'preserve me');
+      else if (kind === 'directory') assert.equal((await lstat(target)).isDirectory(), true);
+      else assert.equal(await readlink(target), 'missing-target.json');
+      if (occupied === 'report') {
+        await assert.rejects(lstat(files.modelPath), error => error.code === 'ENOENT');
+      }
+    });
+  }
+}
+
+for (const destination of ['dataset', 'model', 'report']) {
+  test(`guided confirms a new unignored ${destination} path before collection`, async t => {
+    const files = await fixture(t);
+    const repo = path.join(files.directory, 'repo');
+    await mkdir(repo);
+    execFileSync('git', ['init', '--quiet', repo]);
+    const paths = { dataset: files.datasetPath, model: files.modelPath, report: files.reportPath };
+    paths[destination] = path.join(repo, 'private', `${destination}.json`);
+    const answers = [files.urlFile, paths.dataset, paths.model, paths.report, 'no'];
+    const output = [];
+    const options = deps([], output);
+    delete options.isTracked;
+    let fetches = 0;
+    await assert.rejects(runCli(['guided'], {
+      ...options, prompt: async () => answers.shift(),
+      fetchImpl: async () => { fetches++; throw new Error('unexpected fetch'); },
+    }), /cancel/i);
+    assert.equal(fetches, 0);
+    assert.ok(output.some(line => /not ignored/i.test(line)));
+    for (const target of Object.values(paths)) {
+      await assert.rejects(lstat(target), error => error.code === 'ENOENT');
+    }
+  });
+}
+
+test('guided can explicitly accept new private paths in a Git worktree', async t => {
+  const files = await fixture(t);
+  const repo = path.join(files.directory, 'repo');
+  await mkdir(repo);
+  execFileSync('git', ['init', '--quiet', repo]);
+  const paths = ['dataset', 'model', 'report'].map(name => path.join(repo, 'private', `${name}.json`));
+  const answers = [files.urlFile, ...paths, 'yes', 'yes', 'yes',
+    ...urls.map((_, index) => index % 2 ? 'ai' : 'human')];
+  const output = [];
+  const options = deps([], output);
+  delete options.isTracked;
+  await runCli(['guided'], { ...options, prompt: async () => answers.shift(),
+    baselineModelHash: 'a'.repeat(64), baselineScore: async () => 0.2 });
+  assert.equal(answers.length, 0);
+  assert.equal(JSON.parse(await readFile(paths[0], 'utf8')).records.length, 10);
+  assert.equal(output.filter(line => /not ignored/i.test(line)).length, 3);
+  for (const target of paths) assert.equal((await lstat(target)).isFile(), true);
+});
+
+test('guided accepts Git-ignored private paths without the unignored-path confirmation', async t => {
+  const files = await fixture(t);
+  const repo = path.join(files.directory, 'repo');
+  await mkdir(repo);
+  execFileSync('git', ['init', '--quiet', repo]);
+  await writeFile(path.join(repo, '.gitignore'), 'private/\n');
+  const paths = ['dataset', 'model', 'report'].map(name => path.join(repo, 'private', `${name}.json`));
+  const answers = [files.urlFile, ...paths, ...urls.map((_, index) => index % 2 ? 'ai' : 'human')];
+  const output = [];
+  const options = deps([], output);
+  delete options.isTracked;
+  await runCli(['guided'], { ...options, prompt: async () => answers.shift(),
+    baselineModelHash: 'a'.repeat(64), baselineScore: async () => 0.2 });
+  assert.equal(answers.length, 0);
+  assert.equal(output.some(line => /not ignored/i.test(line)), false);
+  assert.equal(JSON.parse(await readFile(paths[0], 'utf8')).records.length, 10);
+});
+
+test('guided checks outer repositories even when an inner repository ignores the private path', async t => {
+  const files = await fixture(t);
+  const outer = path.join(files.directory, 'outer');
+  const inner = path.join(outer, 'inner');
+  await mkdir(inner, { recursive: true });
+  execFileSync('git', ['init', '--quiet', outer]);
+  execFileSync('git', ['init', '--quiet', inner]);
+  // Local excludes do not protect a path when the outer repository checks it.
+  await writeFile(path.join(inner, '.git', 'info', 'exclude'), 'private/\n');
+  const target = path.join(inner, 'private', 'dataset.json');
+  const answers = [files.urlFile, target, files.modelPath, files.reportPath, 'no'];
+  const output = [];
+  const options = deps([], output);
+  delete options.isTracked;
+  await assert.rejects(runCli(['guided'], { ...options, prompt: async () => answers.shift() }), /cancel/i);
+  assert.ok(output.some(line => /not ignored/i.test(line)));
+  await assert.rejects(lstat(target), error => error.code === 'ENOENT');
+});
+
+test('guided recognizes new repository-private paths through symlinked directories', async t => {
+  const files = await fixture(t);
+  const repo = path.join(files.directory, 'repo');
+  await mkdir(repo);
+  execFileSync('git', ['init', '--quiet', repo]);
+  const link = path.join(files.directory, 'linked');
+  await symlink(repo, link, 'dir');
+  const target = path.join(link, 'dataset.json');
+  const answers = [files.urlFile, target, files.modelPath, files.reportPath, 'no'];
+  const output = [];
+  const options = deps([], output);
+  delete options.isTracked;
+  await assert.rejects(runCli(['guided'], { ...options, prompt: async () => answers.shift() }), /cancel/i);
+  assert.ok(output.some(line => /not ignored/i.test(line)));
+  await assert.rejects(lstat(path.join(repo, 'dataset.json')), error => error.code === 'ENOENT');
+});
+
+test('guided escapes terminal controls in new repository-private path warnings', async t => {
+  const files = await fixture(t);
+  const repo = path.join(files.directory, 'repo');
+  await mkdir(repo);
+  execFileSync('git', ['init', '--quiet', repo]);
+  const target = path.join(repo, 'dataset\u001b[31m.json');
+  const answers = [files.urlFile, target, files.modelPath, files.reportPath, 'no'];
+  const output = [];
+  const options = deps([], output);
+  delete options.isTracked;
+  await assert.rejects(runCli(['guided'], { ...options, prompt: async () => answers.shift() }), /cancel/i);
+  const warning = output.find(line => /not ignored/i.test(line));
+  assert.ok(warning);
+  assert.equal(warning.includes('\u001b'), false);
+  assert.ok(warning.includes('\\x1B'));
+});
+
+test('guided stops safely when an artifact destination cannot be inspected', async t => {
+  const files = await fixture(t);
+  const loop = path.join(files.directory, 'do-not-leak-path');
+  await symlink('do-not-leak-path', loop, 'dir');
+  const answers = [files.urlFile, files.datasetPath, path.join(loop, 'model.json'), files.reportPath];
+  let fetches = 0;
+  await assert.rejects(runCli(['guided'], {
+    ...deps([]), prompt: async () => answers.shift(),
+    fetchImpl: async () => { fetches++; throw new Error('unexpected fetch'); },
+  }), error => {
+    assert.match(error.message, /Unable to inspect the model destination/);
+    assert.doesNotMatch(error.message, /do-not-leak-path/);
+    return true;
+  });
+  assert.equal(fetches, 0);
+  await assert.rejects(lstat(files.datasetPath), error => error.code === 'ENOENT');
+});
+
+test('guided keeps exclusive artifact writes after an early path check', async t => {
+  const files = await fixture(t);
+  const answers = [files.urlFile, files.datasetPath, files.modelPath, files.reportPath,
+    ...urls.map((_, index) => index % 2 ? 'ai' : 'human')];
+  const options = deps([]);
+  let fetches = 0;
+  await assert.rejects(runCli(['guided'], {
+    ...options, prompt: async () => answers.shift(), baselineModelHash: 'a'.repeat(64),
+    fetchImpl: async (...args) => {
+      if (fetches++ === 0) await writeFile(files.modelPath, 'concurrent artifact');
+      return options.fetchImpl(...args);
+    },
+  }), /Model already exists/);
+  assert.equal(await readFile(files.modelPath, 'utf8'), 'concurrent artifact');
+  assert.equal(JSON.parse(await readFile(files.datasetPath, 'utf8')).records.length, 10);
+  await assert.rejects(lstat(files.reportPath), error => error.code === 'ENOENT');
 });
 
 test('guided file input refuses a tracked destination without confirmation', async t => {

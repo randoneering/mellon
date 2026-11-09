@@ -51,7 +51,8 @@ export function createWorkerRuntime({ env, report, factories = {} }) {
         databaseRole: config.databaseRole, report,
       });
       await budget.wait(() => database.verifyRole({ signal: budget.signal,
-        deadline: budget.deadline, limits: config.manifest.limits }));
+        deadline: budget.deadline, limits: config.manifest.limits,
+        ...(config.manifest.reviewPolicy ? { reviewRequests: true } : {}) }));
       if (!current()) return false;
       const readToken = await budget.wait(() => broker.getReadToken({
         signal: budget.signal, deadline: budget.deadline,

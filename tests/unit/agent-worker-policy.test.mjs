@@ -142,6 +142,18 @@ test('rejects malformed descriptors, duplicate skills, and oversized or nontext 
   }
 });
 
+test('canonical policy restricts the comment exception to the opted-in deployed worker', async () => {
+  const system = await readFile(resolve(root, 'automation/policy/system.md'), 'utf8');
+  const rules = await readFile(resolve(root, 'AGENTS.md'), 'utf8');
+  for (const text of [system, rules]) {
+    assert.match(text, /Coding assistants never post PR comments/);
+    assert.match(text, /trusted deployed worker/);
+    assert.match(text, /\/agentic_review/);
+    assert.match(text, /worker-command-maintainer-fallback-v1/);
+    assert.match(text, /once per run\/full head/);
+  }
+});
+
 test('checked-in policy bundle matches its manifest hashes', async () => {
   const manifest = JSON.parse(await readFile(resolve(root, 'automation/policy/manifest.json'), 'utf8'));
   for (const source of [manifest.policy, manifest.projectRules, ...manifest.skills.flatMap(skill => [skill, ...(skill.references ?? [])]), manifest.guidance]) {

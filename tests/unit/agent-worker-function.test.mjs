@@ -475,6 +475,21 @@ test('proposal diagnostic reporter failures preserve the public response', async
   await responseBody(await handle.fetch(request()), 200, { status: 'needs_attention' });
 });
 
+test('review request reports preserve only fixed categories sources and confirmed ids', async () => {
+  const { handle, reports } = fixture({ advanceTick: async () => ({ status: 'needs_attention',
+    reviewDiagnostics: { category: 'review_write_uncertain', commentId: 99, source: 'maintainer',
+      body: 'private issue', token: 'synthetic-token' } }) });
+  await responseBody(await handle.fetch(request()), 200, { status: 'needs_attention' });
+  assert.deepEqual(reports, ['[agent_worker] stage=review_request category=review_write_uncertain comment_id=99 source=maintainer']);
+});
+
+test('unrecognized review diagnostics cannot enter reports', async () => {
+  const { handle, reports } = fixture({ advanceTick: async () => ({ status: 'waiting',
+    reviewDiagnostics: { category: 'private token', commentId: 'private id', source: 'spoofed' } }) });
+  await responseBody(await handle.fetch(request()), 200, { status: 'waiting' });
+  assert.deepEqual(reports, []);
+});
+
 test('unrecognized coordinator data never becomes an HTTP response or log', async () => {
   const { handle, reports } = fixture({ advanceTick: async () => ({ status: 'private-issue', token: 'synthetic-token' }) });
   await responseBody(await handle.fetch(request()), 503, { status: 'unavailable' });

@@ -1,11 +1,11 @@
-import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
-import { dirname, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { parseSubmissionUrl, fetchSubmission } from '../src/personalized/github.mjs';
 import { loadDataset, addRecord, saveDataset, validateDataset } from '../src/personalized/dataset.mjs';
 import { splitDataset } from '../src/personalized/split.mjs';
@@ -61,7 +61,15 @@ async function physicalDestination(path) {
   return resolve(await realpath(directory), relative(directory, resolve(path)));
 }
 
-async function trackedDestination(path) {
+async function assertNewArtifact(path, kind) {
+  try { await lstat(path); } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw new Error(`Unable to inspect the ${kind.toLowerCase()} destination; choose a verifiable path.`);
+  }
+  throw new Error(`${kind} already exists. Choose a new ${kind.toLowerCase()} path and retry.`);
+}
+
+async function gitDestination(path) {
   const target = await physicalDestination(path);
   let directory = dirname(target);
   while (true) {
@@ -71,22 +79,35 @@ async function trackedDestination(path) {
     }
   }
   const exec = promisify(execFile);
+  let unignored = false;
   while (true) {
     let root;
     try {
-      root = (await exec('git', ['-C', directory, 'rev-parse', '--show-toplevel'])).stdout.trim();
+      root = (await exec('git', ['-C', directory, 'rev-parse', '--show-toplevel'])).stdout.replace(/\r?\n$/u, '');
     } catch (error) {
-      if (error.code === 128 && /not a git repository/i.test(error.stderr ?? '')) return false;
+      if (error.code === 128 && /not a git repository/i.test(error.stderr ?? '')) {
+        return { tracked: false, unignored };
+      }
       throw new Error('Unable to check whether the destination is Git-tracked.');
     }
+    const relativeTarget = relative(root, target);
+    if (!isAbsolute(root) || relativeTarget === '..' || relativeTarget.startsWith(`..${sep}`)
+      || isAbsolute(relativeTarget)) throw new Error('Unable to verify the destination repository.');
     try {
-      await exec('git', ['-C', root, 'ls-files', '--error-unmatch', '--', target]);
-      return true;
+      await exec('git', ['--literal-pathspecs', '-C', root, 'ls-files', '--error-unmatch', '--', target]);
+      return { tracked: true, unignored: true };
     } catch (error) {
       if (error.code !== 1) throw new Error('Unable to check whether the destination is Git-tracked.');
     }
+    try {
+      await exec('git', ['-C', root, 'check-ignore', '--no-index', '--', target]);
+    } catch (error) {
+      if (error.code !== 1) throw new Error('Unable to check whether the destination is Git-ignored.');
+      unignored = true;
+    }
+    // An inner repository's ignore rules cannot protect private files from its outer repository.
     const parent = dirname(root);
-    if (parent === root) return false;
+    if (parent === root) return { tracked: false, unignored };
     directory = parent;
   }
 }
@@ -120,19 +141,31 @@ async function runGuided(dependencies) {
   const model = await ask('New model path: ');
   const report = await ask('New report path: ');
   if (!dataset || !model || !report) throw new Error('Dataset, model, and report paths are required.');
+  await assertNewArtifact(model, 'Model');
+  await assertNewArtifact(report, 'Report');
   if (new Set(await Promise.all([dataset, model, report].map(physicalDestination))).size !== 3) {
     throw new Error('Dataset, model, and report paths must be distinct.');
   }
-  const checkTracked = dependencies.isTracked ?? trackedDestination;
   const confirm = async path => {
     let tracked;
-    try { tracked = await checkTracked(path); } catch {
+    let unignored;
+    try {
+      const overrideTracked = dependencies.isTracked ? await dependencies.isTracked(path) : false;
+      const inspected = await gitDestination(path);
+      tracked = inspected.tracked || overrideTracked;
+      unignored = inspected.unignored;
+    } catch {
       throw new Error('Unable to check whether the destination is Git-tracked; choose a verifiable path.');
     }
     if (tracked) {
       output(`Warning: destination is Git-tracked: ${displayText(path)}`);
       if (!/^(y|yes)$/i.test(await ask('Write to this tracked path? [y/N]: '))) {
         throw new Error('Guided workflow cancelled before writing a tracked destination.');
+      }
+    } else if (unignored) {
+      output(`Warning: private destination is inside a Git working tree and is not ignored: ${displayText(path)}`);
+      if (!/^(y|yes)$/i.test(await ask('Write private data to this unignored repository path? [y/N]: '))) {
+        throw new Error('Guided workflow cancelled before writing an unignored repository destination.');
       }
     }
   };

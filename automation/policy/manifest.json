@@ -1,11 +1,11 @@
 {
   "policy": {
     "path": "automation/policy/system.md",
-    "sha256": "ab24bdd185bd6eb49a026d9cd3832a8f82c39c2a9de924064c2e13da244e5792"
+    "sha256": "920f13dd9bfac7cf3b83bd97f9c0ec23ce79696d5647294708bddb0b39d7e221"
   },
   "projectRules": {
     "path": "AGENTS.md",
-    "sha256": "d94bc336e25faa4fce8e85e53ab8c3bdd7ebda9948e901b4a97456a1eaf3c5d4"
+    "sha256": "b7a629ed30c059b17526d00c138a574e2cda5532e5ce2c476893209919dd4778"
   },
   "skills": [
     {

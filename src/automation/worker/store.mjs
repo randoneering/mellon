@@ -1,4 +1,5 @@
 import { normalizeModelCallOutcome } from './budgets.mjs';
+import { createReviewRequestMethods } from './review-request-store.mjs';
 import {
   SAFE_ERROR,
   DEFAULT_DATABASE_TIMEOUT_MS,
@@ -1598,7 +1599,13 @@ export function createWorkerStore(pool, { timeoutMs = DEFAULT_DATABASE_TIMEOUT_M
     }
   }
 
+  const reviewRequests = createReviewRequestMethods({
+    transaction: (lease, options, operation) => withTransaction(pool, operation, databaseDeadline(options, lease)),
+    liveSql: `${JOURNAL_LIVE} AND ${JOURNAL_WAIT_OPEN}`,
+  });
+
   return Object.freeze({
+    ...reviewRequests,
     claimTick,
     checkpoint,
     putIntent,

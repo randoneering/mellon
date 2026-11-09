@@ -8,7 +8,7 @@ const RESPONSE_LIMIT = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 5000;
 const FULL_SHA = /^[a-f0-9]{40}$/;
 const REVIEW_STATES = new Set(['COMMENTED', 'APPROVED', 'CHANGES_REQUESTED']);
-const MAINTAINER_REVIEW_STATES = new Set(['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED']);
+const MAINTAINER_REVIEW_STATES = new Set(['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED', 'COMMENTED']);
 const COMMENT_LIMIT = 2000;
 class ReviewDeadline extends Error {}
 
@@ -116,16 +116,18 @@ export function createReviewReader({ token, repositoryId, fetch = globalThis.fet
           || !FULL_SHA.test(run.headSha ?? '') || !Number.isSafeInteger(run.deadline)
           || !Number.isSafeInteger(run.approver?.id) || run.approver.id < 1
           || typeof run.approver.login !== 'string' || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(run.approver.login)
-          || run.approver.id === run.submissionActorId
-          || run.approver.id === run.workerActorId) return attention('invalid_binding');
+          || !Number.isSafeInteger(run.workerActor?.databaseId) || run.workerActor.databaseId < 1
+          || typeof run.workerActor.login !== 'string' || !run.workerActor.login.length
+          || run.approver.id === run.workerActor.databaseId) return attention('invalid_binding');
       const root = `${API_ROOT}/repos/${REPOSITORY}/pulls/${run.pullNumber}`;
       const permissionUrl = `${API_ROOT}/repos/${REPOSITORY}/collaborators/${encodeURIComponent(run.approver.login)}/permission`;
       try {
         const first = await requestJson(fetch, token, root, run.deadline);
         if (first.number !== run.pullNumber || first.base?.repo?.id !== repositoryId
             || first.head?.sha !== run.headSha || first.state !== 'open' || first.draft !== true
-            || first.user?.id === run.submissionActorId || first.user?.id === run.approver.id
-            || first.user?.type !== 'User') return attention('pull_request_binding_mismatch');
+            || first.user?.id !== run.workerActor.databaseId
+            || first.user?.id === run.approver.id || first.user?.type !== 'Bot'
+            || first.user?.login?.toLowerCase() !== run.workerActor.login.toLowerCase()) return attention('pull_request_binding_mismatch');
         const [permission, reviews] = await Promise.all([
           requestJson(fetch, token, permissionUrl, run.deadline),
           requestJson(fetch, token, `${root}/reviews?per_page=100&page=1`, run.deadline),
@@ -141,19 +143,25 @@ export function createReviewReader({ token, repositoryId, fetch = globalThis.fet
             || !Number.isSafeInteger(item.id) || item.id < 1
             || !MAINTAINER_REVIEW_STATES.has(item.state)
             || !FULL_SHA.test(item.commit_id ?? '')
-            || typeof item.submitted_at !== 'string' || !Number.isFinite(Date.parse(item.submitted_at)))) {
+            || item.pull_request_url !== root
+            || typeof item.submitted_at !== 'string' || !Number.isFinite(Date.parse(item.submitted_at))
+            || Date.parse(item.submitted_at) > Date.now() + 60000)
+            || new Set(relevant.map(item => item.id)).size !== relevant.length) {
           return attention('maintainer_review_invalid');
         }
-        const current = relevant.filter(item => item.commit_id === run.headSha)
+        const current = relevant.filter(item => item.commit_id === run.headSha && item.state !== 'COMMENTED')
           .sort((left, right) => Date.parse(left.submitted_at) - Date.parse(right.submitted_at));
         const last = current.at(-1);
+        // Neutral comments do not change a decision; ambiguous concurrent decisions block.
+        const latest = last ? current.filter(item => Date.parse(item.submitted_at) === Date.parse(last.submitted_at)) : [];
         const second = await requestJson(fetch, token, root, run.deadline);
         if (second.number !== run.pullNumber || second.base?.repo?.id !== repositoryId
             || second.head?.sha !== run.headSha || second.state !== 'open' || second.draft !== true
-            || second.user?.id !== first.user.id || second.user?.login !== first.user.login) {
+            || second.user?.id !== first.user.id || second.user?.type !== 'Bot'
+            || second.user?.login?.toLowerCase() !== first.user.login.toLowerCase()) {
           return attention('pull_request_binding_changed');
         }
-        if (!last || last.state !== 'APPROVED') return { status: 'waiting', reason: 'maintainer_review_absent' };
+        if (!last || latest.some(item => item.state !== 'APPROVED')) return { status: 'waiting', reason: 'maintainer_review_absent' };
         return { status: 'approved', reviewId: last.id, headSha: last.commit_id,
           reviewerId: run.approver.id, reviewerLogin: run.approver.login };
       } catch (error) {

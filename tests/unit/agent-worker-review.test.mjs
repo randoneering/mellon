@@ -32,26 +32,50 @@ const review = (overrides = {}) => ({ id: 81,
   user: { id: 151058649, type: 'Bot', login: 'qodo-code-review[bot]' },
   commit_id: HEAD, state: 'COMMENTED', ...overrides });
 
-test('maintainer fallback requires an exact-head native APPROVED review and current permission', async () => {
-  const fixture = makeFetch({ pullRequest: { draft: true }, reviews: [{ id: 91,
-    user: { id: 42, login: 'maintainer', type: 'User' }, commit_id: HEAD,
-    state: 'APPROVED', submitted_at: new Date().toISOString() }] });
-  fixture.fetch = async (url, options) => {
-    const parsed = new URL(String(url));
-    if (parsed.pathname.endsWith('/collaborators/maintainer/permission')) {
-      fixture.calls.push({ url: String(url), options });
-      return Response.json({ permission: 'write', user: { id: 42, login: 'maintainer', type: 'User' } });
-    }
-    return (await makeFetch({ pullRequest: { draft: true }, reviews: [{ id: 91,
-      user: { id: 42, login: 'maintainer', type: 'User' }, commit_id: HEAD,
-      state: 'APPROVED', submitted_at: new Date().toISOString() }] }).fetch(url, options));
-  };
-  const result = await reader(fixture.fetch).readMaintainerReview(run({
-    approver: { id: 42, login: 'maintainer' }, submissionActorId: 6,
-  }));
+const workerActor = { databaseId: 7, login: 'mellon-worker[bot]' };
+const maintainerReview = overrides => ({ id: 91,
+  user: { id: 42, login: 'maintainer', type: 'User' }, commit_id: HEAD,
+  pull_request_url: 'https://api.github.com/repos/randoneering/mellon/pulls/8',
+  state: 'APPROVED', submitted_at: '2025-01-01T00:00:00Z', ...overrides });
+function maintainerFixture(reviews, pullRequest = {}) {
+  const source = makeFetch({ pullRequest: { draft: true,
+    user: { id: workerActor.databaseId, login: workerActor.login, type: 'Bot' }, ...pullRequest }, reviews });
+  const fetch = async (url, options) => new URL(String(url)).pathname.endsWith('/collaborators/maintainer/permission')
+    ? Response.json({ permission: 'write', user: { id: 42, login: 'maintainer', type: 'User' } })
+    : source.fetch(url, options);
+  return reader(fetch).readMaintainerReview(run({ approver: { id: 42, login: 'maintainer' },
+    workerActor, submissionActorId: 42 }));
+}
+
+test('maintainer may approve a worker PR even when they created or labeled the ticket', async () => {
+  const result = await maintainerFixture([maintainerReview()]);
   assert.equal(result.status, 'approved', result.reason);
   assert.equal(result.reviewId, 91);
   assert.equal(result.headSha, HEAD);
+});
+
+test('neutral maintainer comments preserve approval but cannot erase a later blocking review', async t => {
+  const approved = maintainerReview();
+  const comment = maintainerReview({ id: 92, state: 'COMMENTED', submitted_at: '2025-01-03T00:00:00Z' });
+  for (const [name, reviews, expected] of [
+    ['comment after approval', [approved, comment], 'approved'],
+    ['comment before approval', [comment, { ...approved, submitted_at: '2025-01-04T00:00:00Z' }], 'approved'],
+    ['comment after changes requested', [approved, { ...comment, id: 93,
+      state: 'CHANGES_REQUESTED', submitted_at: '2025-01-02T00:00:00Z' }, comment], 'waiting'],
+    ['comment after dismissal', [approved, { ...comment, id: 93,
+      state: 'DISMISSED', submitted_at: '2025-01-02T00:00:00Z' }, comment], 'waiting'],
+    ['same timestamp conflicting decisions', [approved, { ...approved, id: 92, state: 'CHANGES_REQUESTED' }], 'waiting'],
+  ]) await t.test(name, async () => assert.equal((await maintainerFixture(reviews)).status, expected));
+});
+
+test('maintainer fallback rejects a spoofed or human PR author and native wrong PR reviews', async t => {
+  for (const [name, pullRequest, reviews] of [
+    ['wrong bot id', { user: { id: 99, login: workerActor.login, type: 'Bot' } }, [maintainerReview()]],
+    ['wrong bot login', { user: { id: 7, login: 'spoof[bot]', type: 'Bot' } }, [maintainerReview()]],
+    ['human author', { user: { id: 7, login: workerActor.login, type: 'User' } }, [maintainerReview()]],
+    ['reviewer owns PR', { user: { id: 42, login: 'maintainer', type: 'User' } }, [maintainerReview()]],
+    ['wrong native PR', {}, [maintainerReview({ pull_request_url: 'https://api.github.com/repos/randoneering/mellon/pulls/9' })]],
+  ]) await t.test(name, async () => assert.notEqual((await maintainerFixture(reviews, pullRequest)).status, 'approved'));
 });
 
 test('later exact-head changes requested review and stale approval do not authorize fallback', async t => {
@@ -63,13 +87,8 @@ test('later exact-head changes requested review and stale approval do not author
     ['stale approval', [{ ...approved, commit_id: 'b'.repeat(40) }]],
     ['dismissed approval', [{ ...approved, state: 'DISMISSED' }]],
   ]) await t.test(name, async () => {
-    const source = makeFetch({ pullRequest: { draft: true }, reviews });
-    const fetch = async (url, options) => new URL(String(url)).pathname.endsWith('/collaborators/maintainer/permission')
-      ? Response.json({ permission: 'maintain', user: { id: 42, login: 'maintainer', type: 'User' } })
-      : source.fetch(url, options);
-    const result = await reader(fetch).readMaintainerReview(run({
-      approver: { id: 42, login: 'maintainer' }, submissionActorId: 6,
-    }));
+    const result = await maintainerFixture(reviews.map(item => ({ ...item,
+      pull_request_url: 'https://api.github.com/repos/randoneering/mellon/pulls/8' })));
     assert.equal(result.status, 'waiting');
   });
 });

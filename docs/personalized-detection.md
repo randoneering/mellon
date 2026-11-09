@@ -5,7 +5,7 @@ It does not change the GitHub Action, its pinned model, or its fixed 0.80 cutoff
 
 ## Guided workflow
 
-Use Node 24 and set `GH_TOKEN` or `GITHUB_TOKEN` to a read-only GitHub token.
+Use Node 24 and Git, and set `GH_TOKEN` or `GITHUB_TOKEN` to a read-only GitHub token.
 Start the guide from the repository root:
 
 ```sh
@@ -14,9 +14,12 @@ node scripts/personalized-detection.mjs guided
 
 Enter a URL-list file path, or leave it blank to enter GitHub issue and pull request URLs one at a time.
 Choose separate local paths for the dataset, model, and report, preferably in a private directory outside the repository.
-The guide asks for confirmation before writing to a Git-tracked destination.
-It stops if it cannot check tracking status.
-Existing model and report files are never overwritten.
+The guide asks for confirmation before writing to a Git-tracked destination or a new, unignored path inside a Git working tree.
+It checks symlinked directories and enclosing repositories, and stops if it cannot verify Git status.
+Git-ignored paths and paths outside Git working trees need no unignored-path confirmation.
+Choose model and report paths that do not already exist: the guide checks both before collection or training starts.
+Existing files, directories and dangling symlinks at either artifact path stop the guide.
+Final exclusive writes still prevent overwriting an artifact created after those checks.
 
 The guide starts with collection each time and skips previously labeled URLs.
 Each accepted label is saved before the next prompt, so rerun the guide after an interruption to continue.

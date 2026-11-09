@@ -41,12 +41,13 @@ test('a failed or timed-out readiness command does not authorize database setup'
 
 test('database runner registers only explicit worker and runtime integration files', async () => {
   const runner = await readFile(new URL('../test-agent-intake-db.mjs', import.meta.url), 'utf8');
-  assert.match(runner, /\['intake', 'worker', 'journal', 'coordinator', 'runtime'\]\.includes\(process\.argv\[3\]\)/);
+  assert.match(runner, /\['intake', 'worker', 'journal', 'coordinator', 'runtime', 'review-requests'\]\.includes\(process\.argv\[3\]\)/);
   assert.match(runner, /intake: 'tests\/integration\/agent-intake-store\.test\.mjs'/);
   assert.match(runner, /worker: 'tests\/integration\/agent-worker-store\.test\.mjs'/);
   assert.match(runner, /journal: 'tests\/integration\/agent-worker-journal\.test\.mjs'/);
   assert.match(runner, /coordinator: 'tests\/integration\/agent-worker-coordinator\.test\.mjs'/);
   assert.match(runner, /runtime: 'tests\/support\/agent-worker-runtime-postgres\.mjs'/);
+  assert.match(runner, /'review-requests': 'tests\/manual\/agent-worker-review-request-journal\.mjs'/);
   assert.match(runner, /suiteFiles\[suite\]/);
   assert.match(runner, /timeout: 120000/);
   assert.match(runner, /postgres@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac/);
@@ -71,6 +72,8 @@ test('database runner refuses caller paths and arbitrary commands before Docker'
     ['--suite', 'tests/integration/agent-worker-coordinator.test.mjs'],
     ['--suite', 'runtime;echo forbidden'], ['--suite', 'runtime', '--command', 'echo'],
     ['--suite', 'tests/support/agent-worker-runtime-postgres.mjs'],
+    ['--suite', 'review-requests;echo forbidden'], ['--suite', 'review-requests', '--command', 'echo'],
+    ['--suite', 'tests/manual/agent-worker-review-request-journal.mjs'],
   ]) {
     const result = spawnSync(process.execPath, ['scripts/test-agent-intake-db.mjs', ...args], {
       encoding: 'utf8', timeout: 10000,
@@ -79,6 +82,6 @@ test('database runner refuses caller paths and arbitrary commands before Docker'
     });
     assert.equal(result.status, 2);
     assert.equal(result.stdout, '');
-    assert.equal(result.stderr, 'Usage: node scripts/test-agent-intake-db.mjs [--suite intake|worker|journal|coordinator|runtime]\n');
+    assert.equal(result.stderr, 'Usage: node scripts/test-agent-intake-db.mjs [--suite intake|worker|journal|coordinator|runtime|review-requests]\n');
   }
 });
