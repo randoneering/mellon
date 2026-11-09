@@ -75,6 +75,10 @@ const MAX_ANNOTATION_PAGES = 3;
 const PAGE_SIZE = 100;
 const MAX_ANNOTATIONS = MAX_ANNOTATION_PAGES * PAGE_SIZE;
 const MAX_ANNOTATION_MESSAGE_BYTES = 32 * 1024;
+const REPORT_PREFIX = 'MELLON_CI_REPORT_V2:';
+const CHUNK_PREFIX = 'MELLON_CI_REPORT_V2_CHUNK:';
+const CHUNK_DATA_LENGTH = 3500;
+const MAX_REPORT_CHUNKS = 10;
 const MAX_REPORT_BYTES = 24 * 1024;
 const MAX_FAILURES = 64;
 const MAX_TEST_EVENTS = 20000;
@@ -563,22 +567,52 @@ function validateDiagnosticReport(report, { repository, run, producerSha256, exp
 }
 
 function annotationReport(annotations) {
-  let found;
+  let legacy;
+  let bundle;
+  const parts = new Map();
   for (const item of annotations) {
-    if (!isRecord(item)) throw new Error('read_failed');
+    if (!isRecord(item) || typeof item.message !== 'string') throw new Error('read_failed');
     const message = item.message;
-    if (typeof message !== 'string') throw new Error('read_failed');
-    if (message.includes('MELLON_CI_REPORT_V2:') && !message.startsWith('MELLON_CI_REPORT_V2:')) {
-      throw new Error('read_failed');
+    const single = message.startsWith(REPORT_PREFIX);
+    const chunked = message.startsWith(CHUNK_PREFIX);
+    if (!single && !chunked) {
+      if (message.includes('MELLON_CI_REPORT_V2')) throw new Error('read_failed');
+      continue;
     }
-    if (!message.startsWith('MELLON_CI_REPORT_V2:')) continue;
     if (item.annotation_level !== 'notice'
-        || item.title !== undefined && item.title !== null && item.title !== '' && item.title !== 'Mellon CI evidence'
-        || found) throw new Error('ambiguous_report');
-    found = decodeReportMessage(message);
-    if (!found) throw new Error('read_failed');
+      || (item.title !== undefined && item.title !== null && item.title !== ''
+        && item.title !== 'Mellon CI evidence')) throw new Error('ambiguous_report');
+    if (single) {
+      if (legacy || parts.size) throw new Error('ambiguous_report');
+      legacy = decodeReportMessage(message);
+      if (!legacy) throw new Error('read_failed');
+      continue;
+    }
+    if (legacy) throw new Error('ambiguous_report');
+    if (Buffer.byteLength(message) >= 4096) throw new Error('read_failed');
+    const match = message.slice(CHUNK_PREFIX.length)
+      .match(/^([a-f0-9]{64}):([1-9]|10):([1-9]|10):([A-Za-z0-9_-]{1,3500})$/);
+    if (!match) throw new Error('read_failed');
+    const [, digest, indexText, countText, data] = match;
+    const index = Number(indexText);
+    const count = Number(countText);
+    if (count < 2 || count > MAX_REPORT_CHUNKS || index > count
+      || (index < count && data.length !== CHUNK_DATA_LENGTH)) throw new Error('read_failed');
+    if (parts.has(index) || (bundle && (bundle.digest !== digest || bundle.count !== count))) {
+      throw new Error('ambiguous_report');
+    }
+    bundle ??= { digest, count };
+    parts.set(index, data);
   }
-  return found;
+  if (legacy) return legacy;
+  if (!bundle) return undefined;
+  if (parts.size !== bundle.count) throw new Error('read_failed');
+  const encoded = Array.from({ length: bundle.count }, (_, index) => parts.get(index + 1)).join('');
+  if (Buffer.byteLength(REPORT_PREFIX + encoded) > MAX_ANNOTATION_MESSAGE_BYTES
+    || !equalHash(sha256(Buffer.from(encoded, 'utf8')), bundle.digest)) throw new Error('read_failed');
+  const report = decodeReportMessage(REPORT_PREFIX + encoded);
+  if (!report) throw new Error('read_failed');
+  return report;
 }
 
 async function readDiagnosticSources({ fetch, token, repository, run, identity, budget, config }) {

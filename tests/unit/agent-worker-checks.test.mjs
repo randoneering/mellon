@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createCheckReader } from '../../src/automation/worker/checks.mjs';
 import { createHash } from 'node:crypto';
-import { DATABASE_SKIP_IDENTITIES, DATABASE_SKIP_POLICY_SHA256 } from '../../automation/ci/report-annotations.mjs';
+import { DATABASE_SKIP_IDENTITIES, DATABASE_SKIP_POLICY_SHA256, buildTrustedAnnotation } from '../../automation/ci/report-annotations.mjs';
 
 const HEAD = 'a'.repeat(40);
 const WORKFLOW_BYTES = Buffer.from('name: trusted\non: push\n');
@@ -739,6 +739,105 @@ async function readReport(report, red = false, regression = expectedRegression()
     fetch: fixtureFetch(red ? redOverrides(report) : diagnosticOverrides(report)).fetch,
   }).readChecks({ run: run(), manifest: diagnosticManifest(), ...(red ? { expectedRegression: regression } : {}) });
 }
+
+function chunkedAnnotations(report) {
+  const encoded = Buffer.from(JSON.stringify(report)).toString('base64url');
+  const digest = createHash('sha256').update(encoded).digest('hex');
+  const total = Math.ceil(encoded.length / 3500);
+  return Array.from({ length: total }, (_, index) => ({ ...annotation(report),
+    message: `MELLON_CI_REPORT_V2_CHUNK:${digest}:${index + 1}:${total}:${encoded.slice(index * 3500, (index + 1) * 3500)}`,
+  }));
+}
+
+async function readAnnotations(report, annotations, red = false) {
+  const overrides = red ? redOverrides(report) : diagnosticOverrides(report);
+  overrides[`${ROOT}/check-runs/103/annotations?per_page=100&page=1`] = annotations;
+  return createCheckReader({ token: 'synthetic', repository: 'randoneering/mellon',
+    fetch: fixtureFetch(overrides).fetch }).readChecks({ run: run(), manifest: manifest(),
+    ...(red ? { expectedRegression: expectedRegression() } : {}) });
+}
+
+test('reconstructs complete bounded chunks from one verified reporter check in any API order', async () => {
+  const report = withDatabaseSkips(diagnosticReport());
+  const chunks = chunkedAnnotations(report);
+  assert.ok(chunks.length >= 2 && chunks.every(item => Buffer.byteLength(item.message) < 4096));
+  assert.equal((await readAnnotations(report, chunks)).status, 'success');
+  assert.equal((await readAnnotations(report, [...chunks].reverse())).status, 'success');
+});
+
+test('trusted formatter chunk notices preserve green and intended RED through the observed API cap', async () => {
+  for (const red of [false, true]) {
+    const report = withDatabaseSkips(red ? failingRedReport() : diagnosticReport());
+    const { processExitCode, formatterRevision, ...raw } = report;
+    const output = buildTrustedAnnotation({ GITHUB_REPOSITORY: 'randoneering/mellon',
+      GITHUB_SHA: HEAD, GITHUB_RUN_ID: '77', GITHUB_RUN_ATTEMPT: '1',
+      MELLON_CI_REPORTER_REVISION: formatterRevision,
+      MELLON_CI_ENCODED_REPORT: Buffer.from(JSON.stringify(raw)).toString('base64url'),
+      MELLON_CI_TEST_EXIT_CODE: String(processExitCode) });
+    assert.equal(typeof output, 'string');
+    const annotations = output.split('\n').map(command => {
+      assert.ok(command.startsWith('::notice::'));
+      const message = command.slice('::notice::'.length);
+      assert.ok(Buffer.byteLength(message) < 4096);
+      return { ...annotation(report), message: message.slice(0, 4096) };
+    });
+    assert.ok(annotations.length >= 2);
+    const result = await readAnnotations(report, annotations, red);
+    assert.equal(result.status, red ? 'intended_red' : 'success');
+  }
+});
+
+test('the observed truncated legacy annotation cannot supply worker evidence', async () => {
+  const report = withDatabaseSkips(diagnosticReport());
+  const original = annotation(report);
+  assert.ok(original.message.length > 4096);
+  const result = await readAnnotations(report, [{ ...original, message: original.message.slice(0, 4096) }]);
+  assert.equal(result.status, 'needs_attention');
+  assert.equal(result.reason, 'diagnostic_unverified');
+});
+
+for (const [name, mutate] of [
+  ['missing chunk', values => values.pop()],
+  ['duplicate chunk', values => values.push({ ...values[0] })],
+  ['mixed legacy and chunks', (values, report) => values.push(annotation(report))],
+  ['different bundles', values => { values[1].message = values[1].message.replace(/CHUNK:[a-f0-9]{64}:/, 'CHUNK:' + '0'.repeat(64) + ':'); }],
+  ['bad digest', values => { for (const item of values) item.message = item.message.replace(/CHUNK:[a-f0-9]{64}:/, 'CHUNK:' + '0'.repeat(64) + ':'); }],
+  ['zero index', values => { values[0].message = values[0].message.replace(':1:', ':0:'); }],
+  ['leading-zero index', values => { values[0].message = values[0].message.replace(':1:', ':01:'); }],
+  ['one-part bundle', values => { values[0].message = values[0].message.replace(':1:2:', ':1:1:'); }],
+  ['excessive count', values => { for (const item of values) item.message = item.message.replace(':2:', ':11:'); }],
+  ['index beyond count', values => { values[0].message = values[0].message.replace(':1:2:', ':3:2:'); }],
+  ['empty payload', values => { values[0].message = values[0].message.replace(/:[A-Za-z0-9_-]+$/, ':'); }],
+  ['truncated chunk', values => { values[0].message = values[0].message.slice(0, -1); }],
+  ['changed payload', values => { const item = values.at(-1); item.message = item.message.slice(0, -1) + (item.message.endsWith('A') ? 'B' : 'A'); }],
+  ['oversized chunk', values => { values[0].message += 'A'.repeat(4096); }],
+  ['embedded marker', values => { values[0].message = 'untrusted ' + values[0].message; }],
+  ['wrong annotation level', values => { values[0].annotation_level = 'warning'; }],
+  ['wrong annotation title', values => { values[0].title = 'unreviewed'; }],
+]) test(`chunked evidence fails closed for ${name}`, async () => {
+  const report = withDatabaseSkips(diagnosticReport());
+  const values = chunkedAnnotations(report); mutate(values, report);
+  assert.equal((await readAnnotations(report, values)).status, 'needs_attention');
+});
+
+test('chunk reconstruction retains exact workflow head and attempt binding', async () => {
+  for (const change of [{ headSha: 'f'.repeat(40) }, { runAttempt: 2 }, { runId: '78' }]) {
+    const report = withDatabaseSkips(diagnosticReport());
+    const other = { ...report, context: { ...report.context, ...change } };
+    assert.equal((await readAnnotations(report, chunkedAnnotations(other))).status, 'needs_attention');
+  }
+});
+
+test('chunked transport cannot bypass policy, counts, producer or formatter verification', async () => {
+  const base = withDatabaseSkips(diagnosticReport());
+  for (const report of [
+    { ...base, skipPolicySha256: '0'.repeat(64) },
+    { ...base, skippedTestIdentitySha256s: ['0'.repeat(64), ...base.skippedTestIdentitySha256s.slice(1)] },
+    { ...base, counts: { ...base.counts, skippedTestCount: 61 } },
+    { ...base, producerSha256: '0'.repeat(64) },
+    { ...base, formatterRevision: 'c'.repeat(40) },
+  ]) assert.equal((await readAnnotations(base, chunkedAnnotations(report))).status, 'needs_attention');
+});
 
 test('allows only reviewed DB identities in green and intended RED with full counts', async () => {
   const green = await readReport(withDatabaseSkips(diagnosticReport()));

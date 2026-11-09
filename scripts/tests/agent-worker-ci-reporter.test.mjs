@@ -149,9 +149,21 @@ function runRunnerProbe(mode, overrides = {}) {
 function parseWorkflowReport(output) {
   const prefix = '::notice::MELLON_CI_REPORT_V2:';
   const lines = output.trimEnd().split(/\r?\n/);
-  assert.equal(lines.length, 1);
-  assert.ok(lines[0].startsWith(prefix));
-  const encoded = lines[0].slice(prefix.length);
+  let encoded;
+  if (lines.length === 1 && lines[0].startsWith(prefix)) encoded = lines[0].slice(prefix.length);
+  else {
+    assert.ok(lines.length >= 2 && lines.length <= 10);
+    const parts = lines.map(line => {
+      const match = line.match(/^::notice::MELLON_CI_REPORT_V2_CHUNK:([a-f0-9]{64}):([1-9]|10):([1-9]|10):([A-Za-z0-9_-]+)$/);
+      assert.ok(match, 'trusted formatter emits only bounded chunk notices');
+      assert.ok(Buffer.byteLength(line.slice('::notice::'.length)) < 4096);
+      return { digest: match[1], index: Number(match[2]), count: Number(match[3]), data: match[4] };
+    });
+    assert.equal(new Set(parts.map(part => part.index)).size, parts.length);
+    assert.ok(parts.every(part => part.count === parts.length && part.digest === parts[0].digest));
+    encoded = parts.sort((a, b) => a.index - b.index).map(part => part.data).join('');
+    assert.equal(createHash('sha256').update(encoded).digest('hex'), parts[0].digest);
+  }
   assert.match(encoded, /^[A-Za-z0-9_-]+$/);
   const bytes = Buffer.from(encoded, 'base64url');
   assert.equal(bytes.toString('base64url'), encoded);
@@ -180,12 +192,13 @@ test('protected runner reports the real database guard skip shape without a data
   assert.equal(report.counts.skippedTestCount, 62);
   assert.equal(report.skippedTestIdentitySha256s.length, 62);
   assert.equal(new Set(report.skippedTestIdentitySha256s).size, 62);
-  assert.match(buildTrustedAnnotation({
+  const trusted = parseWorkflowReport(buildTrustedAnnotation({
     ...CONTEXT,
     MELLON_CI_ENCODED_REPORT: result.fields.encoded_report,
     MELLON_CI_TEST_EXIT_CODE: result.fields.test_exit_code,
     MELLON_CI_REPORTER_REVISION: 'b'.repeat(40),
-  }), /^::notice::MELLON_CI_REPORT_V2:/);
+  }));
+  assert.deepEqual(trusted.skippedTestIdentitySha256s, report.skippedTestIdentitySha256s);
 });
 
 test('trusted formatter accepts the eight explicitly reviewed frozen journal DB identities', () => {
@@ -516,6 +529,26 @@ test('malformed or wrong-context diagnostic channels cannot alter machine eviden
   assert.equal(JSON.stringify(report), before);
 });
 
+test('large reviewed reports survive GitHub four-KiB annotation readback without dropping skip identities', () => {
+  const native = runRunnerProbe('ci-database-skips', CONTEXT);
+  const report = JSON.parse(Buffer.from(native.fields.encoded_report, 'base64url').toString('utf8'));
+  const output = buildTrustedAnnotation({ ...CONTEXT,
+    MELLON_CI_REPORTER_REVISION: 'b'.repeat(40),
+    MELLON_CI_ENCODED_REPORT: native.fields.encoded_report, MELLON_CI_TEST_EXIT_CODE: '0' });
+  assert.equal(typeof output, 'string');
+  const commands = output.split('\n');
+  assert.ok(commands.length >= 2 && commands.length <= 10);
+  for (const command of commands) {
+    assert.ok(command.startsWith('::notice::MELLON_CI_REPORT_V2_CHUNK:'));
+    assert.ok(Buffer.byteLength(command.slice('::notice::'.length)) < 4096);
+    assert.equal(command.slice('::notice::'.length).slice(0, 4096), command.slice('::notice::'.length));
+  }
+  const parsed = parseWorkflowReport(output);
+  assert.deepEqual(parsed.skippedTestIdentitySha256s, report.skippedTestIdentitySha256s);
+  assert.deepEqual(parsed.counts, report.counts);
+  assert.equal(parsed.schemaVersion, 2);
+});
+
 test('pins the reviewed DB policy independently of the current skipped set', async () => {
   const { DATABASE_SKIP_IDENTITIES, DATABASE_SKIP_POLICY_SHA256 } = await import('../../automation/ci/report-annotations.mjs');
   assert.equal(createHash('sha256').update(readFileSync(path.join(ROOT, 'tests/integration/agent-worker-store.test.mjs'))).digest('hex'),
@@ -538,12 +571,14 @@ test('trusted formatter accepts actual native intended RED alongside reviewed da
   assert.equal(report.counts.skippedTestCount, 62);
   assert.equal(report.counts.assertionFailureCount, 1);
   assert.equal(report.failures.length, 1);
-  assert.match(buildTrustedAnnotation({
+  const trusted = parseWorkflowReport(buildTrustedAnnotation({
     ...CONTEXT,
     MELLON_CI_ENCODED_REPORT: result.fields.encoded_report,
     MELLON_CI_TEST_EXIT_CODE: '1',
     MELLON_CI_REPORTER_REVISION: 'b'.repeat(40),
-  }), /^::notice::MELLON_CI_REPORT_V2:/);
+  }));
+  assert.deepEqual(trusted.failures, report.failures);
+  assert.deepEqual(trusted.skippedTestIdentitySha256s, report.skippedTestIdentitySha256s);
 });
 
 test('formatter independently rejects unreviewed native skips and native todo tests', () => {

@@ -74,6 +74,9 @@ export const DATABASE_SKIP_POLICY_SHA256 = 'bc69e450cbe6f7bb10dfeeaf4ba71d3393cd
 const MAX_REPORT_BYTES = 24 * 1024;
 const MAX_ENCODED_REPORT_BYTES = 32 * 1024;
 const MAX_ANNOTATION_BYTES = 32 * 1024;
+const CHUNK_DATA_LENGTH = 3500;
+const MAX_CHUNKS = 10;
+const CHUNK_PREFIX = 'MELLON_CI_REPORT_V2_CHUNK:';
 const SHA = /^[a-f0-9]{40}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const REPOSITORY = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
@@ -172,12 +175,21 @@ export function buildTrustedAnnotation(environment) {
       || report.counts.otherFailureCount > 0);
   if (exitCode > 255 || !validReport(report, environment)
       || !report.complete && exitCode === 0 || report.complete && exitCode === 0 && hasFailures) return null;
-  const output = `::notice::MELLON_CI_REPORT_V2:${Buffer.from(JSON.stringify({
+  const payload = Buffer.from(JSON.stringify({
     ...report,
     processExitCode: exitCode,
     formatterRevision: environment.MELLON_CI_REPORTER_REVISION,
-  }), 'utf8').toString('base64url')}`;
-  return Buffer.byteLength(output, 'utf8') <= MAX_ANNOTATION_BYTES ? output : null;
+  }), 'utf8').toString('base64url');
+  const legacy = `::notice::MELLON_CI_REPORT_V2:${payload}`;
+  if (Buffer.byteLength(legacy, 'utf8') > MAX_ANNOTATION_BYTES) return null;
+  if (payload.length <= CHUNK_DATA_LENGTH) return legacy;
+  const count = Math.ceil(payload.length / CHUNK_DATA_LENGTH);
+  if (count > MAX_CHUNKS) return null;
+  const digest = createHash('sha256').update(payload, 'utf8').digest('hex');
+  // GitHub's annotation API clips long messages; each transport part stays below 4 KiB.
+  return Array.from({ length: count }, (_, index) =>
+    `::notice::${CHUNK_PREFIX}${digest}:${index + 1}:${count}:${payload.slice(index * CHUNK_DATA_LENGTH, (index + 1) * CHUNK_DATA_LENGTH)}`
+  ).join('\n');
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {

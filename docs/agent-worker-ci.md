@@ -50,11 +50,18 @@ There is no candidate or default-ref fallback.
 The job checks out the reporter at that revision and runs only its builtin-only formatter.
 Missing or malformed configuration fails closed.
 
-The formatter accepts bounded encoded data, checks the closed version 2 schema, reviewed skip policy, complete counts, and exact repository/head/run/attempt context, and emits one base64url-encoded `MELLON_CI_REPORT_V2` notice.
+The formatter accepts bounded encoded data and checks the closed version 2 schema, reviewed skip policy, complete counts and exact repository/head/run/attempt context.
+Small payloads keep one `MELLON_CI_REPORT_V2` notice.
+Larger payloads use two to ten `MELLON_CI_REPORT_V2_CHUNK` notices so GitHub's annotation API cannot clip a long report at 4,096 bytes.
+Each chunk carries a whole-payload SHA-256, one-based index, total count and at most 3,500 base64url characters.
+The decoded V2 JSON and its original logical size limit remain unchanged.
 The report carries the formatter revision.
 The maintainer approves formatter revision `cc44c0fd57fa6dc26f1431e9a7436ac45e097cb1` for the foundation PR.
 Both full GitHub workflow reruns pass with that pin.
-The new source-location channel is separately covered by controlled privacy and tampering tests; its next published run still needs observation.
+The source-location fix is published at `f8ec7ee8df117c428bafc4d645c9d36d04b963e8`, with both test/report workflows green.
+Actual annotation readback exposes the 4,096-byte truncation that this chunked transport addresses.
+Publishing the formatter change requires a reviewed signed revision and separate approval to advance the trusted pin, followed by full workflow reruns and complete API readback.
+Do not substitute the PR head automatically.
 
 ## Worker evidence boundary
 

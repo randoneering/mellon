@@ -64,7 +64,11 @@ Approval and the check reader independently reject missing, unknown, or changed 
 ## Reporter schema
 
 The protected Node 24 reporter consumes native `node:test` events and returns one `MELLON_CI_RAW_V2:<base64url JSON>` record to the runner.
-The runner's job outputs remain only the encoded report and exit code; the separate reviewed formatter emits the `MELLON_CI_REPORT_V2:<base64url JSON>` notice.
+The runner's job outputs remain only the encoded report and exit code.
+The separate reviewed formatter emits either one legacy `MELLON_CI_REPORT_V2:<base64url JSON>` notice or bounded chunk notices for larger payloads.
+Chunk messages use `MELLON_CI_REPORT_V2_CHUNK:<sha256>:<index>:<count>:<part>`, with 2..10 parts and at most 3,500 base64url characters per part.
+The reader accepts API order differences but requires every unique index from the same check's annotation set, consistent count/digest, the full-payload hash and all original V2 validation.
+Missing, duplicated, mixed legacy/chunk, malformed or truncated evidence cannot advance work.
 Human-readable failure locations travel through a separately validated local pipe and are not part of this machine schema or accepted readiness evidence.
 The closed version 2 annotation has exactly these fields: `schemaVersion`, `complete`, `truncated`, `reason`, `context`, `producerSha256`, `counts`, `failures`, `rootFailures`, `skipPolicySha256`, `skippedTestIdentitySha256s`, `processExitCode`, and `formatterRevision`.
 The raw report omits the last two fields.
@@ -82,7 +86,10 @@ Test identities hash canonical JSON fields for repository-relative entry file, t
 The report never includes names, paths, assertion messages, actual or expected values, stacks, logs, secrets, or API payloads.
 
 The reporter accepts at most 20,000 native events, 4,096 completed tests, 64 direct failures, 64 root failures, a 1,024-character test name, and a 512-character normalized path.
-Its JSON report is at most 24 KiB, runner output is at most 64 KiB, and the final workflow annotation is at most 32 KiB.
+Its JSON report is at most 24 KiB and captured runner output at most 64 KiB.
+The original logical annotation bound remains 32 KiB; chunk headers add only bounded transport overhead.
+Each chunk message stays below GitHub's observed 4 KiB API cap.
+Small legacy notices remain supported, including earlier controlled V2 fixtures.
 The ordinary-command guard captures at most 256 KiB per stdout or stderr stream and applies a 12-minute command deadline.
 Overflow, malformed context, malformed events, ambiguous identities, incomplete event streams, and reporter failures cannot produce complete evidence.
 The runner passes the native test child process exit code as a bounded output and preserves a nonzero status.
