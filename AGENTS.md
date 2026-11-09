@@ -50,7 +50,8 @@ Mark behavior that was not exercised as unverified.
    Test mixed-case outcomes for issues and pull requests, including reruns with automatic labeling disabled.
    Update boundary tests when behavior changes.
    Network failures can leave GitHub writes uncertain, and retries must not create duplicate comments or unintended closures.
-5. **Keep secrets and private text out of shared output.** In Action outputs, errors, logs, and CLI status messages, never expose tokens, API response details, scorer exception messages, or submission text.
+5. **Keep secrets and private text out of shared output.** In Action outputs, errors, logs, and CLI status messages, never expose tokens, raw API responses or response bodies, scorer exception messages, or submission text.
+   Non-secret resource identifiers, such as a confirmed posted comment ID, may appear in the diagnostic destinations named in rule 9.
    The local `collect` labeling prompt may show escaped titles and descriptions, since the person labeling needs to read them.
    Keep personalized datasets, models, and reports local, and never commit them.
    These may include credentials or private submission text.
@@ -64,9 +65,17 @@ Mark behavior that was not exercised as unverified.
 8. **Make optional setup failures visible.** Best-effort setup must not block moderation when policy declares it optional.
    Keep the moderation outcome and published Action outputs unchanged when only optional setup fails.
    For outcome-label provisioning, set `outcome_labels_incomplete: true` in the moderation result when setup cannot be confirmed.
-   Surface an actionable job-summary notice; for missing outcome labels, ask maintainers to create them manually.
+   Surface an actionable notice in the GitHub Actions job summary, the Action diagnostic destination in rule 9; for missing outcome labels, ask maintainers to create them manually.
    Never include raw API errors, response bodies, credentials, or submission text.
    Test that optional setup failure preserves intended moderation behavior and produces the notice.
+9. **Keep operational failures diagnosable.** When catching or normalizing failures in moderation, intake, or CI reporting, preserve a sanitized stage, a fixed failure category, and any confirmed partial work.
+   Use the GitHub Actions job summary for Action and CI diagnostics, including the optional-setup notices in rule 8.
+   Use the intake's `report` callback, which writes to stderr by default, for intake diagnostics.
+   These destinations may include non-secret resource identifiers, such as a confirmed posted comment ID; rule 5 still prohibits raw API responses, response bodies, tokens, scorer exception messages, and submission text.
+   Generic public error responses are allowed, but must not be the only diagnostic; do not report a failed operation with confirmed partial work as a plain skip.
+   Follow the stage and category pattern in `src/automation/intake.mjs` without changing published Action outputs just to add detail.
+   Test that new failure-handling paths preserve the sanitized diagnostics and any confirmed partial work.
+   Maintainers need to know which step failed and what was already written to reconcile and retry safely.
 
 ## Specifications
 
