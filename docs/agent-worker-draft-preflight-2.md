@@ -1,4 +1,6 @@
-# Agent worker draft preflight
+# Agent worker preflight
 
-This draft checks whether Qodo reviews a newly opened draft PR.
+This draft checks App commit signing and Qodo review.
 Do not merge.
+
+Update: updated-head.
