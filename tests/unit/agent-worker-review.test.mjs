@@ -15,7 +15,7 @@ function makeFetch({ pullRequest = {}, reviews = [], comments = [] } = {}) {
     const parsed = new URL(String(url));
     if (/\/pulls\/\d+$/.test(parsed.pathname)) {
       return Response.json({ number: 8, draft: false, state: 'open', head: { sha: HEAD },
-        base: { repo: { id: 1234 } }, ...pullRequest });
+        base: { repo: { id: 1234 } }, user: { id: 7, login: 'contributor', type: 'User' }, ...pullRequest });
     }
     if (parsed.pathname.endsWith('/pulls/8/reviews')) return Response.json(reviews);
     if (parsed.pathname.endsWith('/pulls/8/comments')) return Response.json(comments);
@@ -31,6 +31,48 @@ const run = (overrides = {}) => ({ repository: 'randoneering/mellon', repository
 const review = (overrides = {}) => ({ id: 81,
   user: { id: 151058649, type: 'Bot', login: 'qodo-code-review[bot]' },
   commit_id: HEAD, state: 'COMMENTED', ...overrides });
+
+test('maintainer fallback requires an exact-head native APPROVED review and current permission', async () => {
+  const fixture = makeFetch({ pullRequest: { draft: true }, reviews: [{ id: 91,
+    user: { id: 42, login: 'maintainer', type: 'User' }, commit_id: HEAD,
+    state: 'APPROVED', submitted_at: new Date().toISOString() }] });
+  fixture.fetch = async (url, options) => {
+    const parsed = new URL(String(url));
+    if (parsed.pathname.endsWith('/collaborators/maintainer/permission')) {
+      fixture.calls.push({ url: String(url), options });
+      return Response.json({ permission: 'write', user: { id: 42, login: 'maintainer', type: 'User' } });
+    }
+    return (await makeFetch({ pullRequest: { draft: true }, reviews: [{ id: 91,
+      user: { id: 42, login: 'maintainer', type: 'User' }, commit_id: HEAD,
+      state: 'APPROVED', submitted_at: new Date().toISOString() }] }).fetch(url, options));
+  };
+  const result = await reader(fixture.fetch).readMaintainerReview(run({
+    approver: { id: 42, login: 'maintainer' }, submissionActorId: 6,
+  }));
+  assert.equal(result.status, 'approved', result.reason);
+  assert.equal(result.reviewId, 91);
+  assert.equal(result.headSha, HEAD);
+});
+
+test('later exact-head changes requested review and stale approval do not authorize fallback', async t => {
+  const approved = { id: 90, user: { id: 42, login: 'maintainer', type: 'User' },
+    commit_id: HEAD, state: 'APPROVED', submitted_at: '2025-01-01T00:00:00Z' };
+  const changed = { ...approved, id: 91, state: 'CHANGES_REQUESTED', submitted_at: '2025-01-02T00:00:00Z' };
+  for (const [name, reviews] of [
+    ['later changes requested', [approved, changed]],
+    ['stale approval', [{ ...approved, commit_id: 'b'.repeat(40) }]],
+    ['dismissed approval', [{ ...approved, state: 'DISMISSED' }]],
+  ]) await t.test(name, async () => {
+    const source = makeFetch({ pullRequest: { draft: true }, reviews });
+    const fetch = async (url, options) => new URL(String(url)).pathname.endsWith('/collaborators/maintainer/permission')
+      ? Response.json({ permission: 'maintain', user: { id: 42, login: 'maintainer', type: 'User' } })
+      : source.fetch(url, options);
+    const result = await reader(fetch).readMaintainerReview(run({
+      approver: { id: 42, login: 'maintainer' }, submissionActorId: 6,
+    }));
+    assert.equal(result.status, 'waiting');
+  });
+});
 
 test('current Qodo-looking review without an observed completion contract never succeeds', async () => {
   const fixture = makeFetch({ reviews: [review({ body: 'synthetic completion: true' })] });
@@ -148,6 +190,18 @@ test('a GitHub fetch ignoring abort still ends at the review deadline', async ()
     assert.equal(result.status, 'needs_attention');
     assert.equal(result.reason, 'review_deadline');
   } finally { clearTimeout(timer); }
+});
+
+test('an aborted absolute review timer stays a deadline even before the wall clock advances', async t => {
+  const now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  let signal;
+  const result = await reader(async (_url, options) => {
+    signal = options.signal;
+    return new Promise(() => {});
+  }).readReview(run({ deadline: now + 10 }));
+  assert.equal(signal.aborted, true);
+  assert.deepEqual(result, { status: 'needs_attention', reason: 'review_deadline' });
 });
 
 test('does not use an original line when GitHub marks the current comment position unavailable', async () => {

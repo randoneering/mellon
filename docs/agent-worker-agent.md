@@ -15,12 +15,17 @@ Only lease-bound durable authorization can prevent reissue across adapter instan
   The loader must check source approval and revision provenance before returning them.
 - The manifest supplies `repository`, `baseSha`, `hash`, bounded `files` paths, and the patch validator's `patchManifest`.
   `patchManifest.allowedPaths` must match those paths exactly.
+  The manifest hash appears in trusted guidance and every proposal is checked against the bound hash.
 - Existing text-file entries supply `path`, regular-file `mode`, Git `blobSha`, SHA-256 `sha256`, and `text`.
   Both hashes must match the supplied content.
   Include explicit ancestor metadata and absent targets required by `validateChanges`; directory or absent entries have `blobSha: null` and no `text`.
 - The adapter clones and freezes context, reservation, tool arguments, and returned patches.
   Its `inputHash` binds the model ID, renderer, complete context, rendered guidance/data, and tool declarations.
   Returned guidance hashes identify the exact reviewed system guidance and selected skills.
+- Coordinator contexts may include a closed `phaseInstructions` object for the phase purpose, repair cycle, approved regression path and literal test name.
+  Initial phases also bind the selected criterion index and exact criterion text.
+  The adapter checks these values against the approved manifest before rendering them as trusted guidance.
+  Contexts without phase instructions remain valid for non-coordinator use, preserving the foundation adapter contract.
 
 Reviewed policy, project rules, and selected skills enter the system message.
 Issue text, repository metadata, and file contents enter delimiter-escaped JSON data blocks in the user message.
@@ -176,7 +181,15 @@ It requests SDK response-body retention for this check but never returns or logs
 Absent, partial, or null raw counts remain unreported even if the SDK normalizes them to zero.
 Explicitly reported zero counts remain valid; the adapter never invents counts or costs.
 Raw model transcripts, provider errors, response bodies, and credentials are not returned or logged.
-A successful result contains only validated structured changes, base/manifest bindings, and hashes for the coordinator.
+Results include bounded diagnostic metadata with a fixed proposal category and counts for the three known tools.
+Categories distinguish model failure, prose-only output, read/list-only activity, rejected proposals, validated proposals, and assessments.
+The coordinator reports a validated proposal that fails candidate staging as `lost_valid_proposal`.
+Rejected proposals add a fixed reason such as `schema`, `binding`, `scope`, or `validation`.
+The worker function sends only these closed categories and tool counts to its operator `report` callback, which defaults to stderr.
+The HTTP response and durable journal schema stay unchanged; detailed diagnostics are not stored in Postgres.
+Diagnostics contain no prompts, transcripts, findings, patches, submitted text, exception messages, or API bodies.
+Successful results otherwise retain validated structured changes, base/manifest bindings, and hashes for the coordinator.
+The diagnostics field is additive, and existing tool schemas remain unchanged.
 Treat patch content as untrusted data and do not log it.
 
 | Observation | Persisted outcome | Fixed blocker |

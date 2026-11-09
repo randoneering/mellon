@@ -94,6 +94,7 @@ const invalidSources = {
   'generated eval registration': SOURCE.replace('assert.equal(1, 2);', "eval(\"test('generated', () => {})\");"),
   'generated require registration': SOURCE.replace('assert.equal(1, 2);', "require('node:test')('generated', () => {});"),
   'marker only identity': "// approved regression location identity: forged\nexport const nothing = 1;",
+  'wrong approved test name': SOURCE.replace('approved regression location', 'unapproved regression name'),
 };
 for (const [name, source] of Object.entries(invalidSources)) test(`candidate rejects ${name}`, () => {
   const input = candidateInput(); input.changes[0].content = source;
@@ -101,6 +102,7 @@ for (const [name, source] of Object.entries(invalidSources)) test(`candidate rej
 });
 for (const [name, mutate] of Object.entries({
   'stale head': input => { input.phase.headSha = 'f'.repeat(40); },
+  'wrong phase purpose': input => { input.phase.purpose = 'initial_implementation'; },
   'wrong approved path': input => { input.changes[0].path = 'src/parser.mjs'; },
   'test phase production edit': input => { input.changes.push({ operation: 'create', path: 'src/parser.mjs', content: 'export const x = 1;' }); },
   'forged model operation': input => { input.modelOperationId = 'model supplied marker'; },

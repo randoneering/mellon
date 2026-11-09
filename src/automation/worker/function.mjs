@@ -24,6 +24,22 @@ function unavailable(report, category) {
   return response('unavailable', 503);
 }
 
+function reportProposalDiagnostics(report, result) {
+  const categories = new Set(['model_failure', 'prose_only', 'read_only', 'rejected_proposal',
+    'valid_proposal', 'lost_valid_proposal', 'assessment_only']);
+  const rejections = new Set(['schema', 'binding', 'scope', 'validation', 'duplicate', 'assessment', 'deadline']);
+  const value = result.diagnostics;
+  if (!categories.has(value?.proposalCategory)) return;
+  const fields = ['[agent_worker] stage=model', `category=${value.proposalCategory}`];
+  if (rejections.has(value.proposalRejection)) fields.push(`rejection=${value.proposalRejection}`);
+  for (const name of ['readFile', 'listFiles', 'proposeChanges']) {
+    const count = value.toolCounts?.[name];
+    if (Number.isSafeInteger(count) && count >= 0 && count <= 16) fields.push(`${name}=${count}`);
+  }
+  // The HTTP response stays fixed; only closed metadata reaches the operator report.
+  try { Promise.resolve(report(fields.join(' '))).catch(() => {}); }
+  catch { /* Reporting cannot change the worker outcome. */ }
+}
 function trustedConfiguration(config) {
   return config && typeof config.productionBranch === 'string' &&
     config.productionBranch.length > 0 && config.productionBranch.length <= 255 &&
@@ -130,6 +146,7 @@ export function createWorkerFunction({
           data: Object.freeze({ scheduledAt: invocation.data.scheduledAt }),
         }));
         if (!COORDINATOR_STATUSES.has(result?.status)) return unavailable(report, 'coordinator_unavailable');
+        reportProposalDiagnostics(report, result);
         return response(result.status, 200);
       } catch {
         return unavailable(report, `${stage}_unavailable`);

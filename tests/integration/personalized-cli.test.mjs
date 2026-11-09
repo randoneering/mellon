@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { runCli } from '../../scripts/personalized-detection.mjs';
@@ -119,6 +120,136 @@ test('rejects invalid arguments before side effects', async t => {
   const files = await fixture(t);
   await assert.rejects(runCli(['train', '--dataset', files.datasetPath], deps([])), /Usage:/);
   await assert.rejects(runCli(['collect', '--urls', files.urlFile, '--dataset', files.datasetPath], { env: {}, output() {} }), /GH_TOKEN/);
+});
+
+test('guided manual entry collects, trains, and evaluates without leaking submissions', async t => {
+  const files = await fixture(t);
+  const output = [];
+  const answers = ['', ...urls, '', files.datasetPath, files.modelPath, files.reportPath,
+    ...urls.map((_, index) => index % 2 ? 'ai' : 'human')];
+  await runCli(['guided'], {
+    ...deps([], output),
+    prompt: async () => answers.shift(),
+    baselineModelHash: 'a'.repeat(64),
+    baselineScore: async () => 0.2,
+  });
+  assert.equal(answers.length, 0);
+  assert.equal(JSON.parse(await readFile(files.datasetPath, 'utf8')).records.length, 10);
+  assert.ok(JSON.parse(await readFile(files.reportPath, 'utf8')).detectors.baseline);
+  assert.doesNotMatch(output.join('\n'), /do-not-leak-token|Title 1|Body 1/);
+});
+
+test('guided file input refuses a tracked destination without confirmation', async t => {
+  const files = await fixture(t);
+  const answers = [files.urlFile, files.datasetPath, files.modelPath, files.reportPath, 'no'];
+  await assert.rejects(runCli(['guided'], {
+    ...deps([]), prompt: async () => answers.shift(), isTracked: async () => true,
+  }), /cancel/i);
+  await assert.rejects(readFile(files.datasetPath), error => error.code === 'ENOENT');
+});
+
+test('guided resumes saved labels and confirms tracked destinations at each stage', async t => {
+  const files = await fixture(t);
+  let first = true;
+  await assert.rejects(runCli(['collect', '--urls', files.urlFile, '--dataset', files.datasetPath], {
+    ...deps([]), prompt: async () => { if (first) { first = false; return 'human'; } throw new Error('interrupted'); },
+  }), /interrupted/);
+  let fetches = 0;
+  const answers = [files.urlFile, files.datasetPath, files.modelPath, files.reportPath, 'yes', 'yes', 'yes',
+    ...urls.slice(1).map((_, index) => index % 2 ? 'human' : 'ai')];
+  const output = [];
+  await runCli(['guided'], {
+    ...deps([], output), isTracked: async () => true,
+    prompt: async () => answers.shift(), baselineModelHash: 'a'.repeat(64),
+    baselineScore: async () => 0.2,
+    fetchImpl: async (...args) => { fetches++; return deps([]).fetchImpl(...args); },
+  });
+  assert.equal(fetches, 9);
+  assert.equal(answers.length, 0);
+  assert.equal(JSON.parse(await readFile(files.datasetPath, 'utf8')).records[0].label, 'human');
+  assert.ok(output.filter(line => line.startsWith('Warning: destination is Git-tracked')).length === 3);
+});
+
+test('guided recognizes a tracked file through a symlinked directory', async t => {
+  const files = await fixture(t);
+  const repo = path.join(files.directory, 'repo');
+  await mkdir(repo);
+  execFileSync('git', ['init', '--quiet', repo]);
+  await writeFile(path.join(repo, 'dataset.json'), 'existing');
+  execFileSync('git', ['-C', repo, 'add', 'dataset.json']);
+  const link = path.join(files.directory, 'linked');
+  await symlink(repo, link, 'dir');
+  const answers = [files.urlFile, path.join(link, 'dataset.json'), files.modelPath, files.reportPath, 'no'];
+  const output = [];
+  const options = deps([], output);
+  delete options.isTracked;
+  await assert.rejects(runCli(['guided'], { ...options, prompt: async () => answers.shift() }), /cancel/i);
+  assert.ok(output.some(line => line.includes('Git-tracked')));
+  assert.equal(await readFile(path.join(repo, 'dataset.json'), 'utf8'), 'existing');
+});
+
+test('guided manual entry can resume after re-entering URLs', async t => {
+  const files = await fixture(t);
+  const setup = ['', ...urls, '', files.datasetPath, files.modelPath, files.reportPath];
+  const first = [...setup, 'human'];
+  await assert.rejects(runCli(['guided'], {
+    ...deps([]), prompt: async () => { if (first.length) return first.shift(); throw new Error('interrupted'); },
+  }), /interrupted/);
+  let fetches = 0;
+  const answers = [...setup, ...urls.slice(1).map((_, index) => index % 2 ? 'human' : 'ai')];
+  await runCli(['guided'], {
+    ...deps([]), prompt: async () => answers.shift(), baselineModelHash: 'a'.repeat(64),
+    baselineScore: async () => 0.2,
+    fetchImpl: async (...args) => { fetches++; return deps([]).fetchImpl(...args); },
+  });
+  assert.equal(fetches, 9);
+  assert.equal(JSON.parse(await readFile(files.datasetPath, 'utf8')).records[0].label, 'human');
+});
+
+test('guided uses GITHUB_TOKEN when GH_TOKEN is empty', async t => {
+  const files = await fixture(t);
+  const answers = [files.urlFile, files.datasetPath, files.modelPath, files.reportPath,
+    ...urls.map((_, index) => index % 2 ? 'ai' : 'human')];
+  await runCli(['guided'], {
+    ...deps([]), env: { GH_TOKEN: '', GITHUB_TOKEN: 'do-not-leak-token' },
+    prompt: async () => answers.shift(), baselineModelHash: 'a'.repeat(64),
+    baselineScore: async () => 0.2,
+  });
+  assert.equal(JSON.parse(await readFile(files.datasetPath, 'utf8')).records.length, 10);
+});
+
+test('guided checks outer repositories for tracked destinations', async t => {
+  const files = await fixture(t);
+  const outer = path.join(files.directory, 'outer');
+  const inner = path.join(outer, 'inner');
+  await mkdir(inner, { recursive: true });
+  execFileSync('git', ['init', '--quiet', outer]);
+  await writeFile(path.join(inner, 'dataset.json'), 'existing');
+  execFileSync('git', ['-C', outer, 'add', 'inner/dataset.json']);
+  execFileSync('git', ['init', '--quiet', inner]);
+  const answers = [files.urlFile, path.join(inner, 'dataset.json'), files.modelPath, files.reportPath, 'no'];
+  const options = deps([]);
+  delete options.isTracked;
+  await assert.rejects(runCli(['guided'], { ...options, prompt: async () => answers.shift() }), /cancel/i);
+  assert.equal(await readFile(path.join(inner, 'dataset.json'), 'utf8'), 'existing');
+});
+
+test('guided rejects artifact paths aliased through a symlink', async t => {
+  const files = await fixture(t);
+  const link = path.join(files.directory, 'linked');
+  await symlink(files.directory, link, 'dir');
+  const answers = [files.urlFile, files.datasetPath, path.join(link, 'dataset.json'), files.reportPath];
+  await assert.rejects(runCli(['guided'], { ...deps([]), prompt: async () => answers.shift() }), /must be distinct/);
+  await assert.rejects(readFile(files.datasetPath), error => error.code === 'ENOENT');
+});
+
+test('guided fails closed when tracked status cannot be checked', async t => {
+  const files = await fixture(t);
+  const answers = [files.urlFile, files.datasetPath, files.modelPath, files.reportPath];
+  await assert.rejects(runCli(['guided'], {
+    ...deps([]), prompt: async () => answers.shift(), isTracked: async () => { throw new Error('sensitive'); },
+  }), /Unable to check whether the destination is Git-tracked/);
+  await assert.rejects(readFile(files.datasetPath), error => error.code === 'ENOENT');
 });
 
 test('warns before writing tracked dataset and never prints credentials', async t => {

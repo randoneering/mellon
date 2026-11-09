@@ -31,7 +31,8 @@ const MODEL_STATES = new Set(['generating_tests', 'implementing', 'repairing']);
 const WAIT_STATES = new Set(['waiting_red_ci', 'waiting_ci', 'waiting_review']);
 const PHASE_FIELDS = ['version', 'purpose', 'key', 'repairCycle', 'headSha', 'findingSha256',
   'expectedRegression', 'criterionSha256', 'findingSource', 'findingHeadSha', 'priorCheckRunId', 'priorReviewId'];
-const result = (status, reason, persisted = false) => Object.freeze({ status, ...(reason ? { reason } : {}), persisted });
+const result = (status, reason, persisted = false, diagnostics) => Object.freeze({ status,
+  ...(reason ? { reason } : {}), persisted, ...(diagnostics ? { diagnostics } : {}) });
 const freeze = value => {
   if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); }
   return value;
@@ -42,6 +43,21 @@ class Stop extends Error {
   }
 }
 function stop(reason, status) { throw new Stop(reason, status); }
+function safeAgentDiagnostics(value) {
+  const categories = new Set(['model_failure', 'prose_only', 'read_only', 'rejected_proposal',
+    'valid_proposal', 'assessment_only']);
+  const names = ['readFile', 'listFiles', 'proposeChanges'];
+  if (!value || typeof value !== 'object' || !categories.has(value.proposalCategory)) return null;
+  const toolCounts = {};
+  for (const name of names) {
+    const count = value.toolCounts?.[name];
+    if (Number.isSafeInteger(count) && count >= 0 && count <= 16) toolCounts[name] = count;
+  }
+  const rejections = new Set(['schema', 'binding', 'scope', 'validation', 'duplicate', 'assessment', 'deadline']);
+  return Object.freeze({ proposalCategory: value.proposalCategory,
+    ...(rejections.has(value.proposalRejection) ? { proposalRejection: value.proposalRejection } : {}),
+    toolCounts: Object.freeze(toolCounts) });
+}
 function phaseInput(phase) {
   return validateCoordinatorPhase(Object.fromEntries(PHASE_FIELDS.filter(key => Object.hasOwn(phase, key)).map(key => [key, phase[key]])));
 }
@@ -187,7 +203,7 @@ export function createCoordinator(dependencies = {}) {
 
   async function advanceTick(delivery) {
     const budget = createWaitDeadline(timeoutMs);
-    let lease, claimedDeadline, snapshot, terminalResult, databaseUncertain = false;
+    let lease, claimedDeadline, snapshot, terminalResult, databaseUncertain = false, agentDiagnostics = null;
     async function database(operation) {
       if (databaseUncertain || terminalResult) stop('recovery_database_uncertain');
       try {
@@ -480,12 +496,23 @@ export function createCoordinator(dependencies = {}) {
       // Initial expected RED follows TDD; unexpected-finding repair also needs debugging guidance.
       const selectedSkills = policy.skills.filter(skill => skill.name !== 'systematic-debugging'
         || snapshot.phase.purpose.startsWith('repair_'));
+      const regression = manifest.coordinator.regression;
+      const criterionIndex = snapshot.phase.purpose.startsWith('initial_')
+        ? regression.initial.criterionIndex : null;
+      const regressionPath = manifest.allowedPaths[regression.testPathIndex];
+      const phaseInstructions = freeze({ purpose: snapshot.phase.purpose,
+        repairCycle: snapshot.phase.repairCycle, regressionPath,
+        testName: snapshot.phase.repairCycle === 0 ? regression.initial.testName
+          : regression.repairTestNames[snapshot.phase.repairCycle - 1],
+        ...(criterionIndex === null ? {} : { criterionIndex, criterion: manifest.acceptanceCriteria[criterionIndex] }) });
       const context = freeze({ policy: { system: policy.systemPolicy, projectRules: `${policy.projectRules}\n\n${policy.documentationGuidance}` },
         skills: selectedSkills.map(skill => [skill.content, ...skill.references.map(reference => reference.content)].join('\n\n')),
         issue, repository: { owner: 'randoneering', name: 'mellon', baseSha: headSha, revision: headSha },
-        manifest: { repository: manifest.repository.name, baseSha: headSha, hash: expectedManifestSha256, files: manifest.allowedPaths,
+        manifest: { repository: manifest.repository.name, baseSha: headSha, hash: expectedManifestSha256,
+          files: manifest.allowedPaths, acceptanceCriteria: manifest.acceptanceCriteria,
+          coordinator: { regression },
           patchManifest: { allowedPaths: manifest.allowedPaths, pilotScope: manifest.pilotScope } }, files,
-        ...investigationContext });
+        phaseInstructions, ...investigationContext });
       let modelOperationId = null, successfulOutcome = false;
       const authorization = {
         async recheck() { await fresh(); return true; },
@@ -511,9 +538,10 @@ export function createCoordinator(dependencies = {}) {
           return { revision: headSha, path: file.path, blobSha: file.blobSha, text: file.text };
         }, timeoutMs: Math.max(1, Math.min(45000, budget.deadline - Date.now())) }));
       const generated = await budget.wait(() => agent.run({}));
+      agentDiagnostics = safeAgentDiagnostics(generated?.diagnostics);
       if (databaseUncertain) stop('recovery_database_uncertain');
       if (terminalResult) return terminalResult;
-      if (generated?.blockerCode === 'model_outcome_uncertain') return result('needs_attention', 'model_outcome_uncertain');
+      if (generated?.blockerCode === 'model_outcome_uncertain') return result('needs_attention', 'model_outcome_uncertain', false, agentDiagnostics);
       if (generated?.blockerCode === 'investigation_human_stop' || generated?.blockerCode === 'investigation_assessment_unavailable') stop('coordinator_investigation_human_stop');
       if (generated?.status !== 'completed' || generated.proposal !== true || !successfulOutcome || !modelOperationId
         || generated.baseSha !== headSha || generated.manifestHash !== expectedManifestSha256) {
@@ -522,10 +550,13 @@ export function createCoordinator(dependencies = {}) {
       const candidatePhase = phaseInput(snapshot.phase);
       // A new regression selects its own approved criterion; implementation preserves it.
       const { criterionSha256: _previousCriterion, ...newSelectionPhase } = candidatePhase;
-      const candidate = prepareCandidate({ publicationRun: publicationRun(snapshot.run, manifest),
-        phase: trustedInvestigation ? { ...newSelectionPhase, investigation: trustedInvestigation } : candidatePhase,
-        approvedManifest: manifest, modelOperationId, changes: projectedChanges(generated.changes), baseFiles: files,
-        ...(trustedInvestigation ? { assessment: generated.assessment } : {}) });
+      let candidate;
+      try {
+        candidate = prepareCandidate({ publicationRun: publicationRun(snapshot.run, manifest),
+          phase: trustedInvestigation ? { ...newSelectionPhase, investigation: trustedInvestigation } : candidatePhase,
+          approvedManifest: manifest, modelOperationId, changes: projectedChanges(generated.changes), baseFiles: files,
+          ...(trustedInvestigation ? { assessment: generated.assessment } : {}) });
+      } catch { stop('coordinator_candidate_lost'); }
       return publish(candidate.intent, candidate.publication);
     }
     try {
@@ -614,11 +645,16 @@ export function createCoordinator(dependencies = {}) {
       if (budget.isExpired()) return result('needs_attention', 'recovery_deadline');
       const reason = error instanceof Stop ? error.reason : 'coordinator_journal_conflict';
       const status = error instanceof Stop ? error.status : 'needs_attention';
-      if (!lease) return result(status, reason);
+      const diagnostics = agentDiagnostics
+        ? { ...agentDiagnostics, proposalCategory: reason === 'coordinator_candidate_lost'
+          && agentDiagnostics.proposalCategory === 'valid_proposal'
+          ? 'lost_valid_proposal' : agentDiagnostics.proposalCategory }
+        : undefined;
+      if (!lease) return result(status, reason, false, diagnostics);
       try {
         const persisted = await database(options => store.finishRun(lease, status,
           status === 'needs_attention' ? { blockerCode: reason } : {}, options));
-        return persisted ? result(status, reason, true) : result('needs_attention', 'recovery_lease_lost');
+        return persisted ? result(status, reason, true, diagnostics) : result('needs_attention', 'recovery_lease_lost');
       } catch { return result('needs_attention', 'recovery_database_uncertain'); }
     } finally { budget.close(); }
   }
