@@ -7,6 +7,8 @@ function required(name: string): string {
 }
 
 const runtimeDatabaseUrl = required("AGENT_INTAKE_DATABASE_URL");
+// The disabled worker needs no new secret and must never inherit an owner URL.
+const workerDatabaseUrl = process.env.AGENT_WORKER_DATABASE_URL || "disabled";
 
 export default defineConfig({
   // Keep the Auth service already enabled on the linked production branch.
@@ -25,6 +27,31 @@ export default defineConfig({
         DATABASE_URL: runtimeDatabaseUrl,
         DATABASE_URL_UNPOOLED: runtimeDatabaseUrl,
       },
+    },
+    issueworker: {
+      name: "Agent issue worker",
+      source: "./src/automation/worker/function.mjs",
+      env: {
+        AGENT_WORKER_ENABLED: "false",
+        AGENT_WORKER_CONFIG_JSON: process.env.AGENT_WORKER_CONFIG_JSON || "",
+        AGENT_WORKER_CONFIG_SHA256: process.env.AGENT_WORKER_CONFIG_SHA256 || "",
+        AGENT_WORKER_APP_PRIVATE_KEY: process.env.AGENT_WORKER_APP_PRIVATE_KEY || "",
+        WORKER_MODEL_BASE_URL: process.env.WORKER_MODEL_BASE_URL || "",
+        WORKER_MODEL_TOKEN: process.env.WORKER_MODEL_TOKEN || "",
+        AGENT_WORKER_DATABASE_URL: workerDatabaseUrl,
+        DATABASE_URL: workerDatabaseUrl,
+        DATABASE_URL_UNPOOLED: workerDatabaseUrl,
+      },
+    },
+  },
+  // Static false applies to every branch, including inherited nonproduction schedules.
+  triggers: {
+    issueworkertick: {
+      type: "schedule",
+      function: "issueworker",
+      cron: "*/2 * * * *",
+      functionPath: "/tick",
+      enabled: false,
     },
   },
   // Branch policy: per-branch tuning
