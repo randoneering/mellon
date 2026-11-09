@@ -67,6 +67,28 @@ BEGIN
          ROW(OLD.evidence_source, OLD.native_review_id)) THEN
     RAISE EXCEPTION 'review request metadata is immutable';
   END IF;
+  -- Attempt, confirmation and evidence must each build on a previously recorded stage.
+  IF (NOT OLD.attempted AND (NEW.comment_id IS NOT NULL OR NEW.evidence_source IS NOT NULL))
+     OR (OLD.comment_id IS NULL AND NEW.evidence_source IS NOT NULL) THEN
+    RAISE EXCEPTION 'review request transition is invalid';
+  END IF;
+  PERFORM 1 FROM agent_worker.runs r WHERE r.run_id=NEW.run_id
+    AND r.repository_id=NEW.repository_id AND r.repository_full_name=NEW.repository_full_name
+    AND r.pull_request_number=NEW.pull_request_number AND r.expected_head_sha=NEW.head_sha
+    AND r.branch_name='agent-work/' || r.run_id::text AND r.generation>=NEW.lease_generation
+    AND (OLD.attempted OR NOT NEW.attempted OR NEW.attempted_generation=r.generation)
+    AND r.state='waiting_review' AND r.pending_operation_id IS NULL AND r.terminal_at IS NULL
+    AND r.last_check_head_sha=NEW.head_sha AND r.check_evidence_sha256 IS NOT NULL
+    AND r.lease_expires_at > clock_timestamp()
+    AND r.lease_started_at + ((r.limits ->> 'tickDeadlineSeconds')::double precision * interval '1 second') > clock_timestamp()
+    AND r.created_at + ((r.limits ->> 'runLifetimeSeconds')::double precision * interval '1 second') > clock_timestamp()
+    AND r.wait_started_at + ((r.limits ->> 'reviewWaitSeconds')::double precision * interval '1 second') > clock_timestamp()
+    AND EXISTS (SELECT 1 FROM agent_worker.operations o WHERE o.run_id=r.run_id
+      AND o.kind='commit_create' AND o.effect_phase='confirmed' AND o.effect_reference=NEW.head_sha)
+    AND EXISTS (SELECT 1 FROM agent_worker.operations o WHERE o.run_id=r.run_id
+      AND o.kind='pr_create' AND o.effect_phase='confirmed' AND o.effect_reference=NEW.pull_request_number::text)
+    FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'review request update binding is invalid'; END IF;
   RETURN NEW;
 END;
 $function$;

@@ -57,6 +57,18 @@ function wireReviewTransport(h, uncertain = false) {
   return () => posts;
 }
 
+async function rejectsDirectTransition(h, lease, assignments, values = []) {
+  const client = await h.runtime.connect();
+  try {
+    await client.query('BEGIN');
+    await assert.rejects(client.query(`UPDATE agent_worker.review_requests SET ${assignments}
+      WHERE run_id=$1`, [lease.runId, ...values]), { code: 'P0001' });
+  } finally {
+    // RED attempts must not corrupt the row used by subsequent transition tests.
+    try { await client.query('ROLLBACK'); } finally { client.release(); }
+  }
+}
+
 // The shared fixture verifies a fresh local database marker before any SQL.
 test('actual review request journal fences attempts and preserves native evidence', async t => {
   await withCoordinator(async h => {
@@ -81,11 +93,39 @@ test('actual review request journal fences attempts and preserves native evidenc
       await assert.rejects(store.reserveReviewRequest(lease, { ...input, actorId: input.actorId + 1 }));
       await assert.rejects(store.reserveReviewRequest(lease, { ...input, identitySha256: 'f'.repeat(64) }));
     });
+    await t.test('SQL cannot combine reservation attempt and comment confirmation', async () => {
+      await rejectsDirectTransition(h, lease,
+        'attempted=true,attempted_generation=$2,comment_id=987', [lease.generation]);
+      const row = await store.getReviewRequest(lease, input.headSha);
+      assert.equal(row.attempted, false);
+      assert.equal(row.commentId, null);
+    });
+    await t.test('SQL cannot combine reservation attempt confirmation and review evidence', async () => {
+      await rejectsDirectTransition(h, lease,
+        "attempted=true,attempted_generation=$2,comment_id=987,evidence_source='maintainer',native_review_id=90",
+        [lease.generation]);
+      const row = await store.getReviewRequest(lease, input.headSha);
+      assert.equal(row.attempted, false);
+      assert.equal(row.commentId, null);
+      assert.equal(row.evidenceSource, null);
+    });
+    await t.test('SQL cannot fence an attempt under another lease generation', async () => {
+      await rejectsDirectTransition(h, lease, 'attempted=true,attempted_generation=$2', [lease.generation + 1]);
+      assert.equal((await store.getReviewRequest(lease, input.headSha)).attempted, false);
+    });
     await t.test('attempt is executable once across restarted store instances', async () => {
       assert.equal((await store.attemptReviewRequest(lease, input)).canExecute, true);
       assert.equal((await store.attemptReviewRequest(lease, input)).canExecute, false);
       h.restart();
       assert.equal((await h.actualStore.attemptReviewRequest(lease, input)).canExecute, false);
+    });
+    await t.test('SQL cannot confirm a comment and attach review evidence in one transition', async () => {
+      await rejectsDirectTransition(h, lease,
+        "comment_id=987,evidence_source='maintainer',native_review_id=90");
+      const row = await store.getReviewRequest(lease, input.headSha);
+      assert.equal(row.attempted, true);
+      assert.equal(row.commentId, null);
+      assert.equal(row.evidenceSource, null);
     });
     await t.test('native confirmation reconciles once without rewriting comment identity', async () => {
       assert.equal((await store.confirmReviewRequest(lease, { ...input, commentId: 987 })).commentId, 987);
@@ -123,6 +163,7 @@ test('actual review request journal fences attempts and preserves native evidenc
     await t.test('expired and stale leases cannot read or write the request', async () => {
       assert.equal(await store.getReviewRequest({ ...lease, generation: lease.generation + 1 }, input.headSha), null);
       await h.expireLease();
+      await rejectsDirectTransition(h, lease, 'updated_at=clock_timestamp()');
       assert.equal(await store.getReviewRequest(lease, input.headSha), null);
       assert.equal(await store.confirmReviewRequest(lease, { ...input, commentId: 987 }), null);
     });
