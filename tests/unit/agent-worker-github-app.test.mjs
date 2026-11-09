@@ -21,7 +21,7 @@ function fixture() {
     if (path === '/app/installations/456/access_tokens') return response({ token: 'ghs_test', expires_at: new Date(Date.now() + 60 * 60_000).toISOString(), permissions: JSON.parse(options.body).permissions, repository_selection: 'selected', repositories: [{ id: 789, name: 'mellon', full_name: 'randoneering/mellon' }] });
     if (path === '/repositories/789') return response({ id: 789, full_name: 'randoneering/mellon' });
     if (path === '/users/mellon%5Bbot%5D') return response({ id: 42, login: 'mellon[bot]', type: 'Bot' });
-    if (path === '/graphql') return response({ data: { repository: { databaseId: 789, nameWithOwner: 'randoneering/mellon', object: { oid: 'a'.repeat(40), tree: { oid: 'b'.repeat(40) }, parents: { nodes: ['c'.repeat(40)].map(oid => ({ oid })) }, author: { user: { databaseId: 42, login: 'mellon[bot]' } }, committer: { user: { databaseId: 42, login: 'mellon[bot]' } }, signature: { isValid: true, state: 'VALID', wasSignedByGitHub: true } } } } });
+    if (path === '/graphql') return response({ data: { repository: { databaseId: 789, nameWithOwner: 'randoneering/mellon', object: { oid: 'a'.repeat(40), tree: { oid: 'b'.repeat(40) }, parents: { nodes: ['c'.repeat(40)].map(oid => ({ oid })) }, author: { user: { databaseId: 42, login: 'mellon[bot]' } }, committer: { name: 'GitHub', email: 'noreply@github.com', user: null }, signature: { isValid: true, state: 'VALID', wasSignedByGitHub: true } } } } });
     throw new Error('unexpected');
   };
   return { calls, fetch, broker: createGitHubAppBroker(config, { fetch, now }) };

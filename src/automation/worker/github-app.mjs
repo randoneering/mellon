@@ -1,5 +1,6 @@
 import { createHash, createPrivateKey, createSign } from 'node:crypto';
-import { validatePublicationContext } from './publication-validation.mjs';
+import { EXPECTED_COMMITTER, WEB_FLOW_USER, validatePublicationContext }
+  from './publication-validation.mjs';
 
 const ORIGIN = 'https://api.github.com';
 const VERSION = '2022-11-28';
@@ -25,7 +26,7 @@ const ERRORS = new Set([
   'github_app_repository_mismatch', 'github_app_actor_mismatch',
   'github_app_preflight_invalid',
 ]);
-const PROOF_QUERY = `query AgentWorkerSigningPreflight($owner:String!,$name:String!,$oid:GitObjectID!){repository(owner:$owner,name:$name){databaseId nameWithOwner object(oid:$oid){... on Commit{oid tree{oid} parents(first:2){nodes{oid}} author{user{databaseId login}} committer{user{databaseId login}} signature{isValid state wasSignedByGitHub}}}}}`;
+const PROOF_QUERY = `query AgentWorkerSigningPreflight($owner:String!,$name:String!,$oid:GitObjectID!){repository(owner:$owner,name:$name){databaseId nameWithOwner object(oid:$oid){... on Commit{oid tree{oid} parents(first:2){nodes{oid}} author{user{databaseId login}} committer{name email user{databaseId login}} signature{isValid state wasSignedByGitHub}}}}}`;
 
 class BrokerError extends Error {}
 function fail(reason = 'github_app_unavailable') { throw new BrokerError(reason); }
@@ -291,9 +292,12 @@ export function createGitHubAppBroker(input, dependencies = {}) {
       || !Array.isArray(commit.parents?.nodes) || commit.parents.nodes.length !== 1
       || !/^[a-f0-9]{40}$/.test(commit.parents.nodes[0]?.oid ?? '')
       || commit.author?.user?.databaseId !== config.actor.databaseId
-      || commit.committer?.user?.databaseId !== config.actor.databaseId
+      || commit.committer?.name !== EXPECTED_COMMITTER.name
+      || commit.committer?.email !== EXPECTED_COMMITTER.email
+      || !(commit.committer.user === null
+        || (commit.committer.user?.databaseId === WEB_FLOW_USER.databaseId
+          && commit.committer.user.login?.toLowerCase() === WEB_FLOW_USER.login))
       || commit.author.user.login?.toLowerCase() !== config.actor.login.toLowerCase()
-      || commit.committer.user.login?.toLowerCase() !== config.actor.login.toLowerCase()
       || commit.signature?.isValid !== true || commit.signature.state !== 'VALID'
       || commit.signature.wasSignedByGitHub !== true
       || cap.expiresAt <= clock() + MIN_TOKEN_LIFE_MS) fail('github_app_preflight_invalid');
@@ -302,7 +306,7 @@ export function createGitHubAppBroker(input, dependencies = {}) {
       appId: config.appId, installationId: config.installationId,
       expiresAt: stamp(Math.min(cap.expiresAt, clock() + 4 * 60_000)),
       commit: {
-        oid: commit.oid, author: { ...config.actor }, committer: { ...config.actor },
+        oid: commit.oid, author: { ...config.actor }, committer: { ...EXPECTED_COMMITTER },
         signature: { isValid: true, state: 'VALID', wasSignedByGitHub: true },
       },
     };

@@ -28,7 +28,7 @@ const COMMIT_PROOF_QUERY = `query AgentWorkerCommitProof($owner: String!, $name:
         tree { oid }
         parents(first: 2) { nodes { oid } }
         author { user { databaseId login } }
-        committer { user { databaseId login } }
+        committer { name email user { databaseId login } }
         signature { isValid state wasSignedByGitHub signer { databaseId login } }
       }
     }
@@ -287,8 +287,8 @@ export function createPublicationClient({ fetch, token, budget }) {
             login: commit.author?.user?.login,
           },
           committer: {
-            databaseId: commit.committer?.user?.databaseId,
-            login: commit.committer?.user?.login,
+            name: commit.committer?.name,
+            email: commit.committer?.email,
           },
           signature: {
             isValid: signature?.isValid,
