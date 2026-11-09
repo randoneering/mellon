@@ -7,6 +7,9 @@ export const BASE_BRANCH = 'main';
 export const MAX_TREE_ENTRIES = 100_000;
 export const MAX_TREE_BYTES = 4 * 1024 * 1024;
 export const MAX_INPUT_BYTES = 1024 * 1024;
+// GitHub signs API-created App commits as its web-flow committer, not the App bot.
+export const EXPECTED_COMMITTER = Object.freeze({ name: 'GitHub', email: 'noreply@github.com' });
+export const WEB_FLOW_USER = Object.freeze({ databaseId: 19864447, login: 'web-flow' });
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SHA1 = /^[a-f0-9]{40}$/;
@@ -193,7 +196,7 @@ export function validatePublicationContext(value, run, now = Date.now()) {
   const commit = preflight.commit;
   if (!exactKeys(commit, ['oid', 'author', 'committer', 'signature'])
     || !SHA1.test(commit.oid)
-    || !actorMatches(commit.author, value.actor) || !actorMatches(commit.committer, value.actor)
+    || !actorMatches(commit.author, value.actor) || !webFlowCommitterMatches(commit.committer)
     || !validSignature(commit.signature)) fail('signing_preflight_missing');
   return freezeDeep(value);
 }
@@ -203,6 +206,12 @@ function actorMatches(candidate, actor) {
     && positiveId(candidate.databaseId) && safeLogin(candidate.login)
     && candidate.databaseId === actor.databaseId
     && candidate.login.toLowerCase() === actor.login.toLowerCase();
+}
+
+function webFlowCommitterMatches(candidate) {
+  return exactKeys(candidate, ['name', 'email'])
+    && candidate.name === EXPECTED_COMMITTER.name
+    && candidate.email === EXPECTED_COMMITTER.email;
 }
 
 function validSignature(signature) {
@@ -323,7 +332,7 @@ export function verifyCommitProof(proof, expected) {
     || !Array.isArray(proof.commit.parents) || proof.commit.parents.length !== 1
     || proof.commit.parents[0] !== expected.parentSha
     || !actorMatches(proof.commit.author, expected.actor)
-    || !actorMatches(proof.commit.committer, expected.actor)
+    || !webFlowCommitterMatches(proof.commit.committer)
     || !validSignature(proof.commit.signature)) return false;
   return true;
 }
@@ -336,7 +345,7 @@ export function verifyOwnedCommitProof(proof, expected) {
     || !Array.isArray(proof.commit.parents) || proof.commit.parents.length !== 1
     || !SHA1.test(proof.commit.parents[0])
     || !actorMatches(proof.commit.author, expected.actor)
-    || !actorMatches(proof.commit.committer, expected.actor)
+    || !webFlowCommitterMatches(proof.commit.committer)
     || !validSignature(proof.commit.signature)) return null;
   return { treeSha: proof.commit.tree.oid, parentSha: proof.commit.parents[0] };
 }

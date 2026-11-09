@@ -28,7 +28,7 @@ function scenario(mutate = (key, value) => value, parentHead = HEAD) {
     [`${ROOT}/git/blobs/${blob(SOURCE)}`]: { sha: blob(SOURCE), size: Buffer.byteLength(SOURCE), encoding: 'base64', content: Buffer.from(SOURCE).toString('base64') },
     '/graphql': { data: { repository: {
       databaseId: 123456, nameWithOwner: 'randoneering/mellon',
-      object: { oid: CANDIDATE, tree: { oid: AFTER_TREE }, parents: { nodes: [{ oid: parentHead }] }, author: { user: ACTOR }, committer: { user: ACTOR }, signature: { isValid: true, state: 'VALID', wasSignedByGitHub: true } },
+      object: { oid: CANDIDATE, tree: { oid: AFTER_TREE }, parents: { nodes: [{ oid: parentHead }] }, author: { user: ACTOR }, committer: { name: 'GitHub', email: 'noreply@github.com', user: null }, signature: { isValid: true, state: 'VALID', wasSignedByGitHub: true } },
       ref: { prefix: 'refs/heads/', name: branch, target: { oid: CANDIDATE } },
     } } },
   };

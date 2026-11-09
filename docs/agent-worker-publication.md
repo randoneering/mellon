@@ -28,7 +28,7 @@ The publisher calls approval and fence gates before each mutation and applies on
 `getPublicationContext` must return a repository-scoped GitHub App installation token, its expiry, the fixed repository identity, App and installation IDs, and the expected App bot actor identity.
 It must verify the App, installation, and repository from trusted runtime configuration rather than accepting a PAT, environment fallback, or caller-supplied token.
 The signing preflight must come from an actual GitHub commit created with that App installation in an explicitly approved test branch.
-It must bind the same repository, App, installation, author, committer, and bot actor, with `signature.isValid: true`, `signature.state: 'VALID'`, and `signature.wasSignedByGitHub: true`.
+It must bind the same repository, App, installation, and author bot actor, and require GitHub's `web-flow` committer (`GitHub`, `noreply@github.com`) with `signature.isValid: true`, `signature.state: 'VALID'`, and `signature.wasSignedByGitHub: true`. GitHub signs API-created commits as `web-flow`.
 The context expires within five minutes, and the publisher rejects missing or expired preflight evidence before writing.
 Synthetic test context does not prove a live App token or signing capability.
 
@@ -48,7 +48,7 @@ The only commit mutation is the static `createCommitOnBranch` GraphQL document w
 The publisher accepts only `100644` output files because the documented structured file-change input does not expose a file-mode argument.
 It rejects executable-mode edits before writing rather than assuming that GitHub preserves the mode.
 
-After a commit, the publisher checks the exact repository, commit OID, single expected parent, complete tree, changed paths, blob SHA-1 values, modes, author and committer App actor IDs, and GitHub signature state.
+After a commit, the publisher checks the exact repository, commit OID, single expected parent, complete tree, changed paths, blob SHA-1 values, modes, author App actor ID, `web-flow` committer identity, and GitHub signature state.
 The opaque operation SHA-256 binds the run, manifest, approved base, expected head, paths, content, current blob and mode, and resulting mode.
 Git blob SHA-1 values are separate from the operation SHA-256.
 

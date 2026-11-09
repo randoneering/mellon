@@ -58,7 +58,7 @@ export function brokerFixture({ mutate, transport, repositoryId = 789 } = {}) {
           oid: 'a'.repeat(40), tree: { oid: 'b'.repeat(40) },
           parents: { nodes: [{ oid: 'c'.repeat(40) }] },
           author: { user: { databaseId: 42, login: 'mellon[bot]' } },
-          committer: { user: { databaseId: 42, login: 'mellon[bot]' } },
+          committer: { name: 'GitHub', email: 'noreply@github.com', user: null },
           signature: { isValid: true, state: 'VALID', wasSignedByGitHub: true },
         },
       } } };

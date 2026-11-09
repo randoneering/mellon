@@ -79,7 +79,7 @@ export async function controlledTransport(job) {
       appId: 5150, installationId: 6160, actor,
       signingPreflight: { repositoryId: manifest.repository.id, repositoryName: manifest.repository.name,
         appId: 5150, installationId: 6160, expiresAt: expires,
-        commit: { oid: '7'.repeat(40), author: actor, committer: actor, signature } } };
+        commit: { oid: '7'.repeat(40), author: actor, committer: { name: 'GitHub', email: 'noreply@github.com' }, signature } } };
   };
   const repository = { id: manifest.repository.id, full_name: manifest.repository.name, name: 'mellon', private: false };
   const run = () => ({ id: 77, run_attempt: 1, workflow_id: 3000,
@@ -208,7 +208,7 @@ export async function controlledTransport(job) {
       const sha = body.variables.oid; const value = commits.get(sha);
       return json({ data: { repository: { databaseId: manifest.repository.id, nameWithOwner: manifest.repository.name,
         object: { oid: sha, tree: { oid: value.treeSha }, parents: { nodes: value.parent ? [{ oid: value.parent }] : [] },
-          author: { user: actor }, committer: { user: actor }, signature },
+          author: { user: actor }, committer: { name: 'GitHub', email: 'noreply@github.com', user: null }, signature },
         ref: { name: state.branch, prefix: 'refs/heads/', target: { oid: state.head } } } } });
     }
     if (path === '/contents/.github/PULL_REQUEST_TEMPLATE.md') return json(content('.github/PULL_REQUEST_TEMPLATE.md', PR_TEMPLATE));

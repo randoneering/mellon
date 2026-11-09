@@ -163,7 +163,7 @@ export function createPublisherFixture(options = {}) {
       commit: {
         oid: '7'.repeat(40),
         author: actor(),
-        committer: actor(),
+        committer: { name: 'GitHub', email: 'noreply@github.com' },
         signature: signature(),
       },
     },
@@ -183,7 +183,7 @@ export function createPublisherFixture(options = {}) {
           tree: { oid: tree },
           parents: { nodes: [{ oid: options.wrongParent ? FOREIGN_SHA : BASE_SHA }] },
           author: { user: actualActor },
-          committer: { user: actualActor },
+          committer: { name: 'GitHub', email: 'noreply@github.com' },
           signature: signature(options.wrongSignature
             ? { isValid: false, state: 'UNKNOWN', wasSignedByGitHub: false }
             : {}),
@@ -569,7 +569,7 @@ export function createOwnedHistoryFixture(length, options = {}) {
         databaseId: REPOSITORY_ID, nameWithOwner: 'randoneering/mellon',
         object: { oid: proofNode.sha, tree: { oid: proofNode.treeSha },
           parents: { nodes: [{ oid: proofNode.parentSha }] },
-          author: { user: proofActor }, committer: { user: proofActor },
+          author: { user: proofActor }, committer: { name: 'GitHub', email: 'noreply@github.com' },
           signature: signature() },
         ref: { name: branch, prefix: 'refs/heads/', target: { oid: state.branchHead } },
       } } });

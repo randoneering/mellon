@@ -107,6 +107,14 @@ for (const [name, change] of [
   ['wrong signing actor', repo => { repo.object.author.user.databaseId = 999; }],
   ['invalid signature', repo => { repo.object.signature.isValid = false; }],
   ['wrong preflight repository', repo => { repo.databaseId = 999; }],
+  ['the App bot as committer', repo => {
+    repo.object.committer = { name: 'mellon[bot]', email: '42+mellon[bot]@users.noreply.github.com',
+      user: { databaseId: 42, login: 'mellon[bot]' } };
+  }],
+  ['another committer user', repo => { repo.object.committer.user = { databaseId: 999, login: 'someone' }; }],
+  ['a non-GitHub committer name', repo => { repo.object.committer.name = 'Someone'; }],
+  ['a non-GitHub committer email', repo => { repo.object.committer.email = 'someone@example.com'; }],
+  ['a missing committer', repo => { repo.object.committer = null; }],
 ]) {
   test(`runtime authorization rejects ${name}`, async () => {
     const f = brokerFixture({ mutate: call => {
@@ -117,6 +125,15 @@ for (const [name, change] of [
   });
 }
 
+test('runtime authorization accepts the GitHub web-flow committer user', async () => {
+  const f = brokerFixture({ mutate: call => {
+    if (call.path === '/graphql') {
+      call.data.data.repository.object.committer.user = { databaseId: 19864447, login: 'web-flow' };
+    }
+    return call.data;
+  } });
+  assert.equal(await f.create().verifyRuntime(), true);
+});
 test('runtime authorization reads verified repository and signing proof', async () => {
   const f = brokerFixture();
   assert.equal(await f.create().verifyRuntime(), true);
