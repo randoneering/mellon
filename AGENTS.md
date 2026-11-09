@@ -67,6 +67,11 @@ Mark behavior that was not exercised as unverified.
    Surface an actionable job-summary notice; for missing outcome labels, ask maintainers to create them manually.
    Never include raw API errors, response bodies, credentials, or submission text.
    Test that optional setup failure preserves intended moderation behavior and produces the notice.
+9. **Keep operational failures diagnosable.** When catching or normalizing failures in moderation, intake, or CI reporting, preserve a sanitized stage, a fixed failure category, and any confirmed partial work, such as a posted comment ID, in the relevant job summary or internal diagnostic channel.
+   Generic public error responses are allowed, but must not be the only diagnostic; do not report a failed operation with confirmed partial work as a plain skip.
+   Follow the stage and category pattern in `src/automation/intake.mjs`, and apply rule 5 to all diagnostics without changing published Action outputs just to add detail.
+   Test that new failure-handling paths preserve the sanitized diagnostics and any confirmed partial work.
+   Maintainers need to know which step failed and what was already written to reconcile and retry safely.
 
 ## Specifications
 
