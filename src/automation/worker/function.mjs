@@ -24,6 +24,34 @@ function unavailable(report, category) {
   return response('unavailable', 503);
 }
 
+function reportProposalDiagnostics(report, result) {
+  const categories = new Set(['model_failure', 'prose_only', 'read_only', 'rejected_proposal',
+    'valid_proposal', 'lost_valid_proposal', 'assessment_only']);
+  const rejections = new Set(['schema', 'binding', 'scope', 'validation', 'duplicate', 'assessment', 'deadline']);
+  const value = result.diagnostics;
+  if (!categories.has(value?.proposalCategory)) return;
+  const fields = ['[agent_worker] stage=model', `category=${value.proposalCategory}`];
+  if (rejections.has(value.proposalRejection)) fields.push(`rejection=${value.proposalRejection}`);
+  for (const name of ['readFile', 'listFiles', 'proposeChanges']) {
+    const count = value.toolCounts?.[name];
+    if (Number.isSafeInteger(count) && count >= 0 && count <= 16) fields.push(`${name}=${count}`);
+  }
+  // The HTTP response stays fixed; only closed metadata reaches the operator report.
+  try { Promise.resolve(report(fields.join(' '))).catch(() => {}); }
+  catch { /* Reporting cannot change the worker outcome. */ }
+}
+function reportReviewDiagnostics(report, value) {
+  const categories = new Set(['review_request_confirmed', 'review_binding_invalid', 'review_context_unavailable',
+    'review_context_invalid', 'review_pull_request_mismatch', 'review_commit_mismatch',
+    'review_confirmation_mismatch', 'review_lease_lost', 'review_head_changed', 'review_write_uncertain',
+    'review_deadline', 'review_dispatch_failed', 'review_evidence_unconfirmed']);
+  if (!categories.has(value?.category)) return;
+  const fields = ['[agent_worker] stage=review_request', `category=${value.category}`];
+  if (Number.isSafeInteger(value.commentId) && value.commentId > 0) fields.push(`comment_id=${value.commentId}`);
+  if (['qodo', 'maintainer'].includes(value.source)) fields.push(`source=${value.source}`);
+  try { Promise.resolve(report(fields.join(' '))).catch(() => {}); }
+  catch { /* Reporting cannot change the worker outcome. */ }
+}
 function trustedConfiguration(config) {
   return config && typeof config.productionBranch === 'string' &&
     config.productionBranch.length > 0 && config.productionBranch.length <= 255 &&
@@ -130,6 +158,8 @@ export function createWorkerFunction({
           data: Object.freeze({ scheduledAt: invocation.data.scheduledAt }),
         }));
         if (!COORDINATOR_STATUSES.has(result?.status)) return unavailable(report, 'coordinator_unavailable');
+        reportProposalDiagnostics(report, result);
+        reportReviewDiagnostics(report, result.reviewDiagnostics);
         return response(result.status, 200);
       } catch {
         return unavailable(report, `${stage}_unavailable`);

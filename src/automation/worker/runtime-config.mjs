@@ -64,12 +64,21 @@ export function authorizeRuntimeConfiguration(config, env, now = Date.now()) {
       || !url.hostname.endsWith('.neon.tech') || !url.hostname.includes('-api.ai.')
       || typeof apiKey !== 'string' || !/^[!-~]{8,4096}$/.test(apiKey)
       || typeof privateKey !== 'string' || !privateKey.length) invalid();
+    const reviewPolicy = config.manifest.reviewPolicy;
+    const reviewRequests = reviewPolicy !== undefined;
+    if (reviewRequests && (!exact(reviewPolicy, ['version', 'profile']) || reviewPolicy.version !== 1
+      || reviewPolicy.profile !== 'worker-command-maintainer-fallback-v1'
+      || config.manifest.coordinator?.version !== 1)) invalid();
+    const checks = reviewRequests ? PREFLIGHT_CHECKS.filter(check => !check.startsWith('qodo_'))
+      .concat(['worker_review_command', 'maintainer_exact_head_review']) : PREFLIGHT_CHECKS;
     const preflight = config.preflight;
     const { preflight: ignored, ...plan } = config;
     const checkedAt = Date.parse(preflight?.checkedAt);
     const expiresAt = Date.parse(preflight?.expiresAt);
     if (!exact(preflight, ['version', 'planSha256', 'gatewayBindingSha256', 'databaseBindingSha256',
-      'checkedAt', 'expiresAt', 'evidenceSha256', 'checks']) || preflight.version !== 1
+      'checkedAt', 'expiresAt', 'evidenceSha256', 'checks', ...(reviewRequests ? ['reviewProfile'] : [])])
+      || preflight.version !== (reviewRequests ? 2 : 1)
+      || reviewRequests && preflight.reviewProfile !== reviewPolicy.profile
       || preflight.planSha256 !== hash(canonical(plan))
       || preflight.databaseBindingSha256 !== hash(canonical({
         connectionString: env.AGENT_WORKER_DATABASE_URL, role: config.databaseRole,
@@ -80,9 +89,9 @@ export function authorizeRuntimeConfiguration(config, env, now = Date.now()) {
       || !Number.isFinite(checkedAt) || !Number.isFinite(expiresAt)
       || checkedAt > now + 60_000 || checkedAt < now - 4 * 60 * 60_000
       || expiresAt <= now || expiresAt <= checkedAt || expiresAt > checkedAt + 4 * 60 * 60_000
-      || !Array.isArray(preflight.checks) || preflight.checks.length !== PREFLIGHT_CHECKS.length
-      || new Set(preflight.checks).size !== PREFLIGHT_CHECKS.length
-      || !PREFLIGHT_CHECKS.every(check => preflight.checks.includes(check))) invalid();
+      || !Array.isArray(preflight.checks) || preflight.checks.length !== checks.length
+      || new Set(preflight.checks).size !== checks.length
+      || !checks.every(check => preflight.checks.includes(check))) invalid();
     return Object.freeze({ baseURL, apiKey, privateKey, expiresAt });
   } catch { invalid(); }
 }

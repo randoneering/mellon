@@ -76,7 +76,8 @@ for (const [name, usage] of [
   }, finish_reason: 'tool_calls' }] });
   const h = setup({ sdk: { fetch: async () => { requests++; return response(body); } } });
   const output = await h.run();
-  assert.deepEqual(output, { status: 'stopped', blockerCode: 'model_usage_unreported' });
+  assert.deepEqual(JSON.parse(JSON.stringify(output)), { status: 'stopped', blockerCode: 'model_usage_unreported',
+    diagnostics: { proposalCategory: 'valid_proposal', toolCounts: { proposeChanges: 1 } } });
   assert.deepEqual(h.outcomes, [{ outcome: 'usage_unreported' }]);
   assert.equal(requests, 1);
   assert.equal(Object.hasOwn(output, 'changes'), false);
@@ -172,7 +173,8 @@ for (const [name, receipt] of [
   ['unrecognized success blocker', { status: 'recorded', outcome: 'success', blockerCode: 'private synthetic-secret' }],
 ]) test(`invalid persistence receipt never authorizes publication: ${name}`, async () => {
   const h = setup(); h.options.authorization.recordModelCallOutcome = async () => receipt;
-  assert.deepEqual(await h.run(), { status: 'stopped', blockerCode: 'model_outcome_uncertain' });
+  assert.deepEqual(JSON.parse(JSON.stringify(await h.run())), { status: 'stopped', blockerCode: 'model_outcome_uncertain',
+    diagnostics: { proposalCategory: 'prose_only', toolCounts: {} } });
 });
 
 test('revocation between reservation and call prevents SDK execution', async () => {

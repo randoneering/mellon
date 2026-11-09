@@ -64,6 +64,23 @@ function fixture({ input = context(), execute, rawUsage, transport = false, call
   return { worker, outcomes, requests, counted };
 }
 
+for (const disposition of ['confirmed', 'suspected_false_positive']) {
+  test(`accepted ${disposition} assessment diagnostics survive later rejected attempts`, async () => {
+    const call = proposal(assessment(disposition));
+    if (disposition !== 'confirmed') call.changes = [];
+    const f = fixture({ execute: async options => {
+      assert.ok(['proposed', 'assessed'].includes((await options.tools.proposeChanges.execute(call)).status));
+      assert.equal((await options.tools.proposeChanges.execute(call)).status, 'rejected');
+      assert.equal((await options.tools.proposeChanges.execute({ arbitrary: 'private' })).status, 'rejected');
+    } });
+    const value = await f.worker.run({});
+    assert.equal(value.assessment.disposition, disposition);
+    assert.equal(value.diagnostics.proposalCategory, disposition === 'confirmed' ? 'valid_proposal' : 'assessment_only');
+    assert.equal(value.diagnostics.proposalRejection, undefined);
+    assert.equal(value.diagnostics.toolCounts.proposeChanges, 3);
+  });
+}
+
 function qodoContext(body) {
   const input = context();
   const finding = { version: 1, source: 'qodo', reviewId: 81, commentId: 901,

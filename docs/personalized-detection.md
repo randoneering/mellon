@@ -3,7 +3,33 @@
 This local workflow trains a separate classifier from selected GitHub issue and pull request snapshots.
 It does not change the GitHub Action, its pinned model, or its fixed 0.80 cutoff.
 
-## Requirements
+## Guided workflow
+
+Use Node 24 and Git, and set `GH_TOKEN` or `GITHUB_TOKEN` to a read-only GitHub token.
+Start the guide from the repository root:
+
+```sh
+node scripts/personalized-detection.mjs guided
+```
+
+Enter a URL-list file path, or leave it blank to enter GitHub issue and pull request URLs one at a time.
+Choose separate local paths for the dataset, model, and report, preferably in a private directory outside the repository.
+The guide asks for confirmation before writing to a Git-tracked destination or a new, unignored path inside a Git working tree.
+It checks symlinked directories and enclosing repositories, and stops if it cannot verify Git status.
+Git-ignored paths and paths outside Git working trees need no unignored-path confirmation.
+Choose model and report paths that do not already exist: the guide checks both before collection or training starts.
+Existing files, directories and dangling symlinks at either artifact path stop the guide.
+Final exclusive writes still prevent overwriting an artifact created after those checks.
+
+The guide starts with collection each time and skips previously labeled URLs.
+Each accepted label is saved before the next prompt, so rerun the guide after an interruption to continue.
+If you entered URLs manually, enter them again when restarting; the guide skips URLs already labeled.
+Choose new model and report paths for each run.
+If you add labels after training, train a new model before evaluating the changed dataset.
+Training requires examples from both labels, and a usable holdout is needed for evaluation.
+The report records comparison metrics and warnings; small or unrepresentative datasets cannot establish authorship or prove which detector is better.
+
+## Individual commands
 
 Use Node 24.
 Choose explicit paths for URL list, dataset, model, and report.

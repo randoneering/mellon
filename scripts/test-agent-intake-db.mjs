@@ -3,14 +3,15 @@ import { spawnSync } from 'node:child_process';
 import pg from 'pg';
 import { isPostgresTcpReady } from './lib/postgres-readiness.mjs';
 
-const suite = process.argv.length === 2 ? 'intake' : process.argv[2] === '--suite' && ['intake', 'worker', 'journal', 'coordinator', 'runtime'].includes(process.argv[3]) && process.argv.length === 4 ? process.argv[3] : null;
-if (!suite) { console.error('Usage: node scripts/test-agent-intake-db.mjs [--suite intake|worker|journal|coordinator|runtime]'); process.exit(2); }
+const suite = process.argv.length === 2 ? 'intake' : process.argv[2] === '--suite' && ['intake', 'worker', 'journal', 'coordinator', 'runtime', 'review-requests'].includes(process.argv[3]) && process.argv.length === 4 ? process.argv[3] : null;
+if (!suite) { console.error('Usage: node scripts/test-agent-intake-db.mjs [--suite intake|worker|journal|coordinator|runtime|review-requests]'); process.exit(2); }
 const suiteFiles = Object.freeze({
   intake: 'tests/integration/agent-intake-store.test.mjs',
   worker: 'tests/integration/agent-worker-store.test.mjs',
   journal: 'tests/integration/agent-worker-journal.test.mjs',
   coordinator: 'tests/integration/agent-worker-coordinator.test.mjs',
   runtime: 'tests/support/agent-worker-runtime-postgres.mjs',
+  'review-requests': 'tests/manual/agent-worker-review-request-journal.mjs',
 });
 const image = 'postgres@sha256:3540c0362c809df084ffac0ae69fe794515f9de92692f02178bcdce0ef0302ac';
 const container = `mellon-${suite}-test-${randomUUID()}`;

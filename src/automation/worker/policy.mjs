@@ -24,8 +24,8 @@ const REQUIRED_REFERENCES = {
 };
 const HASH = /^[a-f0-9]{64}$/;
 const PINNED_HASHES = new Map([
-  ['automation/policy/system.md', 'ab24bdd185bd6eb49a026d9cd3832a8f82c39c2a9de924064c2e13da244e5792'],
-  ['AGENTS.md', 'd94bc336e25faa4fce8e85e53ab8c3bdd7ebda9948e901b4a97456a1eaf3c5d4'],
+  ['automation/policy/system.md', '920f13dd9bfac7cf3b83bd97f9c0ec23ce79696d5647294708bddb0b39d7e221'],
+  ['AGENTS.md', 'b7a629ed30c059b17526d00c138a574e2cda5532e5ce2c476893209919dd4778'],
   ['automation/policy/skills/test-driven-development/SKILL.md', '64b03fce4aee5a97a93160cea8111f3ba13a17b7c001db4bd5836d67fd10705d'],
   ['automation/policy/skills/systematic-debugging/SKILL.md', '51c6435d98c83c42c96ba7c35725a0b2c376cd487fb1a4e6bd0ddbe7e33ef202'],
   ['automation/policy/skills/verification-before-completion/SKILL.md', '2befe7fc55bcadaa3d97dd9e8efeb633d2561c0ebe74c5a8b17c4d9e7e4520b3'],

@@ -77,6 +77,13 @@ Mark behavior that was not exercised as unverified.
    Test that new failure-handling paths preserve the sanitized diagnostics and any confirmed partial work.
    Maintainers need to know which step failed and what was already written to reconcile and retry safely.
 
+10. **Restrict PR comment authority.** Coding assistants never post PR comments.
+    Only the trusted deployed worker with the pinned `worker-command-maintainer-fallback-v1` policy may post the exact fixed `/agentic_review` command on its run-owned draft PR after its own confirmed commit, at most once per run/full head.
+    Persist intent and an attempted fence before posting; uncertain writes never authorize a repost.
+    Models receive no posting tool, and contributor review-on-push settings stay unchanged.
+    Command acknowledgement and issue-comment timestamps or SHA text do not prove review coverage.
+    Accept only supported exact-head Qodo evidence or the opted-in configured maintainer's authenticated native exact-head approval, with distinct evidence sources and unchanged CI requirements.
+
 ## Specifications
 
 - OpenSpec files live in a local `openspec/` folder at the repository root.

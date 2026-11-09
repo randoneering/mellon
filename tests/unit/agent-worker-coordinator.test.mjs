@@ -42,6 +42,13 @@ test('coordinator real Agent and candidate: initial lifecycle uses two calls, on
   assert.equal(h.state.publications.length, 3);
   const [tests, implementation, draft] = h.state.publications;
   assert.equal(tests.intent.coordinator.purpose, 'initial_tests');
+  assert.deepEqual(h.state.contexts[0].phaseInstructions, {
+    purpose: 'initial_tests', repairCycle: 0,
+    regressionPath: h.manifest.allowedPaths[h.manifest.coordinator.regression.testPathIndex],
+    testName: h.manifest.coordinator.regression.initial.testName,
+    criterionIndex: h.manifest.coordinator.regression.initial.criterionIndex,
+    criterion: h.manifest.acceptanceCriteria[h.manifest.coordinator.regression.initial.criterionIndex],
+  });
   assert.equal(implementation.intent.coordinator.purpose, 'initial_implementation');
   assert.equal(draft.intent.kind, 'pr_create');
   assert.notEqual(h.state.contexts[1].repository.baseSha, h.manifest.base.revision);
@@ -49,6 +56,26 @@ test('coordinator real Agent and candidate: initial lifecycle uses two calls, on
   assert.equal(implementation.publication.run.expectedHeadSha, h.state.contexts[1].repository.baseSha);
   assert.deepEqual(Object.keys(tests.publication.proposedChanges[0]).sort(), ['content', 'operation', 'path']);
   for (const context of h.state.contexts) assert.equal(context.investigation, undefined);
+});
+
+test('coordinator marks a validated proposal lost at candidate validation with bounded metadata', async () => {
+  const h = await harness();
+  h.dependencies.adapters.createAgentWorker = options => ({ run: async () => {
+    const context = await options.loadContext();
+    const reservation = await options.authorization.reserveModelCall({ inputHash: hash('synthetic'),
+      expectedHeadSha: context.repository.baseSha, inputTokens: 500, outputTokens: 100 });
+    await options.authorization.recordModelCallOutcome(reservation,
+      { outcome: 'success', actualInputTokens: 100, actualOutputTokens: 10 });
+    return { status: 'completed', proposal: true, changes: [], baseSha: context.repository.baseSha,
+      manifestHash: context.manifest.hash, diagnostics: { proposalCategory: 'valid_proposal',
+        toolCounts: { proposeChanges: 1 } } };
+  } });
+  h.coordinator = coordinator(h.dependencies);
+  await tick(h);
+  const result = await tick(h);
+  assert.equal(result.reason, 'coordinator_candidate_lost');
+  assert.equal(result.diagnostics.proposalCategory, 'lost_valid_proposal');
+  assert.deepEqual({ ...result.diagnostics.toolCounts }, { proposeChanges: 1 });
 });
 
 test('coordinator journal: confirmed wait keeps parent identity, timestamps, successful model is normal', async () => {
@@ -179,6 +206,19 @@ test('coordinator actual current review reader never authorizes readiness on a d
     } });
   h.coordinator = coordinator(h.dependencies); await through(h, 'waiting_review'); h.state.checkStatus = 'success';
   assert.equal((await tick(h)).status, 'waiting');
+});
+
+test('legacy coordinator never reads maintainer fallback or publishes the command', async () => {
+  const h = await setup();
+  await through(h, 'waiting_review');
+  h.state.reviewResult = syntheticFutureReview(h.state);
+  let maintainerReads = 0;
+  h.adapters.review.readMaintainerReview = async () => { maintainerReads += 1; };
+  const result = await tick(h);
+  assert.equal(result.status, 'ready_for_human');
+  assert.equal(maintainerReads, 0);
+  assert.equal(h.state.calls.some(call => call[0] === 'reserveReviewRequest'), false);
+  assert.equal(h.state.calls.some(call => call[0] === 'attemptReviewRequest'), false);
 });
 
 test('coordinator SYNTHETIC FUTURE Qodo: completed authenticated empty findings and fresh checks finish still draft', async () => {

@@ -54,6 +54,12 @@ SELECT current_user AS role_name, session_user AS session_role,
     )
   ) AS grants_ok
 FROM pg_roles r WHERE r.rolname = current_user`;
+export function workerRoleQuery({ reviewRequests = false } = {}) {
+  if (typeof reviewRequests !== 'boolean') throw new Error(ROLE_ERROR);
+  if (!reviewRequests) return ROLE_QUERY;
+  return ROLE_QUERY.replace("('agent_intake.jobs', ARRAY['SELECT']",
+    "('agent_worker.review_requests', ARRAY['SELECT','INSERT','UPDATE'], ARRAY['DELETE','TRUNCATE','REFERENCES','TRIGGER']),\n    ('agent_intake.jobs', ARRAY['SELECT']");
+}
 const FALSE_FIELDS = [
   'rolsuper', 'rolbypassrls', 'rolcreatedb', 'rolcreaterole', 'rolreplication',
   'rolinherit', 'has_memberships', 'owns_database', 'owns_app_objects',
@@ -112,7 +118,7 @@ export function createWorkerDatabase({ env, databaseRole, report = line => conso
     throw new Error('Worker database configuration is invalid.');
   }
 
-  async function verifyRole({ signal, deadline = Infinity, limits } = {}) {
+  async function verifyRole({ signal, deadline = Infinity, limits, reviewRequests = false } = {}) {
     let budget;
     let acquisition;
     let client;
@@ -129,8 +135,9 @@ export function createWorkerDatabase({ env, databaseRole, report = line => conso
         return acquisition;
       });
       if (typeof client?.query !== 'function' || typeof client.release !== 'function') throw new Error();
-      const text = limits === undefined ? ROLE_QUERY
-        : ROLE_QUERY.replace('SELECT current_user AS role_name',
+      const roleQuery = workerRoleQuery({ reviewRequests });
+      const text = limits === undefined ? roleQuery
+        : roleQuery.replace('SELECT current_user AS role_name',
           'SELECT agent_worker.valid_limits($1::jsonb) AS limits_ok, current_user AS role_name');
       const receipt = await budget.wait(() => client.query({
         text, ...(limits === undefined ? {} : { values: [JSON.stringify(limits)] }),

@@ -15,6 +15,7 @@
     "test:worker:journal:db": "node scripts/test-agent-intake-db.mjs --suite journal",
     "test:worker:coordinator:db": "node scripts/test-agent-intake-db.mjs --suite coordinator",
     "test:worker:runtime:db": "node scripts/test-agent-intake-db.mjs --suite runtime",
+    "test:worker:review:db": "node scripts/test-agent-intake-db.mjs --suite review-requests",
     "test:build": "node --test --test-concurrency=1 scripts/tests/*.test.mjs",
     "validate:release": "node scripts/validate-release.mjs",
     "test:parity": "node --test detector/tests/parity.test.mjs",

@@ -32,7 +32,8 @@ Defaults use `checkApproval`, `loadPolicy`, `createRepositoryReader`, `createWor
 Repository guidance reads use the pinned `policyRevision`, while prepared candidate files use the current phase head.
 Publication retains the original base revision and the current expected parent.
 
-The optional private `adapters` fields are `repository`, `discovery`, `checks`, `review`, `checkApproval`, `loadPolicy`, `createAgentWorker`, and `createRecoveryCoordinator`.
+The optional private test `adapters` fields are `repository`, `discovery`, `checks`, `review`, `reviewRequestPublisher`, `checkApproval`, `loadPolicy`, `createAgentWorker`, and `createRecoveryCoordinator`.
+Production composition uses the trusted publisher and lease-bound store; submitted text cannot supply adapters.
 Object adapters retain their existing documented method signatures.
 Factory overrides receive the same options as their real counterparts.
 These are trusted code seams, not capabilities accepted from a request, issue, model result, or database payload.
@@ -111,7 +112,10 @@ A new repair test selects its criterion from those approved bindings instead of 
 That omission applies only to transient candidate selection; checkpoints preserve prior metadata until the new typed intent installs its selection atomically.
 
 Repairs publish reserved-name tests, require exact RED, then publish implementation and require green CI.
-An existing draft re-enters review without another PR intent, comment, or body rewrite.
+An existing draft re-enters review without another PR intent or body rewrite.
+Legacy manifests also post no comments.
+The optional `worker-command-maintainer-fallback-v1` policy dispatches one fixed worker command per confirmed owned head through the separate durable review-request journal, before waiting for proof.
+It retains Qodo-finding precedence and may use authenticated exact-head maintainer approval with source-distinct evidence; see [review policy](agent-worker-review.md).
 Both sources share two durable repair cycles; the third stops.
 
 The actual review reader reads only fixed GitHub pull, review, and inline-comment REST resources.

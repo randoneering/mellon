@@ -182,9 +182,25 @@ export function validateCoordinatorConfig(manifest) {
   return true;
 }
 
+function validReviewPolicy(manifest) {
+  if (!Object.hasOwn(manifest, 'reviewPolicy')) return true;
+  const policy = manifest.reviewPolicy;
+  return Object.hasOwn(manifest, 'coordinator')
+    && sameKeys(policy, ['version', 'profile'])
+    && policy.version === 1
+    && policy.profile === 'worker-command-maintainer-fallback-v1'
+    && Array.isArray(manifest.qodoIdentities)
+    && manifest.qodoIdentities.length > 0
+    && manifest.qodoIdentities.every(identity => validQodoIdentity(identity)
+      && identity.appId > 0 && identity.appSlug === 'qodo-code-review'
+      && identity.completion === 'github-submitted-review-v1');
+}
+
 function validManifest(manifest) {
-  const keys = isRecord(manifest) && Object.hasOwn(manifest, 'coordinator')
-    ? [...REQUIRED_MANIFEST_KEYS, 'coordinator'] : REQUIRED_MANIFEST_KEYS;
+  const optionalKeys = [];
+  if (isRecord(manifest) && Object.hasOwn(manifest, 'coordinator')) optionalKeys.push('coordinator');
+  if (isRecord(manifest) && Object.hasOwn(manifest, 'reviewPolicy')) optionalKeys.push('reviewPolicy');
+  const keys = [...REQUIRED_MANIFEST_KEYS, ...optionalKeys];
   if (!sameKeys(manifest, keys)
       || manifest.version !== 1
       || manifest.approved !== true
@@ -225,6 +241,7 @@ function validManifest(manifest) {
         && positiveId(check.workflowId))
       || !validIdentities(manifest)
       || !validateCoordinatorConfig(manifest)
+      || !validReviewPolicy(manifest)
       || !validManifestModel(manifest.model)
       || !sameKeys(manifest.limits, Object.keys(ALLOWED_LIMITS))) return false;
 
