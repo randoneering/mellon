@@ -114,6 +114,9 @@ The unresolved durable reservation must prevent later ticks from issuing a repla
 
 The model receives only `readFile`, `listFiles`, and `proposeChanges`.
 Each tool validates its strict schema again at execution, including calls that bypass SDK validation.
+Coordinator phases with validated phase instructions require a prepared representation for every approved path: verified regular-file text and hashes, or an explicit `mode: null` entry for a new file.
+Directories can describe ancestors, but cannot stand in for an approved file.
+Those phases expose only `proposeChanges` and force that tool in the single provider request; adapters without phase instructions retain the read, list, and automatic-selection behavior.
 No tool runs shell commands, arbitrary URLs, SQL, package installation, publication, or deployment.
 
 - Reads require an approved regular-file path and the prepared revision.
