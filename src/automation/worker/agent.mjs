@@ -234,8 +234,10 @@ function validContext(context, secret) {
         || Buffer.from(file.text).toString('utf8') !== file.text) return false;
     }
   }
-  return paths.every(path => seen.has(path)) && validInvestigation(context)
-    && validFindingReport(context) && validPhaseInstructions(context.phaseInstructions, context);
+  return paths.every(path => seen.has(path)
+    && (!context.phaseInstructions || context.files.find(file => file.path === path)?.mode !== '040000'))
+    && validInvestigation(context) && validFindingReport(context)
+    && validPhaseInstructions(context.phaseInstructions, context);
 }
 function escapeControls(text) {
   return text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu,
@@ -387,6 +389,8 @@ export function createAgentWorker({
           listFiles: 'List only approved paths from the immutable prepared base manifest.',
           proposeChanges: 'Propose bounded file changes against the approved base and manifest. No publication or execution.',
         };
+        const exposedSchemas = context.phaseInstructions
+          ? { proposeChanges: schemas.proposeChanges } : schemas;
         const live = () => state.active && !controller.signal.aborted && now() < state.deadline;
         const implementations = {
           readFile: async input => {
@@ -434,8 +438,8 @@ export function createAgentWorker({
         };
         const declarations = [];
         const tools = {};
-        for (const name of Object.keys(schemas)) {
-          const { $schema: _dialect, ...parameters } = z.toJSONSchema(schemas[name]);
+        for (const name of Object.keys(exposedSchemas)) {
+          const { $schema: _dialect, ...parameters } = z.toJSONSchema(exposedSchemas[name]);
           const frozenParameters = deepCloneFreeze(parameters);
           declarations.push({ type: 'function', function: { name, description: descriptions[name], parameters: frozenParameters } });
           tools[name] = Object.freeze(tool({
@@ -500,7 +504,9 @@ export function createAgentWorker({
         let result;
         try {
           result = await raceAbort(Promise.resolve().then(() => generate({
-            model, ...rendered, tools, toolChoice: 'auto', stopWhen: [isStepCount(1)], maxRetries: 0,
+            model, ...rendered, tools, toolChoice: context.phaseInstructions
+              ? { type: 'tool', toolName: 'proposeChanges' } : 'auto',
+            stopWhen: [isStepCount(1)], maxRetries: 0,
             abortSignal: controller.signal, maxOutputTokens: reservation.outputTokens,
             ...(isSol ? { providerOptions: { openai: { reasoningEffort: trustedConfig.reasoningEffort, store: false } } } : {}),
             telemetry: { isEnabled: false }, include: { responseBody: true },
@@ -514,7 +520,7 @@ export function createAgentWorker({
         }
         state.active = false;
         if (now() >= state.deadline) return await persist({ outcome: 'deadline' }) ?? stopped('model_call_deadline');
-        if (!validOutput(result, schemas)) {
+        if (!validOutput(result, exposedSchemas)) {
           return await persist({ outcome: 'unknown_contract' }) ?? stopped('model_contract_unknown');
         }
         const failure = await persist(safeUsage(result, reservation, isSol));
