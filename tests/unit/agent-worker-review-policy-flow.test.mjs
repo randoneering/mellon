@@ -3,9 +3,13 @@ import assert from 'node:assert/strict';
 import { createCoordinator } from '../../src/automation/worker/coordinator.mjs';
 import { harness, delivery, syntheticFutureReview } from '../fixtures/worker-coordinator/harness.mjs';
 import { hash, canonical } from '../fixtures/worker-candidates/inputs.mjs';
+import { runtimeFixture } from '../fixtures/worker-runtime.mjs';
+import { authorizeRuntimeConfiguration } from '../../src/automation/worker/runtime-config.mjs';
 
-async function optedIn() {
-  const h = await harness();
+async function optedIn(startup = false) {
+  const runtime = startup ? await runtimeFixture() : null;
+  const h = runtime ? runtime.h : await harness();
+  if (runtime) h.store.claimTick = runtime.claimJob;
   h.manifest.reviewPolicy = { version: 1, profile: 'worker-command-maintainer-fallback-v1' };
   h.manifest.qodoIdentities = [{ userId: 4000, appId: 4001,
     appSlug: 'qodo-code-review', completion: 'github-submitted-review-v1' }];
@@ -29,6 +33,32 @@ async function optedIn() {
   h.store.recordReviewEvidence = async (_lease, input) => {
     h.state.proof = input; return { evidenceSource: input.source, nativeReviewId: input.reviewId };
   };
+  if (runtime) {
+    runtime.config.preflight = { ...runtime.config.preflight, version: 3,
+      purpose: 'first-run-startup', reviewProfile: h.manifest.reviewPolicy.profile,
+      checks: ['native_ingress', 'worker_credential_isolation', 'gateway_model_tools_usage',
+        'gateway_spend_limits', 'github_app_signing'] };
+    runtime.pin();
+    assert.doesNotThrow(() => authorizeRuntimeConfiguration(runtime.config, runtime.env));
+    h.startup = runtime;
+    h.model.config = { gateway: { baseURL: runtime.env.WORKER_MODEL_BASE_URL,
+      apiKey: runtime.env.WORKER_MODEL_TOKEN }, modelId: h.manifest.model.id,
+      reasoningEffort: h.manifest.model.reasoningEffort,
+      inputAdmission: h.manifest.model.inputAdmission };
+    const generate = h.model.sdk.generateText;
+    h.model.sdk.generateText = async options => {
+      const result = await generate(options);
+      result.response.body.usage = { input_tokens: result.usage.inputTokens,
+        output_tokens: result.usage.outputTokens };
+      return result;
+    };
+    h.dependencies.isEnabled = () => {
+      try {
+        authorizeRuntimeConfiguration(runtime.config, runtime.env);
+        return runtime.env.AGENT_WORKER_ENABLED === 'true';
+      } catch { return false; }
+    };
+  }
   const c = createCoordinator(h.dependencies);
   h.tick = () => c.advanceTick(delivery());
   for (let i = 0; h.state.run.state !== 'waiting_review' && i < 10; i++) {
@@ -97,3 +127,42 @@ test('uncertain dispatch stops safely with fixed diagnostics rather than reposti
   assert.equal(result.reviewDiagnostics.category, 'review_write_uncertain');
   assert.equal(h.state.humanReads ?? 0, 0);
 });
+
+for (const failure of ['missing review', 'stale review', 'moved head', 'uncertain command',
+  'failed CI', 'kill switch', 'expired startup', 'approval drift']) {
+  test(`first-run authorization cannot complete with ${failure}`, async () => {
+    const h = await optedIn(true);
+    if (failure === 'stale review') h.state.reviewReason = 'stale_review';
+    if (failure === 'moved head') {
+      h.state.reviewResult = { ...syntheticFutureReview(h.state), headSha: 'f'.repeat(40) };
+    }
+    if (failure === 'uncertain command') {
+      h.state.humanApproved = true;
+      h.state.dispatchFailure = { status: 'needs_attention', category: 'review_write_uncertain' };
+    }
+    if (failure === 'failed CI') {
+      h.state.checkStatus = 'needs_attention'; h.state.humanApproved = true;
+    }
+    if (failure === 'kill switch') h.startup.env.AGENT_WORKER_ENABLED = 'false';
+    if (failure === 'expired startup') h.startup.config.preflight.expiresAt = '2000-01-01T00:00:00Z';
+    if (failure === 'approval drift') h.state.approvalReason = 'readiness_label_missing';
+    assert.notEqual((await h.tick()).status, 'ready_for_human');
+    assert.equal(h.state.proof, null);
+    assert.notEqual(h.state.run.state, 'ready_for_human');
+  });
+}
+
+for (const source of ['maintainer', 'qodo']) {
+  test(`first-run mocked ${source} completion still needs dispatch and exact-head evidence`, async () => {
+    const h = await optedIn(true);
+    assert.equal(h.state.dispatches, 0);
+    assert.ok(h.state.publications.some(item => item.intent.kind === 'commit_create'));
+    if (source === 'maintainer') h.state.humanApproved = true;
+    else h.state.reviewResult = syntheticFutureReview(h.state);
+    assert.equal((await h.tick()).status, 'ready_for_human');
+    assert.equal(h.state.dispatches, 2);
+    assert.equal(h.state.proof.source, source);
+    assert.equal(h.state.proof.headSha, h.state.run.expectedHeadSha);
+    if (source === 'qodo') assert.equal(h.state.humanReads ?? 0, 0);
+  });
+}
