@@ -34,7 +34,8 @@ The packet includes:
 | Shutdown record | Disable further processing; record exact confirmed references, checks, interventions, usage and blockers without private text |
 
 Use the [runtime contract](agent-worker-runtime.md) to bind the real preflight evidence to its plan and credentials.
-Do not fill that record from unit-test fixtures or mark checks true merely because credentials exist.
+Version-3 first-run startup evidence covers infrastructure only; production acceptance still requires the separately gated command, exact-head review, current CI and human authorization path.
+Do not fill any record from unit-test fixtures or mark checks true merely because credentials exist.
 The existing Gateway count-route probe did not generate text and does not replace model/tool/spend preflight.
 
 ## Safe stop

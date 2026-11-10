@@ -51,11 +51,18 @@ The worker compares supplied pins; it never calculates its own expected approval
 - `gatewayBindingSha256` hashes canonical `{baseURL: WORKER_MODEL_BASE_URL, tokenSha256: sha256(WORKER_MODEL_TOKEN), model: manifest.model}`.
 - The complete config pin also binds the preflight record and its evidence hash.
 
+The model receives the approved patch paths and validated `pilotScope` as trusted structured system context.
+Byte limits apply to complete resulting UTF-8 file contents, not diff size or character count.
+Issue, file and tool data cannot alter them; the trusted patch validator still rejects oversize or out-of-scope changes.
+Generic adapters that omit `pilotScope` retain their existing path-only contract; they receive no invented numeric approval.
+Runtime worker contexts always supply the approved scope.
+
 The default supports the explicitly approved Sol/high `conservative-bytes-v1` model profile and opt-in GitHub submitted-review Qodo profile.
 The Gateway must be an HTTPS Neon AI host origin, without credentials, port, query, fragment or API suffix.
 Preflight timestamps must be valid and expire within four hours of the recorded check.
 
 The preflight record is an operator attestation.
+Startup readiness does not satisfy command dispatch, exact-head review, fresh CI, or human fallback requirements, and never makes a run ready for human review by itself.
 Hash checks verify its binding, not the truth of checks that have never run.
 Never create production evidence from mocked tests or credential presence.
 Live generation, App publication, draft/re-review and spend/isolation checks still need their separate approvals.
@@ -68,6 +75,13 @@ The first five existing checks stay required; replace `qodo_draft_review` and `q
 Old version-1 preflight cannot authorize this profile, even with refreshed hashes.
 Unknown fields/profiles fail closed, and maintainer evidence never satisfies Qodo-named checks.
 All attestations still need separate live approval and observed evidence.
+
+A version-3 preflight is a separate first-run-startup attestation, available only with that pinned review policy and valid coordinator/full Qodo App identities.
+It requires exactly `purpose: 'first-run-startup'` and the five infrastructure checks: `native_ingress`, `worker_credential_isolation`, `gateway_model_tools_usage`, `gateway_spend_limits`, and `github_app_signing`.
+Review acceptance remains unobserved, not passed; review checks, completion fields and any additional stage field are rejected.
+Startup checks remain bound to the full plan, manifest, database/Gateway credentials, evidence hash, and expiry.
+The attestation covers ticks of one bound issue/run lifecycle, with existing job/run uniqueness and fresh approval controls; it grants no authority for unrelated jobs or additional runs.
+Version 1 and version 2 retain their existing meanings and accepted check sets.
 
 Opt-in role attestation additionally requires the migrated `agent_worker.review_requests` table with SELECT, INSERT and UPDATE only.
 DELETE, TRUNCATE, REFERENCES and TRIGGER privileges remain forbidden.

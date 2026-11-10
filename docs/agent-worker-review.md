@@ -53,6 +53,7 @@ reviewPolicy: { version: 1, profile: 'worker-command-maintainer-fallback-v1' }
 
 Only the trusted deployed worker may post the literal `/agentic_review` command on its owned draft PR after its confirmed commit and fresh required CI.
 Coding assistants never post PR comments, and the model receives no posting tool.
+A startup version-3 preflight records only infrastructure readiness; it neither claims review acceptance nor substitutes for this command, exact-head Qodo evidence, or authenticated maintainer fallback.
 Contributor-wide Qodo settings stay unchanged.
 Existing Pull requests write permission covers the issue-comment endpoint; no Issues write or admin grant is added.
 
