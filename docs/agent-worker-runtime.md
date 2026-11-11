@@ -105,6 +105,10 @@ Fresh post-model authority checks have a separate 10-second window before the ei
 Publication admission requires at least eight seconds before its cutoff; the single provider call still has a 45-second ceiling.
 Model reservation SQL must settle before the model-admission cutoff, leaving 10 seconds for post-reservation authority checks and at least 30 seconds for the call.
 Only verified, pinned Git objects share a per-tick cache; approval, permissions, labels, issue content, head and write fences stay fresh.
+Independent policy sources load through at most four concurrent reads and retain canonical output order.
+Concurrent reads with compatible signals and deadlines share in-flight immutable Git objects, while each access still verifies repository metadata.
+A shorter or independently cancellable caller never owns another caller's transport; verified completed objects remain reusable.
+Closing the per-tick cache aborts its active read sessions; rejected reads leave no reusable failed entry.
 Uncertain database writes never authorize a compensating write.
 Current enablement, branch, config pins, credentials and preflight expiry are checked again before subsequent effects.
 Already accepted remote SQL/HTTP/model work may finish after local cancellation.
@@ -122,6 +126,8 @@ Run the wall-clock publication regression in separate fresh containers:
 ```sh
 MELLON_PUBLICATION_DEADLINE_CASE=baseline npm run test:worker:runtime:db
 MELLON_PUBLICATION_DEADLINE_CASE=green npm run test:worker:runtime:db
+MELLON_PUBLICATION_DEADLINE_CASE=readiness-baseline npm run test:worker:runtime:db
+MELLON_PUBLICATION_DEADLINE_CASE=readiness npm run test:worker:runtime:db
 ```
 
 `tests/manual/agent-worker-publication-deadline-runtime.mjs` restores every baseline source from public pre-change revision `1c08180084dac9807a031bcc61b3c97435c868eb` and exercises the production Function entry, actual SQL ledger and installed Responses SDK.
@@ -129,6 +135,9 @@ The green case covers regression publication, authenticated native-shaped RED/GR
 Run `MELLON_PUBLICATION_DEADLINE_CASE=source-pin node --test tests/manual/agent-worker-publication-deadline-runtime.mjs` to check every restored source against that revision without running PostgreSQL or the 90-second baseline.
 Both cases retain all three runner-marker probes.
 Latency uses real waits of 4,500ms for startup, 770ms per trusted policy blob and 30,713ms for the profiled model response.
+The readiness baseline restores source from `41f6fcce37405829e9645e68e99c0f2e61634bef` and reproduces admission expiry without a model reservation.
+Both readiness cases delay every mocked GitHub request by 100ms, including later ticks, and apply startup and model-response delays to every relevant invocation.
+Its complete multi-tick test process may run for 300 seconds; each production tick still has its unchanged 90-second ceiling.
 PostgreSQL and JavaScript use their unchanged clocks.
 The local test substitutes App authority and allows plaintext only after the real catalog query; external HTTP responses and review records remain mocked.
 It proves no live Gateway, App, CI or review behavior.

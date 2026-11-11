@@ -62,6 +62,36 @@ test('loads only hash-pinned trusted policy, rules, skills, and guidance', async
   assert.equal(result.sources.guidance.sha256, manifest.trustedSources.guidance.hash);
 });
 
+test('policy source reads use four bounded lanes and retain canonical output order', async () => {
+  const { manifest, files } = await fixture();
+  const releases = [];
+  let active = 0, peak = 0, released = false;
+  const pending = loadPolicy(manifest, { async readTrustedFile(path) {
+    active += 1;
+    peak = Math.max(peak, active);
+    try {
+      if (!released) await new Promise(resolve => releases.push(resolve));
+      return files.get(path);
+    } finally { active -= 1; }
+  } });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(active, 4);
+    assert.equal(peak, 4);
+  } finally {
+    released = true;
+    for (const release of releases) release();
+    await pending;
+  }
+  const result = await pending;
+  assert.equal(active, 0);
+  assert.equal(peak, 4);
+  assert.deepEqual(result.skills.map(skill => skill.name), trusted.skills.map(skill => skill.name));
+  assert.deepEqual(result.skills.flatMap(skill => skill.references.map(ref => ref.path)),
+    trusted.skills.flatMap(skill => skill.references.map(ref => ref.path)));
+  assert.equal(result.systemPolicy, files.get(trusted.policy.path));
+});
+
 test('rejects missing or changed project rules and every changed trusted source', async () => {
   const { manifest, files } = await fixture();
   files.delete(trusted.projectRules.path);

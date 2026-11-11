@@ -15,18 +15,20 @@ import { blob, POLICY, PATH } from '../fixtures/worker-candidates/inputs.mjs';
 import { runtimePostgres } from '../support/agent-worker-runtime-postgres-context.mjs';
 
 const CASE = process.env.MELLON_PUBLICATION_DEADLINE_CASE;
-const LATENCY = Object.freeze({ startupMs: 4500, policyBlobMs: 770, modelMs: 30713 });
+const READINESS_CASE = ['readiness', 'readiness-baseline'].includes(CASE);
+const LATENCY = Object.freeze({ startupMs: 4500, policyBlobMs: 770, modelMs: 30713,
+  githubRequestMs: READINESS_CASE ? 100 : 0 });
 const BASELINE_REVISION = '1c08180084dac9807a031bcc61b3c97435c868eb';
 
-async function baselineEntry() {
+async function baselineEntry(revision = BASELINE_REVISION) {
   const directory = join(tmpdir(), `mellon-publication-baseline-${randomUUID()}`);
   mkdirSync(directory, { recursive: true });
   symlinkSync(resolve('node_modules'), join(directory, 'node_modules'), 'dir');
   // Restore every tracked source, including the runtime and all publication dependencies.
-  const paths = execFileSync('git', ['ls-tree', '-r', '--name-only', BASELINE_REVISION, '--', 'src'], { encoding: 'utf8' }).trim().split('\n');
+  const paths = execFileSync('git', ['ls-tree', '-r', '--name-only', revision, '--', 'src'], { encoding: 'utf8' }).trim().split('\n');
   for (const path of paths) {
     mkdirSync(dirname(join(directory, path)), { recursive: true });
-    writeFileSync(join(directory, path), execFileSync('git', ['show', `${BASELINE_REVISION}:${path}`]));
+    writeFileSync(join(directory, path), execFileSync('git', ['show', `${revision}:${path}`]));
   }
   if (CASE === 'source-pin') {
     const revision = '1c08180084dac9807a031bcc61b3c97435c868eb';
@@ -88,7 +90,7 @@ async function runtimeHarness({ entry = createProductionWorkerFunction, profile 
         changes: [{ operation: 'create', path: testing ? PATH : 'src/parser.mjs', content: testing
           ? "import test from 'node:test';\nimport assert from 'node:assert/strict';\n\ntest('approved regression location', () => {\n  assert.equal(1, 2);\n});\n"
           : 'export const fixed = true;\n' }] };
-      if (metrics.profileActive) await delay(LATENCY.modelMs);
+      if (metrics.profileActive || READINESS_CASE) await delay(LATENCY.modelMs);
       metrics.modelEnd = Date.now();
       return Response.json({ id: `resp_${metrics.modelRequests}`, object: 'response', model: f.config.manifest.model.id,
         output: [{ id: 'fc_1', type: 'function_call', call_id: 'call_1', name: 'proposeChanges',
@@ -97,11 +99,12 @@ async function runtimeHarness({ entry = createProductionWorkerFunction, profile 
           output_tokens_details: { reasoning_tokens: 25 } } });
     }
     assert.equal(target.origin, 'https://api.github.com');
+    if (LATENCY.githubRequestMs) await delay(LATENCY.githubRequestMs);
     if (target.pathname === '/apps/qodo-code-review') return Response.json({
       id: f.config.manifest.qodoIdentities[0].appId, slug: f.config.manifest.qodoIdentities[0].appSlug });
     if (decodeURIComponent(target.pathname) === `/users/${f.config.manifest.qodoIdentities[0].appSlug}[bot]`) return Response.json({
       id: f.config.manifest.qodoIdentities[0].userId, login: `${f.config.manifest.qodoIdentities[0].appSlug}[bot]`, type: 'Bot' });
-    if (metrics.profileActive && target.pathname.includes('/git/blobs/')
+    if ((metrics.profileActive || READINESS_CASE) && target.pathname.includes('/git/blobs/')
       && policyBlobs.has(target.pathname.split('/').at(-1))) await delay(LATENCY.policyBlobMs);
     return transport.fetch(url, options);
   };
@@ -116,7 +119,7 @@ async function runtimeHarness({ entry = createProductionWorkerFunction, profile 
         async verifyRole(options) {
           // Docker has no TLS. Execute the real catalog query, then allow only this local transport exception.
           await runtimePostgres.verifyLocalRole(database, options);
-          if (metrics.profileActive) await delay(LATENCY.startupMs);
+          if (metrics.profileActive || READINESS_CASE) await delay(LATENCY.startupMs);
         },
         async close() { metrics.closes.push(Date.now()); await database.close(); },
       };
@@ -176,9 +179,9 @@ async function runtimeHarness({ entry = createProductionWorkerFunction, profile 
   function receipt(name, extra = {}) {
     console.log(JSON.stringify({ case: name, latencyAssumptions: LATENCY, statuses: metrics.statuses,
       modelRequests: metrics.modelRequests, reservations: metrics.reservations, outcomes: metrics.outcomes,
-      elapsedToModelMs: metrics.profileStart === null ? null : metrics.modelStart - metrics.profileStart,
-      elapsedModelMs: metrics.modelEnd - metrics.modelStart,
-      elapsedToIntentMs: metrics.profileStart === null ? null : metrics.intentAt - metrics.profileStart,
+      elapsedToModelMs: metrics.profileStart === null || metrics.modelStart === null ? null : metrics.modelStart - metrics.profileStart,
+      elapsedModelMs: metrics.modelEnd === null || metrics.modelStart === null ? null : metrics.modelEnd - metrics.modelStart,
+      elapsedToIntentMs: metrics.profileStart === null || metrics.intentAt === null ? null : metrics.intentAt - metrics.profileStart,
       http: metrics.http, profiledHttp: metrics.profiledHttp, lateDatabaseStarts: metrics.lateDatabaseStarts,
       reports, mutations: transport.state.mutations, ...extra }));
   }
@@ -206,7 +209,21 @@ if (CASE === 'baseline') test('untouched production baseline exposes the outer r
   assert.equal(h.transport.state.mutations.length, 0);
 });
 
-if (CASE === 'green') {
+if (CASE === 'readiness-baseline') test('pre-repair production entry reproduces admission expiry without a model reservation', async () => {
+  const h = await runtimeHarness({ entry: await baselineEntry('41f6fcce37405829e9645e68e99c0f2e61634bef'), profile: true });
+  assert.deepEqual(await h.tick(), { status: 200, body: { status: 'advanced' } });
+  const response = await h.tick();
+  const { run, operations } = await h.ledger();
+  h.receipt('readiness-baseline', { publicStatus: response, state: run.state,
+    blocker: run.blocker_code, operations });
+  assert.deepEqual(response, { status: 200, body: { status: 'needs_attention' } });
+  assert.equal(run.blocker_code, 'recovery_deadline');
+  assert.equal(h.metrics.modelRequests, 0);
+  assert.equal(h.metrics.reservations, 0);
+  assert.equal(operations.length, 0);
+  assert.equal(h.transport.state.mutations.length, 0);
+});
+if (CASE === 'green' || CASE === 'readiness') {
   test('production entry completes the SQL SDK RED GREEN draft and exact head review lifecycle', async () => {
     const h = await runtimeHarness({ profile: true });
     for (let index = 0; index < 2; index += 1) assert.deepEqual(await h.tick(), { status: 200, body: { status: 'advanced' } });
@@ -239,11 +256,13 @@ if (CASE === 'green') {
       && call.temperature === undefined && call.maxOutputTokens <= 2000));
     assert.equal(h.metrics.lateDatabaseStarts, 0);
     assert.deepEqual(h.transport.state.mutations, ['branch', 'commit', 'commit', 'draft']);
-    h.receipt('green', { state: run.state, operations, profiledHttp: profiled,
+    h.receipt(CASE === 'readiness' ? 'readiness' : 'green', { state: run.state, operations, profiledHttp: profiled,
       elapsedToModelMs: modelStart - h.metrics.profileStart, elapsedModelMs: modelEnd - modelStart,
       elapsedToIntentMs: intentAt - h.metrics.profileStart });
   });
 
+}
+if (CASE === 'green') {
   test('publication expiry finalizes known partial work before closing the SQL pool and ignores late transport', async () => {
     const h = await runtimeHarness({ stall: true });
     assert.deepEqual(await h.tick(), { status: 200, body: { status: 'advanced' } });

@@ -36,6 +36,7 @@ const PINNED_HASHES = new Map([
   ['automation/policy/skills/systematic-debugging/condition-based-waiting.md', 'e89fec8400d6cd50f43407cec9fab50976ba4d55d0ec2eb51c0bd68036b54c26'],
 ]);
 const MAX_SOURCE_BYTES = 128 * 1024;
+const MAX_SOURCE_READS = 4;
 
 function fail(reason) {
   throw new Error(reason);
@@ -65,6 +66,19 @@ async function loadSource(source, dependencies) {
   return { content, sha256: actualHash, path: source.path };
 }
 
+async function loadSources(sources, dependencies) {
+  const loaded = new Array(sources.length);
+  let next = 0, failed = false;
+  await Promise.all(Array.from({ length: Math.min(MAX_SOURCE_READS, sources.length) }, async () => {
+    while (!failed && next < sources.length) {
+      const index = next++;
+      try { loaded[index] = await loadSource(sources[index], dependencies); }
+      catch (error) { failed = true; throw error; }
+    }
+  }));
+  return loaded;
+}
+
 export async function loadPolicy(manifest, dependencies) {
   if (manifest === undefined || manifest === null) return { enabled: false, reason: 'manifest_missing' };
   if (manifest.enabled !== true) return { enabled: false, reason: 'disabled' };
@@ -88,17 +102,16 @@ export async function loadPolicy(manifest, dependencies) {
   }
   if (REQUIRED_SKILLS.some(name => !byName.has(name))) fail('unapproved trusted source');
 
-  const policy = await loadSource(sources.policy, dependencies);
-  const projectRules = await loadSource(sources.projectRules, dependencies);
-  const documentationGuidance = await loadSource(sources.guidance, dependencies);
-  const skills = [];
-  for (const name of REQUIRED_SKILLS) {
-    const source = byName.get(name);
-    const loaded = await loadSource(source, dependencies);
-    const references = [];
-    for (const reference of source.references) references.push(await loadSource(reference, dependencies));
-    skills.push({ name, content: loaded.content, sha256: loaded.sha256, path: loaded.path, references });
-  }
+  const orderedSkills = REQUIRED_SKILLS.map(name => byName.get(name));
+  const loaded = await loadSources([sources.policy, sources.projectRules, sources.guidance,
+    ...orderedSkills.flatMap(skill => [skill, ...skill.references])], dependencies);
+  const [policy, projectRules, documentationGuidance] = loaded;
+  let index = 3;
+  const skills = orderedSkills.map(source => {
+    const skill = loaded[index++];
+    const references = source.references.map(() => loaded[index++]);
+    return { name: source.name, content: skill.content, sha256: skill.sha256, path: skill.path, references };
+  });
   return {
     status: 'loaded',
     pilot: { repository: manifest.pilot.repository, issueNumber: manifest.pilot.issueNumber },

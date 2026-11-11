@@ -58,8 +58,11 @@ try {
   try { await mark.query('INSERT INTO mellon_test_guard.runs (token) VALUES ($1)', [runId]); }
   finally { await mark.end(); }
   phase = `${suite} integration suite`;
+  // The opt-in readiness case waits on every mock request across multiple 90-second ticks.
+  const suiteTimeoutMs = suite === 'runtime' && process.env.MELLON_PUBLICATION_DEADLINE_CASE === 'readiness'
+    ? 300000 : 120000;
   const result = spawnSync('node', ['--test', '--test-concurrency=1', suiteFiles[suite]], {
-    encoding: 'utf8', timeout: 120000,
+    encoding: 'utf8', timeout: suiteTimeoutMs,
     env: { ...process.env, AGENT_INTAKE_TEST_DATABASE_URL: url, AGENT_INTAKE_TEST_RUN_ID: runId, AGENT_INTAKE_GUARD_PROBE: '0' },
   });
   const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.replaceAll(url, '[TEST DATABASE]').replaceAll(password, '[REDACTED]').replaceAll(runId, '[RUN MARKER]');
