@@ -303,7 +303,7 @@ function raceAbort(promise, controller, timeoutMs) {
 /** Creates a single-tick adapter; authorization binds its callbacks to a durable lease. */
 export function createAgentWorker({
   config, sdk, authorization, loadContext, tokenizer, validateChanges: validate = validateChanges,
-  readFile, now = Date.now, timeoutMs = 45_000,
+  readFile, now = Date.now, timeoutMs = 45_000, deadline = Infinity,
 } = {}) {
   let url;
   try { url = new URL(config?.gateway?.baseURL); } catch { failConfig(); }
@@ -320,7 +320,8 @@ export function createAgentWorker({
     || !authorization || typeof authorization.recheck !== 'function'
     || typeof authorization.reserveModelCall !== 'function' || typeof authorization.recordModelCallOutcome !== 'function'
     || typeof loadContext !== 'function' || typeof validate !== 'function'
-    || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 45_000) failConfig();
+    || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 45_000
+    || deadline !== Infinity && !Number.isSafeInteger(deadline)) failConfig();
   const trustedConfig = deepCloneFreeze(config);
   const isSol = trustedConfig.modelId === SOL_MODEL_ID;
   const renderer = isSol ? SOL_RENDERER : CHAT_RENDERER;
@@ -361,6 +362,7 @@ export function createAgentWorker({
         return normalized.blockerCode ? stopped(normalized.blockerCode) : null;
       };
       try {
+        if (now() >= deadline) return stopped('deadline');
         if (request != null && !exactKeys(request, [])) return stopped('invalid_request');
         if (await authorization.recheck() !== true) return stopped('approval_unavailable');
         const context = deepCloneFreeze(await loadContext());
@@ -495,7 +497,7 @@ export function createAgentWorker({
           || !Number.isSafeInteger(reservation.inputTokens) || reservation.inputTokens < inputTokens
           || !Number.isSafeInteger(reservation.outputTokens) || reservation.outputTokens <= 0 || reservation.outputTokens > MAX_OUTPUT_TOKENS
           || typeof reservation.deadlineAt !== 'string' || !Number.isFinite(Date.parse(reservation.deadlineAt))) return stopped('model_reservation_unavailable');
-        state.deadline = Math.min(now() + timeoutMs, Date.parse(reservation.deadlineAt));
+        state.deadline = Math.min(now() + timeoutMs, Date.parse(reservation.deadlineAt), deadline);
         if (await authorization.recheck() !== true || now() >= state.deadline) {
           return await persist({ outcome: 'deadline' }) ?? stopped('model_call_deadline');
         }

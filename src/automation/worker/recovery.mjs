@@ -7,9 +7,20 @@ import {
 
 const DATABASE_UNCERTAIN = 'recovery_database_uncertain';
 const LEASE_LOST = 'recovery_lease_lost';
+const PUBLICATION_FAILURES = new Set(['approval_denied', 'approval_unavailable',
+  'branch_absent', 'branch_head_mismatch', 'branch_history_limit', 'branch_history_untrusted',
+  'branch_identity_mismatch', 'branch_moved', 'branch_read_failed', 'branch_write_not_observed',
+  'commit_metadata_invalid', 'commit_write_not_observed', 'commit_write_unconfirmed',
+  'fence_denied', 'fence_unavailable', 'invalid_input', 'patch_rejected',
+  'publication_context_invalid', 'publication_context_unavailable',
+  'pr_context_unavailable', 'pr_template_unverified', 'pr_evidence_invalid',
+  'pr_evidence_incomplete', 'pr_identity_ambiguous', 'pr_identity_mismatch',
+  'pr_write_not_observed', 'pr_write_unconfirmed', 'pr_publication_failed',
+  'repository_identity_mismatch', 'repository_read_failed', 'signing_preflight_expired',
+  'tree_incomplete', 'unsupported_file_mode']);
 
 export function createRecoveryCoordinator({ store, publicationDependencies,
-  timeoutMs = DEFAULT_RECOVERY_TIMEOUT_MS }) {
+  timeoutMs = DEFAULT_RECOVERY_TIMEOUT_MS, finalizationDeadline }) {
   validateWaitTimeout(timeoutMs, DEFAULT_RECOVERY_TIMEOUT_MS);
   if (!store || !['getRun', 'putIntent', 'fenceIntent', 'confirmIntent', 'finishRun']
     .every(method => typeof store[method] === 'function')) {
@@ -17,6 +28,7 @@ export function createRecoveryCoordinator({ store, publicationDependencies,
   }
 
   async function recover(input, budget) {
+    let ledgerDeadline = Math.min(finalizationDeadline ?? budget.deadline, budget.deadline);
     let lease;
     let intent;
     let publication;
@@ -35,11 +47,25 @@ export function createRecoveryCoordinator({ store, publicationDependencies,
       }
     }
 
-    async function attention(reason) {
+    async function attention(reason, effectCategory) {
       let persisted = false;
       if (databaseUncertain || activeDatabase > 0) reason = DATABASE_UNCERTAIN;
-      if (budget.isExpired()) return Object.freeze({ status: 'needs_attention',
-        reason: reason === DATABASE_UNCERTAIN ? reason : 'recovery_deadline', persisted });
+      if (budget.isExpired()) {
+        if (reason === LEASE_LOST) return Object.freeze({ status: 'needs_attention', reason, persisted });
+        if (reason !== DATABASE_UNCERTAIN) reason = 'recovery_deadline';
+        // Only this recovery knows whether its database work settled before expiry.
+        if (lease && reason !== DATABASE_UNCERTAIN && activeDatabase === 0
+          && Number.isSafeInteger(finalizationDeadline) && Number.isSafeInteger(ledgerDeadline)
+          && ledgerDeadline > Date.now()) {
+          const finalization = createWaitDeadline(ledgerDeadline - Date.now(), ledgerDeadline);
+          try {
+            persisted = await finalization.wait(() => store.finishRun(lease, 'needs_attention',
+              { blockerCode: reason }, { deadline: finalization.deadline }));
+          } catch { reason = DATABASE_UNCERTAIN; }
+          finally { finalization.close(); }
+        }
+        return Object.freeze({ status: 'needs_attention', reason, persisted });
+      }
       // An uncertain transaction is not permission to issue another write.
       if (lease && reason !== DATABASE_UNCERTAIN && reason !== LEASE_LOST) {
         try {
@@ -50,13 +76,15 @@ export function createRecoveryCoordinator({ store, publicationDependencies,
             persisted: false });
         }
       }
-      return Object.freeze({ status: 'needs_attention', reason, persisted });
+      return Object.freeze({ status: 'needs_attention', reason, persisted,
+        ...(PUBLICATION_FAILURES.has(effectCategory) ? { effectCategory } : {}) });
     }
 
     try {
       budget.clamp(input?.deadline);
       lease = validateLease(input?.lease);
       budget.clamp(Date.parse(lease.expiresAt));
+      ledgerDeadline = Math.min(ledgerDeadline, Date.parse(lease.expiresAt));
       intent = validateIntent(input?.intent);
       if (!['commit_create', 'pr_create'].includes(intent.kind)) {
         return attention('recovery_unsupported_effect');
@@ -81,7 +109,10 @@ export function createRecoveryCoordinator({ store, publicationDependencies,
     try {
       const run = await database(options => store.getRun(lease.runId, options));
       for (const deadline of [run?.tickDeadlineAt, run?.runDeadlineAt, run?.leaseExpiresAt]) {
-        if (deadline !== null && deadline !== undefined) budget.clamp(Date.parse(deadline));
+        if (deadline !== null && deadline !== undefined) {
+          budget.clamp(Date.parse(deadline));
+          ledgerDeadline = Math.min(ledgerDeadline, Date.parse(deadline));
+        }
       }
       if (!run || run.manifestHash !== publication.run.manifestSha256
           || run.baseRevision !== publication.run.baseSha
@@ -118,6 +149,7 @@ export function createRecoveryCoordinator({ store, publicationDependencies,
       ...publicationDependencies,
       timeoutMs: Math.max(1, Math.min(publicationDependencies?.timeoutMs ?? 20000,
         budget.deadline - Date.now())),
+      deadline: budget.deadline,
       fetch: (url, options) => budget.wait(() => publicationDependencies.fetch(url, {
         ...options, signal: AbortSignal.any([budget.signal, options.signal]),
       })),
@@ -170,7 +202,7 @@ export function createRecoveryCoordinator({ store, publicationDependencies,
     if (fenceReason) return attention(fenceReason);
     if (result.status !== 'confirmed') {
       return attention(result.reason?.startsWith('approval_')
-        ? 'recovery_approval_denied' : 'recovery_effect_unconfirmed');
+        ? 'recovery_approval_denied' : 'recovery_effect_unconfirmed', result.reason);
     }
     try {
       const proof = validatePublicationProof(result, lease, intent);

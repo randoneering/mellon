@@ -184,6 +184,30 @@ export function createRepositoryReader(configuration = {}) {
       return await operation(session);
     } catch { fail(); } finally { session?.close(); }
   }
+  async function readTrustedFile(request, cache) {
+    const { revision, path, deadline, signal } = request;
+    if (revision !== config.policyRevision || !trusted.has(path) || cache?.closed) fail();
+    return read({ deadline, signal }, async session => {
+      if (cache?.closed) fail();
+      const identity = canonical({ repositoryId: config.repositoryId, revision, tokenScope: hash(config.token) });
+      const treeKey = `${identity}:tree`;
+      let tree = cache?.trees.get(treeKey);
+      if (!tree) {
+        tree = await treeAt(session, revision);
+        if (cache?.closed || session.budget.isExpired()) fail();
+        cache?.trees.set(treeKey, tree);
+      }
+      const entry = tree.get(path);
+      if (entry?.mode !== '100644') fail();
+      const sourceKey = canonical({ identity, path, sha256: trusted.get(path), blobSha: entry.sha });
+      if (cache?.files.has(sourceKey)) return cache.files.get(sourceKey);
+      const text = await textBlob(session, entry.sha, 128 * 1024);
+      if (hash(text) !== trusted.get(path)) fail();
+      if (cache?.closed || session.budget.isExpired()) fail();
+      cache?.files.set(sourceKey, text);
+      return text;
+    });
+  }
   return Object.freeze({
     async readIssue({ manifest, deadline, signal }) {
       try { manifest = structuredClone(manifest); } catch { fail(); }
@@ -203,15 +227,11 @@ export function createRepositoryReader(configuration = {}) {
       try { allowedPaths = structuredClone(allowedPaths); } catch { fail(); }
       return read({ deadline, signal }, async session => (await prepared(session, revision, allowedPaths)).files);
     },
-    async readTrustedFile({ revision, path, deadline, signal }) {
-      if (revision !== config.policyRevision || !trusted.has(path)) fail();
-      return read({ deadline, signal }, async session => {
-        const tree = await treeAt(session, revision);
-        const entry = tree.get(path);
-        if (entry?.mode !== '100644') fail();
-        const text = await textBlob(session, entry.sha, 128 * 1024);
-        if (hash(text) !== trusted.get(path)) fail();
-        return text;
+    async readTrustedFile(request) { return readTrustedFile(request, null); },
+    createTrustedReadSession() {
+      const cache = { trees: new Map(), files: new Map(), closed: false };
+      return Object.freeze({ readTrustedFile: request => readTrustedFile(request, cache),
+        close() { cache.closed = true; cache.trees.clear(); cache.files.clear(); },
       });
     },
     async reconstructCandidate({ publication, metadata, deadline, signal }) {

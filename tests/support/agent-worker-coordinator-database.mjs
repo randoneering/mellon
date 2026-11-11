@@ -13,6 +13,13 @@ import { controlledTransport, hash, canonical } from '../fixtures/worker-coordin
 
 export const ROLE = 'coordinator_test_runtime';
 export const available = Boolean(process.env.AGENT_INTAKE_TEST_DATABASE_URL && process.env.AGENT_INTAKE_TEST_RUN_ID);
+const TICK_DEADLINE_MS = 90_000;
+const MODEL_CEILING_MS = 45_000;
+const MODEL_MINIMUM_MS = 30_000;
+const POST_RESERVATION_AUTH_MS = 10_000;
+const MODEL_OUTCOME_WINDOW_MS = 5_000;
+const PUBLICATION_WINDOW_MS = 8_000;
+const FINALIZATION_GRACE_MS = 10_000;
 let initialization;
 let password;
 let sequence = 80000;
@@ -99,13 +106,40 @@ export async function setupCoordinator(options = {}) {
       job.issueId, job.issueNumber, job.actorId, randomUUID()]);
     const transport = await controlledTransport(job);
     options.configure?.(transport);
-    const control = { method: null, fault: null, calls: [], writes: [], lastClaim: null };
+    const control = { method: null, fault: null, calls: [], writes: [], lastClaim: null,
+      tickStartedAt: null, recoveryActive: false };
     let actualStore = createWorkerStore(faultPool(runtime, control));
     const store = Object.fromEntries(Object.keys(actualStore).map(name => [name, async (...args) => {
       control.method = name; control.phase = name === 'fenceIntent' ? args[2] : null;
       const change = ['checkpoint', 'beginRepair'].includes(name) ? args[1] : name === 'finishRun' ? args[2] : null;
-      control.calls.push({ name, deadline: args.at(-1)?.deadline,
-        expectedDeadline: control.lastClaim?.deadline,
+      const effectiveDeadline = Math.min(control.lastClaim?.deadline ?? Infinity,
+        (control.tickStartedAt ?? Date.now()) + TICK_DEADLINE_MS);
+      const publicationDeadline = effectiveDeadline - FINALIZATION_GRACE_MS;
+      const outcomeDeadline = publicationDeadline - PUBLICATION_WINDOW_MS;
+      const modelDeadline = outcomeDeadline - MODEL_OUTCOME_WINDOW_MS;
+      const modelAdmissionDeadline = modelDeadline - MODEL_MINIMUM_MS - POST_RESERVATION_AUTH_MS;
+      const postReservationDeadline = modelDeadline - MODEL_MINIMUM_MS;
+      const publisherDeadline = Math.min(publicationDeadline,
+        (transport.state.publisherBudgetStartedAt ?? Infinity)
+          + transport.publicationDependencies.timeoutMs);
+      const requestedDeadline = args.at(-1)?.deadline;
+      // Snapshot reads occur in authorization, publication, and finalization.
+      // Each accepted cutoff is derived independently from the tick, never from a response.
+      const snapshotDeadlines = [effectiveDeadline, publicationDeadline,
+        modelAdmissionDeadline, postReservationDeadline];
+      const expectedSnapshotDeadline = snapshotDeadlines.find(value => value === requestedDeadline)
+        ?? effectiveDeadline;
+      const expectedDeadline = name === 'claimTick' ? (control.tickStartedAt ?? Date.now()) + TICK_DEADLINE_MS
+        : name === 'reserveModelCall' ? postReservationDeadline
+          : name === 'recordModelCallOutcome' ? outcomeDeadline
+            : name === 'getCoordinatorSnapshot' ? expectedSnapshotDeadline
+              : ['getRun', 'putIntent'].includes(name) ? publicationDeadline
+              : ['fenceIntent', 'confirmIntent'].includes(name) ? publisherDeadline : effectiveDeadline;
+      if (requestedDeadline !== undefined && !Number.isFinite(requestedDeadline)) {
+        throw new Error('Coordinator fixture received an invalid deadline.');
+      }
+      control.calls.push({ name, deadline: requestedDeadline,
+        expectedDeadline,
         evidence: change?.evidence ? structuredClone(change.evidence) : null,
         terminalState: name === 'finishRun' ? args[1] : null,
         change: ['checkpoint', 'beginRepair'].includes(name) ? structuredClone(args[1]) : null });
@@ -113,9 +147,13 @@ export async function setupCoordinator(options = {}) {
         if (control.beforeStore) await control.beforeStore(name, args);
         const value = await actualStore[name](...args);
         if (name === 'claimTick' && value.status === 'claimed') {
-          control.lastClaim = value; transport.state.runId = value.lease.runId;
+          control.lastClaim = value;
+          control.recoveryActive = false;
+          transport.state.runId = value.lease.runId;
           if (!ids.includes(value.lease.runId)) ids.push(value.lease.runId);
         }
+        if (name === 'getRun') control.recoveryActive = true;
+        if (name === 'confirmIntent' || name === 'finishRun') control.recoveryActive = false;
         if (name === 'getCoordinatorSnapshot' && value.status === 'owned') {
           transport.state.phase = value.phase; transport.state.selected = value.phase?.expectedRegression;
         }
@@ -140,11 +178,17 @@ export async function setupCoordinator(options = {}) {
             const result = context.state.review === 'waiting' ? { status: 'waiting' } : context.syntheticFutureReview();
             await context.afterFutureReview?.(result); return result;
           } } } : {}) } };
-        const coordinator = createCoordinator(dependencies);
         context.handle = createWorkerFunction({ env: environment,
           trustedConfig: { productionBranch: 'production', triggerId: 'trusted-trigger', databaseRole: ROLE },
           verifyNativeRequest: async () => context.native, authorizeRuntime: async () => context.activation,
-          advanceTick: async delivery => { const result = await coordinator.advanceTick(delivery); context.results.push(result); return result; }, report: line => context.reports.push(line) });
+          advanceTick: async delivery => {
+            control.tickStartedAt = Date.now();
+            const coordinator = createCoordinator({ ...dependencies,
+              deadline: control.tickStartedAt + TICK_DEADLINE_MS });
+            const result = await coordinator.advanceTick(delivery);
+            context.results.push(result);
+            return result;
+          }, report: line => context.reports.push(line) });
       },
       observeChecks(afterRead) {
         // Await the actual parser/authenticator, then control only result delivery timing.

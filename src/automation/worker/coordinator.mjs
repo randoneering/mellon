@@ -30,6 +30,14 @@ const ID = /^[A-Za-z0-9_-]{1,128}$/;
 const REVOCATIONS = new Set(['readiness_label_missing', 'approver_permission_missing', 'issue_not_open']);
 const MODEL_STATES = new Set(['generating_tests', 'implementing', 'repairing']);
 const WAIT_STATES = new Set(['waiting_red_ci', 'waiting_ci', 'waiting_review']);
+const MODEL_CALL_CEILING_MS = 45_000;
+const MIN_MODEL_WINDOW_MS = 30_000;
+const POST_RESERVATION_AUTH_MS = 10_000;
+const MODEL_OUTCOME_WINDOW_MS = 5_000;
+const POST_MODEL_AUTH_MS = 10_000;
+const PUBLICATION_WINDOW_MS = 8_000;
+const PUBLICATION_ADMISSION_MS = 8_000;
+const FINALIZATION_GRACE_MS = 10_000;
 const PHASE_FIELDS = ['version', 'purpose', 'key', 'repairCycle', 'headSha', 'findingSha256',
   'expectedRegression', 'criterionSha256', 'findingSource', 'findingHeadSha', 'priorCheckRunId', 'priorReviewId'];
 const result = (status, reason, persisted = false, diagnostics, reviewDiagnostics) => Object.freeze({ status,
@@ -157,6 +165,7 @@ export function createCoordinator(dependencies = {}) {
       || !SHA256.test(dependencies.expectedManifestSha256 ?? '')
       || hash(canonical(manifest)) !== dependencies.expectedManifestSha256
       || !ID.test(triggerId ?? '') || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 90000
+      || dependencies.deadline !== undefined && !Number.isSafeInteger(dependencies.deadline)
       || typeof readToken !== 'string' || !readToken.length || typeof fetch !== 'function'
       || policyManifest?.enabled !== true || policyManifest.pilot?.repository !== manifest.repository.name
       || policyManifest.pilot.issueNumber !== manifest.issue.number
@@ -208,19 +217,60 @@ export function createCoordinator(dependencies = {}) {
   });
 
   async function advanceTick(delivery) {
-    const budget = createWaitDeadline(timeoutMs);
-    let lease, claimedDeadline, snapshot, terminalResult, databaseUncertain = false, agentDiagnostics = null, reviewDiagnostics;
-    async function database(operation) {
-      if (databaseUncertain || terminalResult) stop('recovery_database_uncertain');
-      try {
-        return await budget.wait(() => operation({ deadline: claimedDeadline ?? budget.deadline }));
-      } catch {
-        databaseUncertain = true;
-        stop('recovery_database_uncertain');
+    const budget = createWaitDeadline(timeoutMs, dependencies.deadline ?? Infinity);
+    const trustedFileSession = typeof repository.createTrustedReadSession === 'function'
+      ? repository.createTrustedReadSession() : null;
+    let lease, claimedDeadline, finalizationDeadline, publicationDeadline, outcomeDeadline,
+      modelDeadline, modelAdmissionDeadline, snapshot, terminalResult, databaseUncertain = false,
+      agentDiagnostics = null, reviewDiagnostics, modelUsage = null, modelOperationId = null,
+      knownIntent = null, stageFailure = null, activeDatabaseWrites = 0;
+    function checkDeadline(deadline) {
+      if (!Number.isSafeInteger(deadline) || Date.now() >= deadline) {
+        stageFailure = new Stop('recovery_deadline');
+        throw stageFailure;
       }
     }
-    async function owned() {
-      const value = await database(options => store.getCoordinatorSnapshot(lease, options));
+    async function waitUntil(deadline, operation) {
+      checkDeadline(deadline);
+      const stage = createWaitDeadline(Math.max(1, deadline - Date.now()), deadline);
+      const abortStage = () => stage.close();
+      budget.signal.addEventListener('abort', abortStage, { once: true });
+      try { return await stage.wait(operation); }
+      catch (error) {
+        if (stage.isExpired()) {
+          if (deadline === finalizationDeadline) budget.close();
+          stageFailure = new Stop('recovery_deadline');
+          throw stageFailure;
+        }
+        throw error;
+      } finally { budget.signal.removeEventListener('abort', abortStage); stage.close(); }
+    }
+    async function database(operation, deadline = finalizationDeadline ?? budget.deadline,
+      { readOnly = false } = {}) {
+      if (databaseUncertain || terminalResult) stop('recovery_database_uncertain');
+      checkDeadline(deadline);
+      let started = false;
+      try {
+        return await waitUntil(deadline, () => {
+          checkDeadline(deadline);
+          started = true;
+          if (!readOnly) activeDatabaseWrites += 1;
+          return operation({ deadline });
+        });
+      } catch (error) {
+        if (readOnly || !started) {
+          stageFailure = error instanceof Stop ? error : new Stop('coordinator_journal_conflict');
+          throw stageFailure;
+        }
+        databaseUncertain = true;
+        stop('recovery_database_uncertain');
+      } finally {
+        if (started && !readOnly) activeDatabaseWrites -= 1;
+      }
+    }
+    async function owned(deadline = finalizationDeadline ?? budget.deadline) {
+      const value = await database(options => store.getCoordinatorSnapshot(lease, options), deadline,
+        { readOnly: true });
       if (value?.status !== 'owned') stop('recovery_lease_lost');
       if (!boundRun(value.run, lease, claimManifest)) stop();
       if (snapshot?.phase && value.phase?.key !== snapshot.phase.key) stop('recovery_lease_lost');
@@ -235,17 +285,28 @@ export function createCoordinator(dependencies = {}) {
         stop('coordinator_wait_expired');
       }
     }
-    async function fresh() {
+    async function trustedFile(path, deadline) {
+      const source = descriptors.find(item => item.path === path);
+      if (!source) stop();
+      const request = { revision: manifest.policyRevision, path, deadline,
+        signal: budget.signal };
+      return waitUntil(deadline, () => trustedFileSession
+        ? trustedFileSession.readTrustedFile(request) : repository.readTrustedFile(request));
+    }
+    async function fresh(deadline = finalizationDeadline ?? budget.deadline) {
       budget.check();
+      checkDeadline(deadline);
       if (dependencies.isEnabled !== undefined
         && (typeof dependencies.isEnabled !== 'function' || dependencies.isEnabled() !== true)) {
         stop('recovery_approval_denied');
       }
       checkWait();
-      const approval = await budget.wait(() => (adapters.checkApproval ?? checkApproval)({ manifest,
+      const approval = await waitUntil(deadline, () => (adapters.checkApproval ?? checkApproval)({ manifest,
         expectedManifestSha256, token: readToken,
-        fetch: (url, options) => budget.wait(() => fetch(url, { ...options, signal: AbortSignal.any([budget.signal, options.signal]) })),
-        timeoutMs: Math.max(1, Math.min(5000, budget.deadline - Date.now())) }));
+        fetch: (url, options) => waitUntil(deadline, () => fetch(url, { ...options,
+          signal: AbortSignal.any([budget.signal, options.signal]) })),
+        timeoutMs: Math.max(1, Math.min(5000, deadline - Date.now())) }));
+      checkDeadline(deadline);
       checkWait();
       if (!validateApprovalResult(approval, { run: publicationRun(snapshot.run, manifest), approvedManifest: manifest })) {
         if (REVOCATIONS.has(approval?.reason)) {
@@ -256,15 +317,18 @@ export function createCoordinator(dependencies = {}) {
         }
         stop('recovery_approval_denied');
       }
-      const policy = await budget.wait(() => (adapters.loadPolicy ?? loadPolicy)(policyManifest, {
-        readTrustedFile: path => budget.wait(() => repository.readTrustedFile({ revision: manifest.policyRevision, path, deadline: budget.deadline, signal: budget.signal })),
+      const policy = await waitUntil(deadline, () => (adapters.loadPolicy ?? loadPolicy)(policyManifest, {
+        readTrustedFile: path => trustedFile(path, deadline),
       }));
+      checkDeadline(deadline);
       checkWait();
       if (policy?.status !== 'loaded' || policy.pilot?.repository !== manifest.repository.name || policy.pilot.issueNumber !== manifest.issue.number) stop();
-      const issue = await budget.wait(() => repository.readIssue({ manifest, deadline: budget.deadline, signal: budget.signal }));
+      const issue = await waitUntil(deadline, () => repository.readIssue({ manifest, deadline, signal: budget.signal }));
+      checkDeadline(deadline);
       checkWait();
       if (!exact(issue, ['title', 'body']) || hash(JSON.stringify([issue.title, issue.body])) !== manifest.issue.contentSha256) stop();
-      const current = await owned();
+      const current = await owned(deadline);
+      checkDeadline(deadline);
       checkWait();
       if (current.run.state !== snapshot.run.state || current.phase?.key !== snapshot.phase?.key) stop('recovery_lease_lost');
       return { policy, issue, approval };
@@ -340,32 +404,64 @@ export function createCoordinator(dependencies = {}) {
       // Preserve the claimed deadline on every store call made by recovery, too.
       const recoveryStore = Object.fromEntries(Object.entries({ getRun: 1, getCoordinatorSnapshot: 1,
         putIntent: 2, fenceIntent: 3, confirmIntent: 3, finishRun: 3 }).map(([name, count]) => [name,
-        (...args) => database(options => store[name](...args.slice(0, count), options))]));
+        (...args) => {
+          const requestedDeadline = args[count]?.deadline;
+          const deadline = Number.isSafeInteger(requestedDeadline)
+            ? Math.min(claimedDeadline ?? budget.deadline, requestedDeadline)
+            : claimedDeadline ?? budget.deadline;
+          return database(options => store[name](...args.slice(0, count), options), deadline,
+            { readOnly: name === 'getRun' || name === 'getCoordinatorSnapshot' });
+        }]));
       return (adapters.createRecoveryCoordinator ?? createRecoveryCoordinator)({ store: recoveryStore, publicationDependencies: {
         ...publicationDependencies,
         fetch: (url, options) => budget.wait(() => (publicationDependencies.fetch ?? fetch)(url, { ...options, signal: AbortSignal.any([budget.signal, options.signal]) })),
-        async checkApproval() { return (await fresh()).approval; },
-        async checkInitialChecks() { await fresh(); return checks(); },
-      } });
+        async checkApproval() { return (await fresh(publicationDeadline)).approval; },
+        async checkInitialChecks() { await fresh(publicationDeadline); return checks(); },
+      }, finalizationDeadline });
+    }
+    function publicationDiagnostics(reason, intent, effectCategory) {
+      return Object.freeze({ stage: 'publication', category: reason,
+        ...(typeof effectCategory === 'string' ? { effectCategory } : {}),
+        ...(agentDiagnostics ? { proposalCategory: agentDiagnostics.proposalCategory } : {}),
+        ...(modelOperationId ? { modelOperationId } : {}),
+        ...(modelUsage ? { actualInputTokens: modelUsage.inputTokens,
+          actualOutputTokens: modelUsage.outputTokens } : {}),
+        ...(intent ? { candidateOperationId: intent.key,
+          effectOperationId: intent.key } : {}) });
     }
     async function publish(intent, publication) {
-      await fresh();
-      let outcome;
+      knownIntent = intent;
+      await fresh(publicationDeadline);
+      if (publicationDeadline - Date.now() < PUBLICATION_ADMISSION_MS) {
+        stop('recovery_deadline');
+      }
+      let outcome, recoveryStarted = false;
       try {
-        outcome = await budget.wait(() => recovery().perform({ lease, deadline: claimedDeadline, intent, publication }));
-      } catch {
-        return terminalResult ?? result('needs_attention', 'recovery_database_uncertain');
+        outcome = await waitUntil(finalizationDeadline, () => {
+          recoveryStarted = true;
+          return recovery().perform({ lease, deadline: publicationDeadline, intent, publication });
+        });
+      } catch (error) {
+        if (terminalResult) return terminalResult;
+        if (error instanceof Stop && error.reason === 'recovery_deadline' && !databaseUncertain
+          && activeDatabaseWrites === 0
+          && (!recoveryStarted || !adapters.createRecoveryCoordinator)) throw error;
+        // A rejected custom recovery or an uncertain write cannot authorize finalization.
+        return result('needs_attention', 'recovery_database_uncertain', false,
+          publicationDiagnostics('recovery_database_uncertain', intent));
       }
       if (terminalResult) return terminalResult;
-      if (databaseUncertain) return result('needs_attention', 'recovery_database_uncertain');
+      if (databaseUncertain) return result('needs_attention', 'recovery_database_uncertain', false,
+        publicationDiagnostics('recovery_database_uncertain', intent));
       if (outcome?.status !== 'confirmed' || outcome.persisted !== true) {
         const allowed = new Set(['recovery_database_uncertain', 'recovery_effect_unconfirmed', 'recovery_conflict',
           'recovery_approval_denied', 'recovery_lease_lost', 'recovery_deadline', 'recovery_unsupported_effect',
           'recovery_invalid_input', 'coordinator_journal_conflict', 'coordinator_model_uncertain']);
-        return result('needs_attention', allowed.has(outcome?.reason) ? outcome.reason : 'recovery_effect_unconfirmed',
-          outcome?.persisted === true);
+        const reason = allowed.has(outcome?.reason) ? outcome.reason : 'recovery_effect_unconfirmed';
+        return result('needs_attention', reason, outcome?.persisted === true,
+          publicationDiagnostics(reason, intent, outcome?.effectCategory));
       }
-      snapshot = await owned();
+      snapshot = await owned(finalizationDeadline);
       if (snapshot.pendingOperation || !WAIT_STATES.has(snapshot.run.state)) stop();
       const released = await checkpoint(snapshot.run.state);
       return released.persisted ? result('advanced', undefined, true) : released;
@@ -392,9 +488,10 @@ export function createCoordinator(dependencies = {}) {
         || recovered.publication?.intent?.id !== intent.key) stop();
       return publish(intent, recovered.publication);
     }
-    async function prepared() {
-      return budget.wait(() => repository.readPreparedFiles({ revision: snapshot.run.expectedHeadSha ?? snapshot.run.baseRevision,
-        allowedPaths: manifest.allowedPaths, deadline: budget.deadline, signal: budget.signal }));
+    async function prepared(deadline = finalizationDeadline ?? budget.deadline) {
+      return waitUntil(deadline, () => repository.readPreparedFiles({
+        revision: snapshot.run.expectedHeadSha ?? snapshot.run.baseRevision,
+        allowedPaths: manifest.allowedPaths, deadline, signal: budget.signal }));
     }
     function reviewBinding(value) {
       const run = snapshot.run;
@@ -550,8 +647,8 @@ export function createCoordinator(dependencies = {}) {
     }
     async function generate() {
       if (snapshot.modelOperation) stop(snapshot.modelOperation.outcome === 'success' ? 'coordinator_candidate_lost' : 'coordinator_model_uncertain');
-      const { policy, issue } = await fresh();
-      const files = await prepared();
+      const { policy, issue } = await fresh(finalizationDeadline);
+      const files = await prepared(finalizationDeadline);
       const investigationContext = snapshot.phase.purpose === 'repair_tests' ? await investigation(files) : {};
       const trustedInvestigation = investigationContext.investigation;
       const headSha = snapshot.run.expectedHeadSha ?? snapshot.run.baseRevision;
@@ -575,35 +672,58 @@ export function createCoordinator(dependencies = {}) {
           coordinator: { regression },
           patchManifest: { allowedPaths: manifest.allowedPaths, pilotScope: manifest.pilotScope } }, files,
         phaseInstructions, ...investigationContext });
-      let modelOperationId = null, successfulOutcome = false;
+      let successfulOutcome = false;
+      const modelWindowMs = modelDeadline - Date.now();
+      if (modelWindowMs < MIN_MODEL_WINDOW_MS + POST_RESERVATION_AUTH_MS) stop('recovery_deadline');
+      const agentTimeoutMs = Math.min(MODEL_CALL_CEILING_MS, modelWindowMs);
+      const postReservationDeadline = modelDeadline - MIN_MODEL_WINDOW_MS;
       const authorization = {
-        async recheck() { await fresh(); return true; },
+        async recheck() {
+          const deadline = modelOperationId ? postReservationDeadline : modelAdmissionDeadline;
+          await fresh(deadline);
+          if (modelDeadline - Date.now() < MIN_MODEL_WINDOW_MS) stop('recovery_deadline');
+          return true;
+        },
         async reserveModelCall(request) {
-          await fresh();
-          const receipt = await database(options => store.reserveModelCall(lease, { ...request, key: snapshot.phase.key }, options));
+          await fresh(modelAdmissionDeadline);
+          if (Date.now() >= modelAdmissionDeadline
+            || modelDeadline - Date.now() < MIN_MODEL_WINDOW_MS + POST_RESERVATION_AUTH_MS) {
+            stop('recovery_deadline');
+          }
+          const receipt = await database(options => store.reserveModelCall(lease,
+            { ...request, key: snapshot.phase.key }, options), modelAdmissionDeadline);
           if (receipt?.status === 'reserved' && receipt.canExecute === true) modelOperationId = receipt.operationId;
           return receipt;
         },
         async recordModelCallOutcome(reservation, outcome) {
           if (!modelOperationId || reservation.operationId !== modelOperationId) stop();
-          const receipt = await database(options => store.recordModelCallOutcome(lease, { operationId: modelOperationId, ...outcome }, options));
+          const receipt = await database(options => store.recordModelCallOutcome(lease,
+            { operationId: modelOperationId, ...outcome }, options), outcomeDeadline);
+          if (outcome.outcome === 'success' && Number.isSafeInteger(outcome.actualInputTokens)
+            && Number.isSafeInteger(outcome.actualOutputTokens)) {
+            modelUsage = { inputTokens: outcome.actualInputTokens,
+              outputTokens: outcome.actualOutputTokens };
+          }
           successfulOutcome = receipt?.status === 'recorded' && receipt.outcome === 'success' && receipt.blockerCode === null;
           return receipt;
         },
       };
-      const agent = await budget.wait(() => (adapters.createAgentWorker ?? createAgentWorker)({ ...model,
-        authorization, loadContext: async () => { budget.check(); return context; },
+      const agent = await waitUntil(modelAdmissionDeadline,
+        () => (adapters.createAgentWorker ?? createAgentWorker)({ ...model,
+        authorization, deadline: modelDeadline,
+        loadContext: async () => { budget.check(); return context; },
         readFile: async request => {
           budget.check();
           const file = files.find(file => file.path === request.path);
           if (request.revision !== headSha || file?.blobSha !== request.expectedBlobSha) stop();
           return { revision: headSha, path: file.path, blobSha: file.blobSha, text: file.text };
-        }, timeoutMs: Math.max(1, Math.min(45000, budget.deadline - Date.now())) }));
-      const generated = await budget.wait(() => agent.run({}));
+        }, timeoutMs: agentTimeoutMs }));
+      const generated = await waitUntil(outcomeDeadline, () => agent.run({}));
       agentDiagnostics = safeAgentDiagnostics(generated?.diagnostics);
-      if (databaseUncertain) stop('recovery_database_uncertain');
       if (terminalResult) return terminalResult;
+      if (databaseUncertain) stop('recovery_database_uncertain');
       if (generated?.blockerCode === 'model_outcome_uncertain') return result('needs_attention', 'model_outcome_uncertain', false, agentDiagnostics);
+      if (stageFailure) throw stageFailure;
       if (generated?.blockerCode === 'investigation_human_stop' || generated?.blockerCode === 'investigation_assessment_unavailable') stop('coordinator_investigation_human_stop');
       if (generated?.status !== 'completed' || generated.proposal !== true || !successfulOutcome || !modelOperationId
         || generated.baseSha !== headSha || generated.manifestHash !== expectedManifestSha256) {
@@ -629,8 +749,13 @@ export function createCoordinator(dependencies = {}) {
       if (claim?.status !== 'claimed') stop();
       lease = claim.lease; claimedDeadline = claim.deadline;
       budget.clamp(claimedDeadline);
-      snapshot = await owned();
-      await fresh();
+      finalizationDeadline = Math.min(claimedDeadline, budget.deadline);
+      publicationDeadline = finalizationDeadline - FINALIZATION_GRACE_MS;
+      outcomeDeadline = publicationDeadline - PUBLICATION_WINDOW_MS - POST_MODEL_AUTH_MS;
+      modelDeadline = outcomeDeadline - MODEL_OUTCOME_WINDOW_MS;
+      modelAdmissionDeadline = modelDeadline - MIN_MODEL_WINDOW_MS - POST_RESERVATION_AUTH_MS;
+      snapshot = await owned(finalizationDeadline);
+      await fresh(finalizationDeadline);
       if (snapshot.pendingOperation) return await pending();
       const { run, phase } = snapshot;
       if (phase?.pendingOperationId) stop();
@@ -729,22 +854,34 @@ export function createCoordinator(dependencies = {}) {
       stop();
     } catch (error) {
       if (terminalResult) return terminalResult;
-      if (databaseUncertain) return result('needs_attention', 'recovery_database_uncertain', false, undefined, reviewDiagnostics);
-      if (budget.isExpired()) return result('needs_attention', 'recovery_deadline', false, undefined, reviewDiagnostics);
+      const partialDiagnostics = reason => knownIntent
+        ? publicationDiagnostics(reason, knownIntent)
+        : modelOperationId ? { stage: 'model', category: reason, modelOperationId,
+          ...(modelUsage ? { actualInputTokens: modelUsage.inputTokens,
+            actualOutputTokens: modelUsage.outputTokens } : {}) }
+          : { stage: 'finalization', category: reason };
+      if (databaseUncertain) return result('needs_attention', 'recovery_database_uncertain', false,
+        partialDiagnostics('recovery_database_uncertain'), reviewDiagnostics);
+      if (budget.isExpired()) return result('needs_attention', 'recovery_deadline', false,
+        partialDiagnostics('recovery_deadline'), reviewDiagnostics);
       const reason = error instanceof Stop ? error.reason : 'coordinator_journal_conflict';
       const status = error instanceof Stop ? error.status : 'needs_attention';
       const diagnostics = agentDiagnostics
-        ? { ...agentDiagnostics, proposalCategory: reason === 'coordinator_candidate_lost'
+        ? { ...partialDiagnostics(reason), ...agentDiagnostics, proposalCategory: reason === 'coordinator_candidate_lost'
           && agentDiagnostics.proposalCategory === 'valid_proposal'
           ? 'lost_valid_proposal' : agentDiagnostics.proposalCategory }
-        : undefined;
+        : partialDiagnostics(reason);
       if (!lease) return result(status, reason, false, diagnostics, reviewDiagnostics);
       try {
         const persisted = await database(options => store.finishRun(lease, status,
           status === 'needs_attention' ? { blockerCode: reason } : {}, options));
         return persisted ? result(status, reason, true, diagnostics, reviewDiagnostics) : result('needs_attention', 'recovery_lease_lost', false, undefined, reviewDiagnostics);
-      } catch { return result('needs_attention', 'recovery_database_uncertain', false, undefined, reviewDiagnostics); }
-    } finally { budget.close(); }
+      } catch (failure) {
+        const reason = !databaseUncertain && failure instanceof Stop
+          && failure.reason === 'recovery_deadline' ? 'recovery_deadline' : 'recovery_database_uncertain';
+        return result('needs_attention', reason, false, partialDiagnostics(reason), reviewDiagnostics);
+      }
+    } finally { trustedFileSession?.close?.(); budget.close(); }
   }
   return Object.freeze({ advanceTick });
 }

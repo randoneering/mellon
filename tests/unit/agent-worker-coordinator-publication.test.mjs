@@ -11,7 +11,11 @@ for (const lostAcknowledgment of [false, true]) {
     const coordinator = createCoordinator(h.dependencies);
     assert.equal((await coordinator.advanceTick(delivery())).status, 'advanced');
     const parent = h.state.phase.headSha;
-    assert.equal((await coordinator.advanceTick(delivery())).status, 'advanced');
+    const result = await coordinator.advanceTick(delivery());
+    assert.equal(result.status, 'advanced', JSON.stringify({ result, deadlines: h.state.recoveryStoreDeadlines,
+      ledgerDeadlines: h.state.recoveryStoreDeadlines,
+      calls: h.state.calls.filter(call => ['snapshot', 'getRun', 'recovery', 'putIntent', 'fenceIntent', 'confirmIntent'].includes(call[0])).map(call => [call[0], call[1]?.deadline]),
+      claimDeadline: h.state.deadline, outerDeadline: h.state.outerDeadline }));
     assert.equal(h.fixture.state.branchWrites, 1);
     assert.equal(h.fixture.state.commitWrites, 1);
     assert.equal(h.state.run.expectedHeadSha, COMMIT_SHA);

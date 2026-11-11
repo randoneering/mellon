@@ -40,6 +40,45 @@ function reportProposalDiagnostics(report, result) {
   try { Promise.resolve(report(fields.join(' '))).catch(() => {}); }
   catch { /* Reporting cannot change the worker outcome. */ }
 }
+function reportCoordinatorDiagnostics(report, value) {
+  const stages = new Set(['model', 'publication', 'finalization']);
+  const categories = new Set(['recovery_deadline', 'recovery_database_uncertain',
+    'recovery_effect_unconfirmed', 'recovery_conflict', 'recovery_approval_denied',
+    'recovery_lease_lost', 'recovery_unsupported_effect', 'recovery_invalid_input',
+    'coordinator_model_uncertain', 'coordinator_candidate_lost',
+    'coordinator_journal_conflict']);
+  const effects = new Set(['approval_denied', 'approval_unavailable', 'branch_absent',
+    'branch_head_mismatch', 'branch_history_limit', 'branch_history_untrusted',
+    'branch_identity_mismatch', 'branch_moved', 'branch_read_failed', 'branch_write_not_observed',
+    'commit_metadata_invalid', 'commit_write_not_observed', 'commit_write_unconfirmed',
+    'fence_denied', 'fence_unavailable', 'invalid_input', 'patch_rejected',
+    'publication_context_invalid', 'publication_context_unavailable',
+    'pr_context_unavailable', 'pr_template_unverified', 'pr_evidence_invalid',
+    'pr_evidence_incomplete', 'pr_identity_ambiguous', 'pr_identity_mismatch',
+    'pr_write_not_observed', 'pr_write_unconfirmed', 'pr_publication_failed',
+    'repository_identity_mismatch', 'repository_read_failed', 'signing_preflight_expired',
+    'tree_incomplete', 'unsupported_file_mode']);
+  if (!stages.has(value?.stage) || !categories.has(value.category)) return;
+  const fields = [`[agent_worker] stage=${value.stage}`, `category=${value.category}`];
+  if (effects.has(value.effectCategory)) fields.push(`effect=${value.effectCategory}`);
+  for (const [name, candidate] of Object.entries({
+    model_operation_id: value.modelOperationId,
+    candidate_operation_id: value.candidateOperationId,
+    effect_operation_id: value.effectOperationId,
+  })) {
+    if (typeof candidate === 'string'
+      && (/^[a-f0-9]{64}$/.test(candidate)
+        || /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(candidate))) {
+      fields.push(`${name}=${candidate}`);
+    }
+  }
+  if (Number.isSafeInteger(value.actualInputTokens) && value.actualInputTokens >= 0
+      && value.actualInputTokens <= 65536) fields.push(`actual_input_tokens=${value.actualInputTokens}`);
+  if (Number.isSafeInteger(value.actualOutputTokens) && value.actualOutputTokens >= 0
+      && value.actualOutputTokens <= 2000) fields.push(`actual_output_tokens=${value.actualOutputTokens}`);
+  try { Promise.resolve(report(fields.join(' '))).catch(() => {}); }
+  catch { /* Reporting cannot change the worker outcome. */ }
+}
 function reportReviewDiagnostics(report, value) {
   const categories = new Set(['review_request_confirmed', 'review_binding_invalid', 'review_context_unavailable',
     'review_context_invalid', 'review_pull_request_mismatch', 'review_commit_mismatch',
@@ -159,6 +198,7 @@ export function createWorkerFunction({
         }));
         if (!COORDINATOR_STATUSES.has(result?.status)) return unavailable(report, 'coordinator_unavailable');
         reportProposalDiagnostics(report, result);
+        reportCoordinatorDiagnostics(report, result.diagnostics);
         reportReviewDiagnostics(report, result.reviewDiagnostics);
         return response(result.status, 200);
       } catch {

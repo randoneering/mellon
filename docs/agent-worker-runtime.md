@@ -99,6 +99,13 @@ Policy-source, manifest, config and preflight pins must be regenerated and appro
 6. Close request-owned resources through bounded cleanup, without replacing the confirmed outcome if diagnostics fail.
 
 Startup and advancement share the configured tick deadline, at most 90 seconds.
+The coordinator ends at least one second before the outer runtime deadline so ledger finalization can settle before pool closure.
+Within that deadline, model work ends 33 seconds early and model-outcome recording ends 28 seconds early.
+Fresh post-model authority checks have a separate 10-second window before the eight-second publication window; publication ends 10 seconds early for finalization.
+Publication admission requires at least eight seconds before its cutoff; the single provider call still has a 45-second ceiling.
+Model reservation SQL must settle before the model-admission cutoff, leaving 10 seconds for post-reservation authority checks and at least 30 seconds for the call.
+Only verified, pinned Git objects share a per-tick cache; approval, permissions, labels, issue content, head and write fences stay fresh.
+Uncertain database writes never authorize a compensating write.
 Current enablement, branch, config pins, credentials and preflight expiry are checked again before subsequent effects.
 Already accepted remote SQL/HTTP/model work may finish after local cancellation.
 No automatic provider retry, arbitrary module loader, in-memory dedupe or phase loop is added.
@@ -108,4 +115,20 @@ No automatic provider retry, arbitrary module loader, in-memory dedupe or phase 
 Unit composition uses actual constructors with controlled HTTP/database receipts.
 The manual `npm run test:worker:runtime:db` suite executes actual catalog/grant/limit and reservation SQL in a fresh marker-guarded container.
 Its plaintext test transport is deliberately rejected by production TLS attestation; it does not establish live Neon TLS or service isolation.
-The new manual file is outside ordinary test discovery, so it adds no default database skips.
+The manual files stay outside ordinary test discovery, so they add no default database skips.
+
+Run the wall-clock publication regression in separate fresh containers:
+
+```sh
+MELLON_PUBLICATION_DEADLINE_CASE=baseline npm run test:worker:runtime:db
+MELLON_PUBLICATION_DEADLINE_CASE=green npm run test:worker:runtime:db
+```
+
+`tests/manual/agent-worker-publication-deadline-runtime.mjs` restores every baseline source from public pre-change revision `1c08180084dac9807a031bcc61b3c97435c868eb` and exercises the production Function entry, actual SQL ledger and installed Responses SDK.
+The green case covers regression publication, authenticated native-shaped RED/GREEN CI records, implementation, draft creation, exact-head review and expiry with late transport completion.
+Run `MELLON_PUBLICATION_DEADLINE_CASE=source-pin node --test tests/manual/agent-worker-publication-deadline-runtime.mjs` to check every restored source against that revision without running PostgreSQL or the 90-second baseline.
+Both cases retain all three runner-marker probes.
+Latency uses real waits of 4,500ms for startup, 770ms per trusted policy blob and 30,713ms for the profiled model response.
+PostgreSQL and JavaScript use their unchanged clocks.
+The local test substitutes App authority and allows plaintext only after the real catalog query; external HTTP responses and review records remain mocked.
+It proves no live Gateway, App, CI or review behavior.

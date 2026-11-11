@@ -51,9 +51,11 @@ function deadlineError() {
   return error;
 }
 
-function createBudget(timeoutMs) {
+function createBudget(timeoutMs, { deadline: absoluteDeadline, now = Date.now } = {}) {
   const controller = new AbortController();
-  const deadline = Date.now() + timeoutMs;
+  const startedAt = now();
+  const deadline = Math.min(startedAt + timeoutMs, absoluteDeadline ?? Infinity);
+  if (deadline <= startedAt) throw deadlineError();
   let timer;
   let rejectExpired;
   const expired = new Promise((_, reject) => {
@@ -61,7 +63,7 @@ function createBudget(timeoutMs) {
     timer = setTimeout(() => {
       controller.abort();
       rejectExpired(deadlineError());
-    }, timeoutMs);
+    }, Math.max(1, deadline - Date.now()));
   });
   void expired.catch(() => {});
   return {
@@ -74,7 +76,10 @@ function createBudget(timeoutMs) {
         if (controller.signal.aborted || Date.now() >= deadline) throw deadlineError();
         return operation();
       });
-      return Promise.race([pending, expired]);
+      return Promise.race([pending, expired]).then(value => {
+        if (controller.signal.aborted || Date.now() >= deadline) throw deadlineError();
+        return value;
+      });
     },
     isExpired() {
       return controller.signal.aborted || Date.now() >= deadline;
@@ -138,10 +143,12 @@ function validateDependencies(dependencies) {
     || typeof dependencies.checkApproval !== 'function'
     || typeof dependencies.checkFence !== 'function') stop('callbacks_missing');
   const timeoutMs = dependencies.timeoutMs ?? DEFAULT_DEADLINE_MS;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_DEADLINE_MS) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_DEADLINE_MS
+      || dependencies.deadline !== undefined && !Number.isSafeInteger(dependencies.deadline)
+      || dependencies.now !== undefined && typeof dependencies.now !== 'function') {
     stop('deadline_invalid');
   }
-  return { ...dependencies, timeoutMs };
+  return { ...dependencies, timeoutMs, now: dependencies.now ?? Date.now };
 }
 
 function assertContextFresh(state) {
@@ -526,7 +533,7 @@ async function perform(input, dependencies, operation) {
   let state;
   try {
     const checkedDependencies = validateDependencies(dependencies);
-    budget = createBudget(checkedDependencies.timeoutMs);
+    budget = createBudget(checkedDependencies.timeoutMs, checkedDependencies);
     state = await loadState(input, checkedDependencies, budget, {
       requireApproval: operation === 'publish',
     });
@@ -634,7 +641,7 @@ export async function ensureDraftPr(input, dependencies) {
       getPublicationContext: dependencies?.getPullRequestContext });
     if (typeof checked.getPullRequestContext !== 'function'
       || typeof checked.checkInitialChecks !== 'function') stop('callbacks_missing');
-    budget = createBudget(checked.timeoutMs);
+    budget = createBudget(checked.timeoutMs, checked);
     state = await loadDraftPrState(input, checked, budget);
     const initial = await probeDraftPrState(state, checked, budget);
     if (initial.pr) return await confirmDraftPr(state, checked, budget, initial.pr);

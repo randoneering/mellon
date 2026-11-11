@@ -153,6 +153,123 @@ test('coordinator binding: mismatched leased intake identity stops before networ
   assert.equal(h.state.calls.some(call => call[0] === 'approvalHTTP'), false);
 });
 
+test('coordinator keeps generic adapter policy reads fresh across authorization checks', async () => {
+  const h = await setup();
+  await tick(h);
+  h.state.calls.length = 0;
+  await tick(h);
+  const reads = h.state.calls.filter(call => call[0] === 'policy');
+  assert.equal(reads.length, 60);
+  assert.equal(new Set(reads.map(call => call[2])).size, 10);
+  h.state.calls.length = 0;
+  await tick(h);
+  const nextTickReads = h.state.calls.filter(call => call[0] === 'policy');
+  const nextApprovals = h.state.calls.filter(call => call[0] === 'approvalHTTP');
+  const issueChecks = h.state.calls.filter(call => call[0] === 'issue');
+  assert.ok(nextApprovals.length > 0);
+  assert.equal(nextTickReads.length, issueChecks.length * 10);
+  assert.equal(new Set(nextTickReads.map(call => call[2])).size, 10);
+});
+
+test('coordinator keeps distinct model, publication, and finalization cutoffs', async () => {
+  let clock = Date.now();
+  const dateNow = mock.method(Date, 'now', () => clock);
+  try {
+    const h = await harness();
+    let modelDeadline;
+    const createAgentWorker = h.adapters.createAgentWorker;
+    h.adapters.createAgentWorker = options => {
+      modelDeadline = options.deadline;
+      return createAgentWorker(options);
+    };
+    h.coordinator = coordinator(h.dependencies);
+    await tick(h);
+    await tick(h);
+    assert.equal(h.state.modelRequests, 1);
+    const publicationCall = h.state.calls.find(call => call[0] === 'recovery');
+    assert.ok(publicationCall);
+    const publication = publicationCall[1];
+    const effectiveDeadline = Math.min(h.state.deadline, h.state.outerDeadline);
+    assert.equal(modelDeadline, effectiveDeadline - 33_000);
+    assert.equal(publication.deadline, effectiveDeadline - 10_000);
+    assert.ok(publication.deadline > modelDeadline);
+  } finally { dateNow.mock.restore(); }
+});
+
+test('coordinator preserves a sanitized unconfirmed publication without compensating writes', async () => {
+  const h = await harness();
+  h.state.recoveryHook = async () => ({ status: 'needs_attention',
+    reason: 'recovery_effect_unconfirmed', persisted: false });
+  h.coordinator = coordinator(h.dependencies);
+  await tick(h);
+  const result = await tick(h);
+  assert.equal(result.status, 'needs_attention');
+  assert.equal(result.reason, 'recovery_effect_unconfirmed');
+  assert.equal(result.persisted, false);
+  assert.equal(h.state.run.state, 'generating_tests');
+  assert.equal(h.state.calls.some(call => call[0] === 'finishRun'), false);
+  assert.equal(result.diagnostics.stage, 'publication');
+  assert.equal(result.diagnostics.category, 'recovery_effect_unconfirmed');
+});
+
+test('coordinator keeps publication ledger writes inside the reserved effect deadline', async () => {
+  const h = await setup();
+  let effectDeadline;
+  h.state.recoveryStoreProbe = async ({ request, store }) => {
+    effectDeadline = request.deadline;
+    await store.putIntent(h.state.lease, request.intent, { deadline: request.deadline });
+    await store.fenceIntent(h.state.lease, request.intent, 'commit_create', { deadline: request.deadline });
+    await store.confirmIntent(h.state.lease, request.intent, {}, { deadline: request.deadline });
+  };
+  await tick(h);
+  assert.equal((await tick(h)).status, 'advanced');
+  const writes = h.state.calls.filter(call => ['putIntent', 'fenceIntent', 'confirmIntent'].includes(call[0]));
+  assert.equal(writes.length, 3);
+  assert.ok(effectDeadline < h.state.deadline);
+  assert.ok(writes.every(call => call[1].deadline === effectDeadline));
+});
+
+test('coordinator shortens the single model call to preserve publication time', async () => {
+  const h = await harness();
+  let clock = Date.now();
+  const dateNow = mock.method(Date, 'now', () => clock);
+  let modelTimeout;
+  try {
+    h.state.filesHook = async () => { clock += 10_000; };
+    const createAgentWorker = h.dependencies.adapters.createAgentWorker;
+    h.dependencies.adapters.createAgentWorker = options => {
+      modelTimeout = options.timeoutMs;
+      return createAgentWorker(options);
+    };
+    h.coordinator = coordinator({ ...h.dependencies, timeoutMs: 90_000 });
+    await h.coordinator.advanceTick(delivery());
+    const result = await h.coordinator.advanceTick(delivery());
+    assert.equal(result.status, 'advanced', JSON.stringify(result));
+    assert.equal(h.state.modelRequests, 1);
+    assert.equal(modelTimeout, 42_000);
+  } finally { dateNow.mock.restore(); }
+});
+
+test('coordinator reserves publication and finalization time before reserving a model call', async () => {
+  const h = await harness();
+  let clock = Date.now();
+  const dateNow = mock.method(Date, 'now', () => clock);
+  try {
+    h.state.filesHook = async () => { clock += 80_000; };
+    h.coordinator = coordinator({ ...h.dependencies, timeoutMs: 90_000 });
+    await h.coordinator.advanceTick(delivery());
+    const result = await h.coordinator.advanceTick(delivery());
+    assert.equal(result.status, 'needs_attention');
+    assert.equal(result.reason, 'recovery_deadline');
+    assert.equal(result.persisted, true);
+    assert.equal(h.state.run.state, 'needs_attention');
+    assert.equal(h.state.stops.at(-1), 'recovery_deadline');
+    assert.equal(h.state.modelRequests, 0);
+    assert.equal(h.state.calls.some(call => call[0] === 'reserveModelCall'), false);
+    assert.equal(h.state.publications.length, 0);
+  } finally { dateNow.mock.restore(); }
+});
+
 test('coordinator deadline: stalled claim cannot continue and every later store gets original deadline', async () => {
   const h = await setup(); await through(h, 'waiting_red_ci');
   h.state.calls.length = 0; h.state.checkStatus = 'waiting'; await tick(h);

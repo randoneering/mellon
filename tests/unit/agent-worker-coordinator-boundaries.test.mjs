@@ -13,11 +13,10 @@ const tick = h => h.coordinator.advanceTick(delivery());
 async function setup() { const h = await harness(); h.coordinator = createCoordinator(h.dependencies); return h; }
 async function generating(h) { assert.equal((await tick(h)).status, 'advanced'); }
 
-for (const boundary of ['snapshot', 'reservation', 'outcome', 'confirmation']) {
+for (const boundary of ['reservation', 'outcome', 'confirmation']) {
   test(`coordinator scripted crash: uncertain ${boundary} never compensates or continues`, async () => {
     const h = await setup();
-    if (boundary !== 'snapshot') await generating(h);
-    if (boundary === 'snapshot') h.state.snapshotHook = () => { throw new Error('sensitive SQL'); };
+    await generating(h);
     if (boundary === 'reservation') h.state.reserveHook = () => { throw new Error('sensitive SQL'); };
     if (boundary === 'outcome') h.state.outcomeHook = () => { throw new Error('sensitive SQL'); };
     if (boundary === 'confirmation') h.state.recoveryHook = () => ({ status: 'needs_attention', reason: 'recovery_database_uncertain', persisted: false });
@@ -29,6 +28,19 @@ for (const boundary of ['snapshot', 'reservation', 'outcome', 'confirmation']) {
     assert.doesNotMatch(JSON.stringify(response), /sensitive|SQL/);
   });
 }
+
+test('coordinator known snapshot read failure finalizes with a sanitized journal category', async () => {
+  const h = await setup();
+  h.state.snapshotHook = () => { throw new Error('sensitive SQL'); };
+  const response = await tick(h);
+  assert.equal(response.reason, 'coordinator_journal_conflict');
+  assert.deepEqual(response.diagnostics,
+    { stage: 'finalization', category: 'coordinator_journal_conflict' });
+  assert.equal(response.persisted, true);
+  assert.equal(h.state.stops.length, 1);
+  assert.equal(h.state.modelRequests, 0);
+  assert.doesNotMatch(JSON.stringify(response), /sensitive|SQL/);
+});
 
 test('coordinator unrecognized recovery rejection never permits a compensating DB write', async () => {
   const h = await setup(); await generating(h);

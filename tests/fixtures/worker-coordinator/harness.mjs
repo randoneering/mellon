@@ -42,7 +42,9 @@ export async function harness() {
       if (state.seen.has(request.invocationId)) return { status: 'busy' };
       state.seen.add(request.invocationId);
       if (state.run.terminalAt) return { status: 'idle' };
-      state.deadline = Date.now() + 85000;
+      const startedAt = Date.now();
+      state.deadline = startedAt + 85000;
+      state.outerDeadline = startedAt + 90000;
       state.lease = { runId: state.run.runId, jobId: state.run.jobId, repositoryId: state.run.repositoryId, repositoryFullName: state.run.repositoryFullName, issueId: state.run.issueId, issueNumber: state.run.issueNumber, actorId: state.run.actorId, generation: state.run.generation, token: randomUUID(), expiresAt: new Date(Date.now() + 180000).toISOString() };
       return { status: 'claimed', lease: state.lease, deadline: state.deadline };
     },
@@ -72,6 +74,18 @@ export async function harness() {
       const operationId = randomUUID();
       state.modelOperation = { operationId, outcome: null };
       return { status: 'reserved', canExecute: true, operationId, inputTokens: request.inputTokens, outputTokens: request.outputTokens, deadlineAt: new Date(Date.now() + 40000).toISOString() };
+    },
+    async putIntent(lease, intent, options) {
+      state.calls.push(['putIntent', options]);
+      return { status: 'created' };
+    },
+    async fenceIntent(lease, intent, phase, options) {
+      state.calls.push(['fenceIntent', options]);
+      return { status: 'owned', decision: 'create' };
+    },
+    async confirmIntent(lease, intent, proof, options) {
+      state.calls.push(['confirmIntent', options]);
+      return true;
     },
     async recordModelCallOutcome(lease, outcome, options) {
       state.calls.push(['recordModelCallOutcome', outcome, options]);
@@ -141,7 +155,7 @@ export async function harness() {
   const repository = {
     async readIssue() { state.calls.push(['issue']); return { title: 'approved title', body: 'approved body' }; },
     async readTrustedFile(request) {
-      state.calls.push(['policy', request.revision]);
+      state.calls.push(['policy', request.revision, request.path]);
       return readFile(new URL(`../../../${request.path}`, import.meta.url), 'utf8');
     },
     async readPreparedFiles(request) { state.calls.push(['files', request.revision]); if (state.filesHook) await state.filesHook(); return structuredClone(files); },
@@ -155,10 +169,11 @@ export async function harness() {
     createAgentWorker(options) {
       return createAgentWorker({ ...options, loadContext: async () => { const context = await options.loadContext(); state.contexts.push(context); return context; } });
     },
-    createRecoveryCoordinator() {
+    createRecoveryCoordinator({ store }) {
       return { async perform(request) {
         state.calls.push(['recovery', request]);
-        assert.equal(request.deadline, state.deadline);
+        if (state.recoveryStoreProbe) await state.recoveryStoreProbe({ request, store });
+        assert.equal(request.deadline, Math.min(state.deadline, state.outerDeadline) - 10_000);
         validateIntent(request.intent);
         if (state.recoveryHook) return state.recoveryHook(request);
         state.publications.push(structuredClone(request));

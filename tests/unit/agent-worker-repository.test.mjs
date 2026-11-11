@@ -57,6 +57,43 @@ test('repository rejects binary and invalid UTF8 verified blob bytes', async () 
   }
 });
 
+test('trusted repository read session caches pinned Git objects but rechecks repository metadata', async () => {
+  const path = 'AGENTS.md';
+  const text = '# immutable trusted guidance';
+  const api = fakeApi(treeRoutes(text, path, POLICY));
+  const reader = createRepositoryReader({ ...repositoryConfig(api),
+    trustedPaths: [{ path, sha256: hash(text) }] });
+  assert.equal(typeof reader.createTrustedReadSession, 'function');
+  const request = { revision: POLICY, path, ...options() };
+  const invocation = reader.createTrustedReadSession();
+  assert.equal(await invocation.readTrustedFile(request), text);
+  assert.equal(await invocation.readTrustedFile(request), text);
+  const root = '/repos/randoneering/mellon';
+  assert.equal(api.calls.filter(value => value === root).length, 2);
+  assert.equal(api.calls.filter(value => value === `${root}/git/commits/${POLICY}`).length, 1);
+  assert.equal(api.calls.filter(value => value.startsWith(`${root}/git/trees/`)).length, 1);
+  assert.equal(api.calls.filter(value => value.startsWith(`${root}/git/blobs/`)).length, 1);
+  const nextInvocation = reader.createTrustedReadSession();
+  assert.equal(await nextInvocation.readTrustedFile(request), text);
+  assert.equal(api.calls.filter(value => value === root).length, 3);
+  assert.equal(api.calls.filter(value => value === `${root}/git/commits/${POLICY}`).length, 2);
+  assert.equal(api.calls.filter(value => value.startsWith(`${root}/git/trees/`)).length, 2);
+  assert.equal(api.calls.filter(value => value.startsWith(`${root}/git/blobs/`)).length, 2);
+});
+
+test('trusted repository session closes permanently without permitting cached reads', async () => {
+  const path = 'AGENTS.md', text = '# trusted';
+  const api = fakeApi(treeRoutes(text, path, POLICY));
+  const reader = createRepositoryReader({ ...repositoryConfig(api), trustedPaths: [{ path, sha256: hash(text) }] });
+  const session = reader.createTrustedReadSession();
+  await session.readTrustedFile({ revision: POLICY, path, ...options() });
+  assert.equal(typeof session.close, 'function');
+  session.close();
+  const before = api.calls.length;
+  await assert.rejects(session.readTrustedFile({ revision: POLICY, path, ...options() }));
+  assert.equal(api.calls.length, before);
+});
+
 test('repository guidance is pinned to reviewed policy revision and exact source hash', async () => {
   const path = 'AGENTS.md', text = '# trusted';
   const api = fakeApi(treeRoutes(text, path, POLICY));

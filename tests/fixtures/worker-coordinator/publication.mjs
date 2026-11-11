@@ -13,11 +13,23 @@ export async function publicationHarness(options = {}) {
   h.state.run.runId = RUN_ID;
   const fixture = createPublisherFixture({ manifest: h.manifest, ...options });
   h.dependencies.publicationDependencies = fixture.dependencies;
+  fixture.dependencies.now = () => {
+    h.state.publisherBudgetStartedAt = Date.now();
+    return h.state.publisherBudgetStartedAt;
+  };
   delete h.adapters.createRecoveryCoordinator;
   const effects = new Set();
-  h.store.getRun = async (_runId, wait) => { assert.equal(wait.deadline, h.state.deadline); return structuredClone(h.state.run); };
+  h.state.recoveryStoreDeadlines = [];
+  h.store.getRun = async (_runId, wait) => {
+    h.state.recoveryStoreDeadlines ??= [];
+    h.state.recoveryStoreDeadlines.push(['getRun', wait.deadline,
+      Math.min(h.state.deadline, h.state.outerDeadline) - 10_000]);
+    assert.equal(wait.deadline, Math.min(h.state.deadline, h.state.outerDeadline) - 10_000);
+    return structuredClone(h.state.run);
+  };
   h.store.putIntent = async (_lease, intent, wait) => {
-    assert.equal(wait.deadline, h.state.deadline);
+    h.state.recoveryStoreDeadlines.push(['putIntent', wait.deadline]);
+    assert.equal(wait.deadline, Math.min(h.state.deadline, h.state.outerDeadline) - 10_000);
     if (h.state.pendingOperation) return { status: 'existing', operation: structuredClone(h.state.pendingOperation) };
     h.state.pendingOperation = { operationId: randomUUID(), ...structuredClone(intent) };
     h.state.phase.pendingOperationId = h.state.pendingOperation.operationId;
@@ -26,13 +38,19 @@ export async function publicationHarness(options = {}) {
     return { status: 'created', operation: structuredClone(h.state.pendingOperation) };
   };
   h.store.fenceIntent = async (_lease, _intent, phase, wait) => {
-    assert.equal(wait.deadline, h.state.deadline);
+    h.state.recoveryStoreDeadlines.push(['fenceIntent', wait.deadline]);
+    assert.equal(wait.deadline, Math.min(Math.min(h.state.deadline,
+      h.state.outerDeadline) - 10_000,
+    h.state.publisherBudgetStartedAt + fixture.dependencies.timeoutMs));
     const used = effects.has(phase); effects.add(phase);
     if (h.state.fenceHook) return h.state.fenceHook(phase);
     return { status: 'owned', decision: used ? 'reconcile_only' : 'execute' };
   };
   h.store.confirmIntent = async (_lease, _intent, proof, wait) => {
-    assert.equal(wait.deadline, h.state.deadline);
+    h.state.recoveryStoreDeadlines.push(['confirmIntent', wait.deadline]);
+    assert.equal(wait.deadline, Math.min(Math.min(h.state.deadline,
+      h.state.outerDeadline) - 10_000,
+    h.state.publisherBudgetStartedAt + fixture.dependencies.timeoutMs));
     if (h.state.confirmHook) await h.state.confirmHook(proof);
     h.state.run.expectedHeadSha = proof.commitSha;
     h.state.run.branchName = proof.branch;
