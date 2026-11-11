@@ -1,5 +1,6 @@
 const API_ROOT = 'https://api.github.com';
 const SAFE_ERROR = 'GitHub submission request failed safely.';
+const REQUEST_TIMEOUT_MS = 5000;
 
 export function parseSubmissionUrl(value) {
   let url;
@@ -43,6 +44,7 @@ export async function fetchSubmission(parsed, token, fetchImpl = fetch) {
     const response = await fetchImpl(endpoint, {
       method: 'GET', redirect: 'manual',
       headers: { accept: 'application/vnd.github+json', authorization: `Bearer ${token}`, 'x-github-api-version': '2022-11-28' },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (!response.ok || response.status >= 300 && response.status < 400) throw new Error(SAFE_ERROR);
     const data = await response.json();
