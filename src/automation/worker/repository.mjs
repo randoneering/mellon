@@ -53,10 +53,15 @@ export function createRepositoryReadSession(config, { deadline, signal } = {}) {
   if (signal?.aborted) abort();
   const budget = {
     signal: controller.signal,
+    deadline: end,
     isExpired: () => expired || Date.now() >= end,
     async wait(operation) {
       if (expired || Date.now() >= end) fail();
-      const result = await Promise.race([Promise.resolve().then(operation), expiration]);
+      const pending = Promise.resolve().then(() => {
+        if (expired || Date.now() >= end) fail();
+        return operation();
+      });
+      const result = await Promise.race([pending, expiration]);
       if (expired || Date.now() >= end) fail();
       return result;
     },
@@ -108,7 +113,7 @@ export function createRepositoryReadSession(config, { deadline, signal } = {}) {
       const { data } = await get(ROOT);
       if (data?.id !== repositoryId || data?.full_name !== REPOSITORY || data?.private !== false) fail();
     },
-    close() { clearTimeout(timer); signal?.removeEventListener('abort', abort); controller.abort(); },
+    close() { clearTimeout(timer); signal?.removeEventListener('abort', abort); abort(); },
   };
 }
 
@@ -176,13 +181,51 @@ export function createRepositoryReader(configuration = {}) {
     || config.trustedPaths.some(source => !exact(source, ['path', 'sha256'])
       || !TRUSTED_PATHS.has(source.path) || !SHA256.test(source.sha256 ?? ''))) fail();
   const trusted = new Map(config.trustedPaths.map(source => [source.path, source.sha256]));
-  async function read(options, operation) {
+  async function read(options, operation, cache) {
     let session;
     try {
+      if (cache?.closed) fail();
       session = createRepositoryReadSession(config, options);
+      cache?.sessions.add(session);
       await session.verifyRepository();
       return await operation(session);
-    } catch { fail(); } finally { session?.close(); }
+    } catch { fail(); } finally { cache?.sessions.delete(session); session?.close(); }
+  }
+  async function immutableRead(cache, values, key, session, operation, signal) {
+    if (!cache) {
+      const value = await session.budget.wait(operation);
+      if (session.budget.isExpired()) fail();
+      return value;
+    }
+    if (cache.closed) fail();
+    let entry = values.get(key);
+    // A shorter or independently cancellable owner cannot bound another reader.
+    if (entry && !Object.hasOwn(entry, 'value')
+      && (entry.signal !== signal || entry.deadline < session.budget.deadline)) {
+      const value = await session.budget.wait(operation);
+      if (cache.closed || session.budget.isExpired()) fail();
+      return value;
+    }
+    if (!entry) {
+      entry = { signal, deadline: session.budget.deadline, promise: null };
+      const created = entry;
+      created.promise = Promise.resolve().then(() => {
+        if (cache.closed || session.budget.isExpired()) fail();
+        return operation();
+      }).then(value => {
+        if (cache.closed || session.budget.isExpired()) fail();
+        return value;
+      });
+      values.set(key, created);
+      void created.promise.then(value => {
+        if (!cache.closed && values.get(key) === created) values.set(key, { value });
+      }, () => {
+        if (values.get(key) === created) values.delete(key);
+      });
+    }
+    const value = await session.budget.wait(() => Object.hasOwn(entry, 'value') ? entry.value : entry.promise);
+    if (cache.closed || session.budget.isExpired()) fail();
+    return value;
   }
   async function readTrustedFile(request, cache) {
     const { revision, path, deadline, signal } = request;
@@ -191,22 +234,17 @@ export function createRepositoryReader(configuration = {}) {
       if (cache?.closed) fail();
       const identity = canonical({ repositoryId: config.repositoryId, revision, tokenScope: hash(config.token) });
       const treeKey = `${identity}:tree`;
-      let tree = cache?.trees.get(treeKey);
-      if (!tree) {
-        tree = await treeAt(session, revision);
-        if (cache?.closed || session.budget.isExpired()) fail();
-        cache?.trees.set(treeKey, tree);
-      }
+      const tree = await immutableRead(cache, cache?.trees, treeKey, session,
+        () => treeAt(session, revision), signal);
       const entry = tree.get(path);
       if (entry?.mode !== '100644') fail();
       const sourceKey = canonical({ identity, path, sha256: trusted.get(path), blobSha: entry.sha });
-      if (cache?.files.has(sourceKey)) return cache.files.get(sourceKey);
-      const text = await textBlob(session, entry.sha, 128 * 1024);
-      if (hash(text) !== trusted.get(path)) fail();
-      if (cache?.closed || session.budget.isExpired()) fail();
-      cache?.files.set(sourceKey, text);
-      return text;
-    });
+      return immutableRead(cache, cache?.files, sourceKey, session, async () => {
+        const text = await textBlob(session, entry.sha, 128 * 1024);
+        if (hash(text) !== trusted.get(path)) fail();
+        return text;
+      }, signal);
+    }, cache);
   }
   return Object.freeze({
     async readIssue({ manifest, deadline, signal }) {
@@ -229,9 +267,13 @@ export function createRepositoryReader(configuration = {}) {
     },
     async readTrustedFile(request) { return readTrustedFile(request, null); },
     createTrustedReadSession() {
-      const cache = { trees: new Map(), files: new Map(), closed: false };
+      const cache = { trees: new Map(), files: new Map(), sessions: new Set(), closed: false };
       return Object.freeze({ readTrustedFile: request => readTrustedFile(request, cache),
-        close() { cache.closed = true; cache.trees.clear(); cache.files.clear(); },
+        close() {
+          cache.closed = true;
+          for (const session of cache.sessions) session.close();
+          cache.sessions.clear(); cache.trees.clear(); cache.files.clear();
+        },
       });
     },
     async reconstructCandidate({ publication, metadata, deadline, signal }) {

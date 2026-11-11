@@ -81,6 +81,144 @@ test('trusted repository read session caches pinned Git objects but rechecks rep
   assert.equal(api.calls.filter(value => value.startsWith(`${root}/git/blobs/`)).length, 2);
 });
 
+test('trusted concurrent reads share in-flight Git objects and verify each repository access', async () => {
+  const path = 'AGENTS.md', text = '# concurrent trusted guidance';
+  const api = fakeApi(treeRoutes(text, path, POLICY));
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let commitReads = 0;
+  const fetch = async (url, init) => {
+    if (new URL(url).pathname === `${root}/git/commits/${POLICY}`) {
+      commitReads += 1;
+      await gate;
+    }
+    return api.fetch(url, init);
+  };
+  const reader = createRepositoryReader({ ...repositoryConfig({ fetch }),
+    trustedPaths: [{ path, sha256: hash(text) }] });
+  const session = reader.createTrustedReadSession();
+  const request = { revision: POLICY, path, ...options() };
+  const pending = Promise.all([session.readTrustedFile(request), session.readTrustedFile(request)]);
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(commitReads, 1);
+  } finally { release(); await pending; }
+  assert.deepEqual(await pending, [text, text]);
+  assert.equal(api.calls.filter(value => value === root).length, 2);
+  assert.equal(api.calls.filter(value => value.includes('/git/trees/')).length, 1);
+  assert.equal(api.calls.filter(value => value.includes('/git/blobs/')).length, 1);
+  session.close();
+});
+
+test('an earlier caller deadline cannot abort a later independent trusted read', async () => {
+  const path = 'AGENTS.md', text = '# independent deadlines';
+  const api = fakeApi(treeRoutes(text, path, POLICY));
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const fetch = async (url, init) => {
+    if (new URL(url).pathname.includes('/git/commits/')) await gate;
+    return api.fetch(url, init);
+  };
+  const reader = createRepositoryReader({ ...repositoryConfig({ fetch }),
+    trustedPaths: [{ path, sha256: hash(text) }] });
+  const session = reader.createTrustedReadSession();
+  const first = session.readTrustedFile({ revision: POLICY, path, deadline: Date.now() + 50 });
+  const rejected = assert.rejects(first, /Repository/);
+  await new Promise(resolve => setImmediate(resolve));
+  const second = session.readTrustedFile({ revision: POLICY, path, ...options() })
+    .then(value => ({ value }), error => ({ error }));
+  await rejected;
+  release();
+  assert.deepEqual(await second, { value: text });
+  session.close();
+});
+
+test('one caller signal cannot abort another trusted read with its own signal', async () => {
+  const path = 'AGENTS.md', text = '# independent signals';
+  const api = fakeApi(treeRoutes(text, path, POLICY));
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const fetch = async (url, init) => {
+    if (new URL(url).pathname.includes('/git/commits/')) await gate;
+    return api.fetch(url, init);
+  };
+  const reader = createRepositoryReader({ ...repositoryConfig({ fetch }),
+    trustedPaths: [{ path, sha256: hash(text) }] });
+  const session = reader.createTrustedReadSession();
+  const firstSignal = new AbortController(), secondSignal = new AbortController();
+  const request = { revision: POLICY, path, ...options() };
+  const first = session.readTrustedFile({ ...request, signal: firstSignal.signal });
+  const rejected = assert.rejects(first, /Repository/);
+  await new Promise(resolve => setImmediate(resolve));
+  const second = session.readTrustedFile({ ...request, signal: secondSignal.signal })
+    .then(value => ({ value }), error => ({ error }));
+  await new Promise(resolve => setImmediate(resolve));
+  firstSignal.abort();
+  release();
+  await rejected;
+  assert.deepEqual(await second, { value: text });
+  session.close();
+});
+
+test('closing a trusted session before dispatch starts no queued transport callback', async () => {
+  const path = 'AGENTS.md', text = '# close before dispatch';
+  const api = fakeApi(treeRoutes(text, path, POLICY));
+  const reader = createRepositoryReader({ ...repositoryConfig(api),
+    trustedPaths: [{ path, sha256: hash(text) }] });
+  const session = reader.createTrustedReadSession();
+  const pending = session.readTrustedFile({ revision: POLICY, path, ...options() });
+  const rejected = assert.rejects(pending, /Repository/);
+  session.close();
+  await rejected;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(api.calls.length, 0);
+});
+
+test('closing a shared read aborts its in-flight transport before another Git request', async () => {
+  const path = 'AGENTS.md', text = '# closed concurrent guidance';
+  const api = fakeApi(treeRoutes(text, path, POLICY));
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const requested = [];
+  const fetch = async (url, init) => {
+    requested.push(new URL(url).pathname);
+    if (new URL(url).pathname.includes('/git/commits/')) await gate;
+    return api.fetch(url, init);
+  };
+  const reader = createRepositoryReader({ ...repositoryConfig({ fetch }),
+    trustedPaths: [{ path, sha256: hash(text) }] });
+  const session = reader.createTrustedReadSession();
+  const pending = session.readTrustedFile({ revision: POLICY, path, ...options() });
+  const rejected = assert.rejects(pending, /Repository/);
+  await new Promise(resolve => setImmediate(resolve));
+  session.close();
+  release();
+  await rejected;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requested.some(value => value.includes('/git/trees/')), false);
+  assert.equal(requested.some(value => value.includes('/git/blobs/')), false);
+});
+
+test('a rejected shared Git read does not poison the next verified read', async () => {
+  const path = 'AGENTS.md', text = '# retry verified read';
+  let commitReads = 0;
+  const api = fakeApi(treeRoutes(text, path, POLICY), (key, value) => {
+    if (key === `${root}/git/commits/${POLICY}` && ++commitReads === 1) {
+      return { ...value, sha: 'f'.repeat(40) };
+    }
+    return value;
+  });
+  const reader = createRepositoryReader({ ...repositoryConfig(api),
+    trustedPaths: [{ path, sha256: hash(text) }] });
+  const session = reader.createTrustedReadSession();
+  const request = { revision: POLICY, path, ...options() };
+  const results = await Promise.allSettled([session.readTrustedFile(request), session.readTrustedFile(request)]);
+  assert.deepEqual(results.map(value => value.status), ['rejected', 'rejected']);
+  assert.equal(await session.readTrustedFile(request), text);
+  assert.equal(commitReads, 2);
+  session.close();
+});
+
 test('trusted repository session closes permanently without permitting cached reads', async () => {
   const path = 'AGENTS.md', text = '# trusted';
   const api = fakeApi(treeRoutes(text, path, POLICY));
