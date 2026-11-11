@@ -49,6 +49,29 @@ test('runtime startup shares the explicitly smaller configured tick deadline', a
   assert.deepEqual(await run(f), { status: 200, value: { status: 'idle' } });
 });
 
+test('runtime gives coordinator finalization a deadline before outer pool closure', async () => {
+  const f = await runtimeFixture();
+  let outerDeadline;
+  const module = await import('../../src/automation/worker/github-app.mjs');
+  f.factories.createBroker = (config, dependencies) => {
+    const broker = module.createGitHubAppBroker(config, dependencies);
+    return { ...broker, async getReadToken(control) {
+      outerDeadline = control.deadline;
+      return broker.getReadToken(control);
+    } };
+  };
+  f.factories.createCoordinator = options => {
+    assert.ok(options.timeoutMs > 0);
+    assert.ok(Date.now() + options.timeoutMs <= outerDeadline - 995);
+    return { async advanceTick() {
+      assert.equal(f.pool().closed, false);
+      return { status: 'idle' };
+    } };
+  };
+  assert.deepEqual(await run(f), { status: 200, value: { status: 'idle' } });
+  assert.equal(f.pool().closed, true);
+});
+
 test('public requests cannot construct runtime clients through forged payload fields', async () => {
   const f = await runtimeFixture();
   const request = runtimeRequest(); request.headers.delete('x-neon-trigger-invocation-id');

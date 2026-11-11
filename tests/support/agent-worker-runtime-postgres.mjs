@@ -6,6 +6,7 @@ import pg from 'pg';
 import { openDisposablePool } from './agent-intake-database.mjs';
 import { createWorkerDatabase } from '../../src/automation/worker/pool.mjs';
 import { createWorkerStore } from '../../src/automation/worker/store.mjs';
+import { runtimePostgres } from './agent-worker-runtime-postgres-context.mjs';
 import { manifest } from '../fixtures/worker-candidates/inputs.mjs';
 
 const ROLE = 'mellon_runtime_worker_test';
@@ -58,6 +59,22 @@ before(async () => {
   url.username = ROLE; url.password = password; url.search = '?sslmode=verify-full';
   database = createWorkerDatabase({ env: { AGENT_WORKER_DATABASE_URL: url.toString() },
     databaseRole: ROLE, report() {} }, { Pool: LocalPlaintextPool });
+  Object.assign(runtimePostgres, { owner, database, role: ROLE, admin,
+    openDatabase: () => createWorkerDatabase({
+      env: { AGENT_WORKER_DATABASE_URL: url.toString() }, databaseRole: ROLE, report() {},
+    }, { Pool: LocalPlaintextPool }),
+    async verifyLocalRole(local, options) {
+      lastReceipt = null;
+      await assert.rejects(local.verifyRole(options), { message: 'Worker database role could not be verified.' });
+      assert.ok(lastReceipt);
+      assert.equal(lastReceipt.role_name, ROLE); assert.equal(lastReceipt.session_role, ROLE);
+      assert.equal(lastReceipt.ssl, false);
+      assert.equal(lastReceipt.grants_ok, true); assert.equal(lastReceipt.limits_ok, true);
+      for (const key of ['rolsuper', 'rolbypassrls', 'rolcreatedb', 'rolcreaterole',
+        'rolreplication', 'rolinherit', 'has_memberships', 'owns_database', 'owns_app_objects',
+        'database_create', 'schema_create']) assert.equal(lastReceipt[key], false, key);
+    },
+  });
 });
 
 after(async () => {
@@ -167,3 +184,7 @@ test('actual durable store permits two bounded initial reservations without refu
     assert.equal(run.reservedInputTokens, 70000); assert.equal(run.modelCallCount, 2);
   } finally { await worker.finishRun(lease, 'cancelled'); }
 });
+
+if (process.env.MELLON_PUBLICATION_DEADLINE_CASE) {
+  await import('../manual/agent-worker-publication-deadline-runtime.mjs');
+}

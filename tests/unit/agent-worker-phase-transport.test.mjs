@@ -26,7 +26,7 @@ const basicContext = () => ({
   phaseInstructions: { purpose: 'initial_tests', repairCycle: 0, regressionPath: 'src/example.mjs',
     testName: 'adds example', criterionIndex: 0, criterion: 'Adds example' },
 });
-function makeWorker({ context = basicContext(), response, reserve = async () => reservation(), validateChanges, readFile } = {}) {
+function makeWorker({ context = basicContext(), response, reserve = async () => reservation(), validateChanges, readFile, deadline } = {}) {
   const requests = [], outcomes = [];
   let reservations = 0;
   const worker = createAgentWorker({ config, loadContext: async () => context,
@@ -39,6 +39,7 @@ function makeWorker({ context = basicContext(), response, reserve = async () => 
     tokenizer: { modelId: config.modelId, renderer: 'neon-responses-gpt-6-1-sol-v1', reasoningEffort: 'high', countRendered: () => 512 },
     ...(validateChanges ? { validateChanges } : {}),
     ...(readFile ? { readFile } : {}),
+    ...(deadline === undefined ? {} : { deadline }),
     sdk: { fetch: async (url, init) => {
       const request = { url: String(url), method: init.method, body: JSON.parse(init.body) };
       requests.push(request);
@@ -50,6 +51,15 @@ function makeWorker({ context = basicContext(), response, reserve = async () => 
   return { worker, requests, outcomes, reservations: () => reservations };
 }
 const toolCall = (name, args) => ({ id: 'fc_1', type: 'function_call', call_id: 'call_1', name, arguments: JSON.stringify(args), status: 'completed' });
+
+test('expired coordinator deadline stops before reservation or native SDK transport', async () => {
+  const harness = makeWorker({ deadline: Date.now() - 1,
+    response: toolCall('proposeChanges', { baseSha, manifestHash, changes: [] }) });
+  const result = await harness.worker.run({});
+  assert.equal(result.blockerCode, 'deadline');
+  assert.equal(harness.reservations(), 0);
+  assert.equal(harness.requests.length, 0);
+});
 
 test('complete coordinator phase forces a single proposal-only SDK request and accepts its bounded proposal', async () => {
   const proposal = { baseSha, manifestHash, changes: [{ operation: 'modify', path: 'src/example.mjs', content: 'export const value = 1;', expectedBlobSha: blobSha }] };

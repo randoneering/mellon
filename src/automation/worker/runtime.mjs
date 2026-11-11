@@ -72,7 +72,9 @@ export function createWorkerRuntime({ env, report, factories = {} }) {
         store, manifest: config.manifest, expectedManifestSha256: config.manifestSha256,
         policyManifest: config.policyManifest, triggerId: config.triggerId,
         readToken, ownedActor: config.github.actor, fetch, isEnabled: current,
-        timeoutMs: Math.max(1, Math.min(90_000, budget.deadline - Date.now())),
+        // Let the coordinator settle its ledger before the outer runtime closes the pool.
+        deadline: budget.deadline - 1000,
+        timeoutMs: Math.max(1, Math.min(90_000, budget.deadline - Date.now() - 1000)),
         model: {
           config: { gateway: { baseURL: credentials.baseURL, apiKey: credentials.apiKey },
             modelId: config.manifest.model.id, reasoningEffort: config.manifest.model.reasoningEffort,

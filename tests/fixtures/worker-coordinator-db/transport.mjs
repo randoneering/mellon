@@ -71,7 +71,7 @@ export async function controlledTransport(job) {
   const state = { calls: [], mutations: [], modelCalls: 0, contexts: [], branch: null,
     head: null, prs: [], ci: 'waiting', review: 'waiting', revoked: false,
     loss: null, disposition: 'confirmed', issueOpen: true, runId: null, selected: null,
-    producerTamper: null, reportTamper: null, findingIdentity: null };
+    producerTamper: null, reportTamper: null, findingIdentity: null, branchRequest: null };
   const publicationContext = () => {
     const expires = new Date(Date.now() + 60000).toISOString();
     return { token: 'synthetic-app-private', tokenExpiresAt: expires, contextExpiresAt: expires,
@@ -161,8 +161,10 @@ export async function controlledTransport(job) {
       object: { type: 'commit', sha: state.head } }) : json({}, 404);
     if (path === '/git/refs' && method === 'POST') {
       const body = JSON.parse(init.body);
-      assert.equal(body.ref === `refs/heads/agent-work/${state.runId}`, true);
-      assert.equal(body.sha, HEAD);
+      state.branchRequest = { refMatchesRun: body.ref === `refs/heads/agent-work/${state.runId}`,
+        baseMatches: body.sha === HEAD };
+      assert.equal(state.branchRequest.refMatchesRun, true);
+      assert.equal(state.branchRequest.baseMatches, true);
       state.branch = `agent-work/${state.runId}`; state.head = HEAD;
       state.mutations.push('branch');
       if (state.afterMutation) await state.afterMutation('branch');
@@ -287,7 +289,9 @@ export async function controlledTransport(job) {
     // Captures the real factory's context without substituting its validation or execution.
     createAgentWorker(options) { return createAgentWorker({ ...options,
       loadContext: async () => { const context = await options.loadContext(); state.contexts.push(context); return context; } }); },
-    publicationDependencies: { fetch: controlledFetch, timeoutMs: 10000, getPublicationContext: async () => publicationContext(),
+    publicationDependencies: { fetch: controlledFetch, timeoutMs: 10000,
+      now: () => { state.publisherBudgetStartedAt = Date.now(); return state.publisherBudgetStartedAt; },
+      getPublicationContext: async () => publicationContext(),
       getPullRequestContext: async () => { const publication = publicationContext(); return { publicationContext: publication,
         installationToken: { repositoryId: publication.repositoryId, repositoryName: publication.repositoryName,
           appId: publication.appId, installationId: publication.installationId, tokenExpiresAt: publication.tokenExpiresAt,

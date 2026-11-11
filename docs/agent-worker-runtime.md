@@ -99,6 +99,11 @@ Policy-source, manifest, config and preflight pins must be regenerated and appro
 6. Close request-owned resources through bounded cleanup, without replacing the confirmed outcome if diagnostics fail.
 
 Startup and advancement share the configured tick deadline, at most 90 seconds.
+The coordinator ends at least one second before the outer runtime deadline so ledger finalization can settle before pool closure.
+Within that deadline, model work ends 23 seconds early, model-outcome recording ends 18 seconds early, and publication ends 10 seconds early.
+Publication admission requires at least eight seconds before its cutoff; the single provider call still has a 45-second ceiling.
+Only verified, pinned Git objects share a per-tick cache; approval, permissions, labels, issue content, head and write fences stay fresh.
+Uncertain database writes never authorize a compensating write.
 Current enablement, branch, config pins, credentials and preflight expiry are checked again before subsequent effects.
 Already accepted remote SQL/HTTP/model work may finish after local cancellation.
 No automatic provider retry, arbitrary module loader, in-memory dedupe or phase loop is added.
@@ -108,4 +113,19 @@ No automatic provider retry, arbitrary module loader, in-memory dedupe or phase 
 Unit composition uses actual constructors with controlled HTTP/database receipts.
 The manual `npm run test:worker:runtime:db` suite executes actual catalog/grant/limit and reservation SQL in a fresh marker-guarded container.
 Its plaintext test transport is deliberately rejected by production TLS attestation; it does not establish live Neon TLS or service isolation.
-The new manual file is outside ordinary test discovery, so it adds no default database skips.
+The manual files stay outside ordinary test discovery, so they add no default database skips.
+
+Run the wall-clock publication regression in separate fresh containers:
+
+```sh
+MELLON_PUBLICATION_DEADLINE_CASE=baseline npm run test:worker:runtime:db
+MELLON_PUBLICATION_DEADLINE_CASE=green npm run test:worker:runtime:db
+```
+
+`tests/manual/agent-worker-publication-deadline-runtime.mjs` restores every baseline source from `HEAD` and exercises the production Function entry, actual SQL ledger and installed Responses SDK.
+The green case covers regression publication, authenticated native-shaped RED/GREEN CI records, implementation, draft creation, exact-head review and expiry with late transport completion.
+Both cases retain all three runner-marker probes.
+Latency uses real waits of 4,500ms for startup, 770ms per trusted policy blob and 30,713ms for the profiled model response.
+PostgreSQL and JavaScript use their unchanged clocks.
+The local test substitutes App authority and allows plaintext only after the real catalog query; external HTTP responses and review records remain mocked.
+It proves no live Gateway, App, CI or review behavior.

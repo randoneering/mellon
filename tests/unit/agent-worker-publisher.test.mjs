@@ -34,6 +34,45 @@ function graphqlMutations(fixture) {
     && JSON.parse(call.body).query.includes('mutation AgentWorkerCreateCommit'));
 }
 
+test('publisher absolute deadline bounds a callback that ignores cancellation', async () => {
+  const fixture = createPublisherFixture();
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const startedAt = Date.now();
+  const result = await publish(fixture.request, { ...fixture.dependencies,
+    timeoutMs: 2000, deadline: startedAt + 25,
+    getPublicationContext: () => pending });
+  assert.equal(result.status, 'needs_attention');
+  assert.ok(Date.now() - startedAt < 1000);
+  release(fixture.context);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(writes(fixture).length, 0);
+});
+
+test('publisher rejects an expired callback result before consuming it', async t => {
+  const fixture = createPublisherFixture();
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  let consumed = 0;
+  const lateContext = new Proxy(fixture.context, {
+    get(target, key, receiver) {
+      if (key !== 'then') consumed += 1;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  const result = await publish(fixture.request, { ...fixture.dependencies,
+    timeoutMs: 1000,
+    getPublicationContext: async () => {
+      now += 1001;
+      return lateContext;
+    },
+  });
+  assert.equal(result.reason, 'deadline_exceeded');
+  assert.equal(consumed, 0);
+  assert.equal(fixture.calls.length, 0);
+  assert.equal(writes(fixture).length, 0);
+});
+
 test('publishes one structured commit to the deterministic run branch with expected-head CAS', async () => {
   const fixture = createPublisherFixture();
   const result = await publish(fixture.request, fixture.dependencies);
