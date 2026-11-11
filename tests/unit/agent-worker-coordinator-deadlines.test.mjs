@@ -173,3 +173,40 @@ test('reservation SQL expires before the separately funded post-reservation auth
   assert.equal(h.state.modelRequests, 0);
   assert.equal(h.state.calls.some(call => call[0] === 'recordModelCallOutcome'), false);
 });
+
+test('settled uncertain model outcome survives post-reservation authority expiry', async t => {
+  const h = await harness();
+  let clock = Date.now(), modelDeadline;
+  t.mock.method(Date, 'now', () => clock);
+  const createAgent = h.adapters.createAgentWorker;
+  h.adapters.createAgentWorker = options => {
+    modelDeadline = options.deadline;
+    return createAgent(options);
+  };
+  await generating(h);
+  h.state.approvalHook = () => {
+    if (h.state.modelOperation) clock = modelDeadline - 30_000 + 1;
+  };
+  const recordOutcome = h.store.recordModelCallOutcome;
+  h.store.recordModelCallOutcome = async (...args) => {
+    const receipt = await recordOutcome(...args);
+    assert.equal(receipt.outcome, 'uncertain');
+    assert.equal(receipt.blockerCode, 'model_outcome_uncertain');
+    h.state.run.state = 'needs_attention';
+    h.state.run.terminalAt = new Date(clock).toISOString();
+    h.state.lease = null;
+    return receipt;
+  };
+  h.store.finishRun = async (...args) => {
+    h.state.calls.push(['finishRun', ...args]);
+    return false;
+  };
+  const response = await tick(h);
+  assert.equal(response.status, 'needs_attention');
+  assert.equal(response.reason, 'model_outcome_uncertain');
+  assert.equal(h.state.modelOperation.outcome, 'uncertain');
+  assert.equal(h.state.run.state, 'needs_attention');
+  assert.equal(h.state.modelRequests, 0);
+  assert.equal(h.state.calls.filter(call => call[0] === 'recordModelCallOutcome').length, 1);
+  assert.equal(h.state.calls.some(call => call[0] === 'finishRun'), false);
+});

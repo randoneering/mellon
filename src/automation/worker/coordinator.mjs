@@ -722,8 +722,8 @@ export function createCoordinator(dependencies = {}) {
       agentDiagnostics = safeAgentDiagnostics(generated?.diagnostics);
       if (terminalResult) return terminalResult;
       if (databaseUncertain) stop('recovery_database_uncertain');
-      if (stageFailure) throw stageFailure;
       if (generated?.blockerCode === 'model_outcome_uncertain') return result('needs_attention', 'model_outcome_uncertain', false, agentDiagnostics);
+      if (stageFailure) throw stageFailure;
       if (generated?.blockerCode === 'investigation_human_stop' || generated?.blockerCode === 'investigation_assessment_unavailable') stop('coordinator_investigation_human_stop');
       if (generated?.status !== 'completed' || generated.proposal !== true || !successfulOutcome || !modelOperationId
         || generated.baseSha !== headSha || generated.manifestHash !== expectedManifestSha256) {
