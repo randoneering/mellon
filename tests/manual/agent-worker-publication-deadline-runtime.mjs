@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { cpSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { pathToFileURL, fileURLToPath } from 'node:url';
+import { dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createProductionWorkerFunction } from '../../src/automation/worker/function.mjs';
@@ -16,16 +16,31 @@ import { runtimePostgres } from '../support/agent-worker-runtime-postgres-contex
 
 const CASE = process.env.MELLON_PUBLICATION_DEADLINE_CASE;
 const LATENCY = Object.freeze({ startupMs: 4500, policyBlobMs: 770, modelMs: 30713 });
+const BASELINE_REVISION = '1c08180084dac9807a031bcc61b3c97435c868eb';
 
 async function baselineEntry() {
   const directory = join(tmpdir(), `mellon-publication-baseline-${randomUUID()}`);
   mkdirSync(directory, { recursive: true });
-  cpSync(fileURLToPath(new URL('../../src/', import.meta.url)), join(directory, 'src'), { recursive: true });
   symlinkSync(resolve('node_modules'), join(directory, 'node_modules'), 'dir');
   // Restore every tracked source, including the runtime and all publication dependencies.
-  const paths = execFileSync('git', ['ls-tree', '-r', '--name-only', 'HEAD', '--', 'src'], { encoding: 'utf8' }).trim().split('\n');
+  const paths = execFileSync('git', ['ls-tree', '-r', '--name-only', BASELINE_REVISION, '--', 'src'], { encoding: 'utf8' }).trim().split('\n');
   for (const path of paths) {
-    writeFileSync(join(directory, path), execFileSync('git', ['show', `HEAD:${path}`]));
+    mkdirSync(dirname(join(directory, path)), { recursive: true });
+    writeFileSync(join(directory, path), execFileSync('git', ['show', `${BASELINE_REVISION}:${path}`]));
+  }
+  if (CASE === 'source-pin') {
+    const revision = '1c08180084dac9807a031bcc61b3c97435c868eb';
+    const expected = execFileSync('git', ['ls-tree', '-r', '--name-only', revision, '--', 'src'],
+      { encoding: 'utf8' }).trim().split('\n');
+    const restored = readdirSync(join(directory, 'src'), { recursive: true, withFileTypes: true })
+      .filter(entry => entry.isFile())
+      .map(entry => join(entry.parentPath, entry.name).slice(directory.length + 1)).sort();
+    assert.deepEqual(restored, expected.sort());
+    for (const path of expected) {
+      assert.deepEqual(readFileSync(join(directory, path)),
+        execFileSync('git', ['show', `${revision}:${path}`]), `Pinned baseline source: ${path}`);
+    }
+    console.log(JSON.stringify({ case: 'source-pin', revision, verifiedSources: expected.length }));
   }
   return (await import(pathToFileURL(join(directory, 'src/automation/worker/function.mjs')).href)).createProductionWorkerFunction;
 }
@@ -169,6 +184,10 @@ async function runtimeHarness({ entry = createProductionWorkerFunction, profile 
   }
   return { f, transport, metrics, reports, tick, ledger, receipt, releaseStall };
 }
+
+if (CASE === 'source-pin') test('baseline restoration uses only the public pre-change source tree', async () => {
+  assert.equal(typeof await baselineEntry(), 'function');
+});
 
 if (CASE === 'baseline') test('untouched production baseline exposes the outer runtime publication race', async () => {
   const h = await runtimeHarness({ entry: await baselineEntry(), profile: true });

@@ -147,12 +147,16 @@ It never changes draft status, approves, dismisses, merges, closes, labels, depl
 
 The aggregate budget starts at tick entry and clamps to the database's claimed deadline.
 Operations use lazy factories with checks before invocation and after awaited completion.
-Every store call, including calls made through recovery, receives the original unchanged `claimTick.deadline` as its final `{deadline}` argument.
-Recovery receives that same deadline with the original lease, intent, and publication envelope.
+Every store call, including calls made through recovery, receives a stage `{deadline}` no later than the original `claimTick.deadline`.
+Model work ends 33 seconds before the finalization deadline: five seconds fund outcome recording, 10 seconds fund fresh post-model authority, eight seconds fund publication, and 10 seconds fund finalization.
+Reservation SQL ends at the earlier model-admission cutoff, leaving 10 seconds for post-reservation authority before the minimum 30-second model window.
+Recovery receives the publication cutoff with the original lease, intent, and publication envelope.
 The store retains its own five-second total bound and database-authoritative ownership/time checks.
 No database transaction spans a network call.
 
+Known read-only failures and deadlines before SQL dispatch permit bounded terminal finalization; they do not imply an uncertain write.
 Uncertain database acknowledgment causes no compensating terminal write or later publication in that continuation.
+A confirmed terminal result survives later recovery rejection or expiry.
 Unrecognized recovery rejection is also treated conservatively without another write.
 Late callbacks cannot resume coordinator work or use its store authority after expiry/cancellation.
 CI/review wait expiry uses the durable database wait start and never resets it through polling.

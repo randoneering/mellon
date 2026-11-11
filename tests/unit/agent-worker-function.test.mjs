@@ -459,6 +459,20 @@ test('proposal diagnostics reach the report callback through a closed metadata p
   ]);
 });
 
+for (const effectCategory of ['pr_context_unavailable', 'pr_template_unverified',
+  'pr_evidence_invalid', 'pr_evidence_incomplete', 'pr_identity_ambiguous',
+  'pr_identity_mismatch', 'pr_write_not_observed', 'pr_write_unconfirmed',
+  'pr_publication_failed', 'private draft error']) {
+  test(`draft diagnostic projection keeps only the closed category ${effectCategory}`, async () => {
+    const { handle, reports } = fixture({ advanceTick: async () => ({ status: 'needs_attention',
+      diagnostics: { stage: 'publication', category: 'recovery_effect_unconfirmed', effectCategory },
+    }) });
+    await responseBody(await handle.fetch(request()), 200, { status: 'needs_attention' });
+    assert.deepEqual(reports, ['[agent_worker] stage=publication category=recovery_effect_unconfirmed'
+      + (effectCategory === 'private draft error' ? '' : ` effect=${effectCategory}`)]);
+  });
+}
+
 test('unknown proposal diagnostic values never reach reports', async () => {
   const { handle, reports } = fixture({ advanceTick: async () => ({
     status: 'needs_attention', diagnostics: { proposalCategory: 'private issue',

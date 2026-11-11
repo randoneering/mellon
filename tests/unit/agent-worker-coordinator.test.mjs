@@ -190,7 +190,7 @@ test('coordinator keeps distinct model, publication, and finalization cutoffs', 
     assert.ok(publicationCall);
     const publication = publicationCall[1];
     const effectiveDeadline = Math.min(h.state.deadline, h.state.outerDeadline);
-    assert.equal(modelDeadline, effectiveDeadline - 23_000);
+    assert.equal(modelDeadline, effectiveDeadline - 33_000);
     assert.equal(publication.deadline, effectiveDeadline - 10_000);
     assert.ok(publication.deadline > modelDeadline);
   } finally { dateNow.mock.restore(); }
@@ -235,7 +235,7 @@ test('coordinator shortens the single model call to preserve publication time', 
   const dateNow = mock.method(Date, 'now', () => clock);
   let modelTimeout;
   try {
-    h.state.filesHook = async () => { clock += 20_000; };
+    h.state.filesHook = async () => { clock += 10_000; };
     const createAgentWorker = h.dependencies.adapters.createAgentWorker;
     h.dependencies.adapters.createAgentWorker = options => {
       modelTimeout = options.timeoutMs;

@@ -53,6 +53,9 @@ function reportCoordinatorDiagnostics(report, value) {
     'commit_metadata_invalid', 'commit_write_not_observed', 'commit_write_unconfirmed',
     'fence_denied', 'fence_unavailable', 'invalid_input', 'patch_rejected',
     'publication_context_invalid', 'publication_context_unavailable',
+    'pr_context_unavailable', 'pr_template_unverified', 'pr_evidence_invalid',
+    'pr_evidence_incomplete', 'pr_identity_ambiguous', 'pr_identity_mismatch',
+    'pr_write_not_observed', 'pr_write_unconfirmed', 'pr_publication_failed',
     'repository_identity_mismatch', 'repository_read_failed', 'signing_preflight_expired',
     'tree_incomplete', 'unsupported_file_mode']);
   if (!stages.has(value?.stage) || !categories.has(value.category)) return;

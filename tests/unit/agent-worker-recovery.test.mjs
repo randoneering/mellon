@@ -111,6 +111,20 @@ for (const fault of ['before', 'after']) {
   });
 }
 
+for (const [name, options, effectCategory] of [
+  ['unconfirmed creation', { losePrAck: true, prDoesNotApply: true }, 'pr_write_unconfirmed'],
+  ['foreign identity', { createdPr: pr => ({ ...pr, user: { id: 999, login: 'foreign', type: 'Bot' } }) }, 'pr_identity_mismatch'],
+]) {
+  test(`draft recovery preserves the closed failure category for ${name}`, async () => {
+    const h = harness({ draftPr: true, ...options });
+    const response = await h.coordinator.perform(h.input);
+    assert.equal(response.reason, 'recovery_effect_unconfirmed');
+    assert.equal(response.effectCategory, effectCategory);
+    assert.equal(response.persisted, true);
+    assert.equal(h.state.confirmed, null);
+  });
+}
+
 test('existing intent reconciles exact publisher proof without writing', async () => {
   const h = harness({ existing: true, initialBranchHead: COMMIT_SHA });
   assert.equal((await h.coordinator.perform(h.input)).status, 'confirmed');

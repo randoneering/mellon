@@ -34,6 +34,7 @@ const MODEL_CALL_CEILING_MS = 45_000;
 const MIN_MODEL_WINDOW_MS = 30_000;
 const POST_RESERVATION_AUTH_MS = 10_000;
 const MODEL_OUTCOME_WINDOW_MS = 5_000;
+const POST_MODEL_AUTH_MS = 10_000;
 const PUBLICATION_WINDOW_MS = 8_000;
 const PUBLICATION_ADMISSION_MS = 8_000;
 const FINALIZATION_GRACE_MS = 10_000;
@@ -222,9 +223,12 @@ export function createCoordinator(dependencies = {}) {
     let lease, claimedDeadline, finalizationDeadline, publicationDeadline, outcomeDeadline,
       modelDeadline, modelAdmissionDeadline, snapshot, terminalResult, databaseUncertain = false,
       agentDiagnostics = null, reviewDiagnostics, modelUsage = null, modelOperationId = null,
-      knownIntent = null;
+      knownIntent = null, stageFailure = null, activeDatabaseWrites = 0;
     function checkDeadline(deadline) {
-      if (!Number.isSafeInteger(deadline) || Date.now() >= deadline) stop('recovery_deadline');
+      if (!Number.isSafeInteger(deadline) || Date.now() >= deadline) {
+        stageFailure = new Stop('recovery_deadline');
+        throw stageFailure;
+      }
     }
     async function waitUntil(deadline, operation) {
       checkDeadline(deadline);
@@ -235,23 +239,38 @@ export function createCoordinator(dependencies = {}) {
       catch (error) {
         if (stage.isExpired()) {
           if (deadline === finalizationDeadline) budget.close();
-          stop('recovery_deadline');
+          stageFailure = new Stop('recovery_deadline');
+          throw stageFailure;
         }
         throw error;
       } finally { budget.signal.removeEventListener('abort', abortStage); stage.close(); }
     }
-    async function database(operation, deadline = finalizationDeadline ?? budget.deadline) {
+    async function database(operation, deadline = finalizationDeadline ?? budget.deadline,
+      { readOnly = false } = {}) {
       if (databaseUncertain || terminalResult) stop('recovery_database_uncertain');
       checkDeadline(deadline);
+      let started = false;
       try {
-        return await waitUntil(deadline, () => operation({ deadline }));
-      } catch {
+        return await waitUntil(deadline, () => {
+          checkDeadline(deadline);
+          started = true;
+          if (!readOnly) activeDatabaseWrites += 1;
+          return operation({ deadline });
+        });
+      } catch (error) {
+        if (readOnly || !started) {
+          stageFailure = error instanceof Stop ? error : new Stop('coordinator_journal_conflict');
+          throw stageFailure;
+        }
         databaseUncertain = true;
         stop('recovery_database_uncertain');
+      } finally {
+        if (started && !readOnly) activeDatabaseWrites -= 1;
       }
     }
     async function owned(deadline = finalizationDeadline ?? budget.deadline) {
-      const value = await database(options => store.getCoordinatorSnapshot(lease, options), deadline);
+      const value = await database(options => store.getCoordinatorSnapshot(lease, options), deadline,
+        { readOnly: true });
       if (value?.status !== 'owned') stop('recovery_lease_lost');
       if (!boundRun(value.run, lease, claimManifest)) stop();
       if (snapshot?.phase && value.phase?.key !== snapshot.phase.key) stop('recovery_lease_lost');
@@ -390,7 +409,8 @@ export function createCoordinator(dependencies = {}) {
           const deadline = Number.isSafeInteger(requestedDeadline)
             ? Math.min(claimedDeadline ?? budget.deadline, requestedDeadline)
             : claimedDeadline ?? budget.deadline;
-          return database(options => store[name](...args.slice(0, count), options), deadline);
+          return database(options => store[name](...args.slice(0, count), options), deadline,
+            { readOnly: name === 'getRun' || name === 'getCoordinatorSnapshot' });
         }]));
       return (adapters.createRecoveryCoordinator ?? createRecoveryCoordinator)({ store: recoveryStore, publicationDependencies: {
         ...publicationDependencies,
@@ -415,12 +435,18 @@ export function createCoordinator(dependencies = {}) {
       if (publicationDeadline - Date.now() < PUBLICATION_ADMISSION_MS) {
         stop('recovery_deadline');
       }
-      let outcome;
+      let outcome, recoveryStarted = false;
       try {
-        outcome = await waitUntil(finalizationDeadline,
-          () => recovery().perform({ lease, deadline: publicationDeadline, intent, publication }));
-      } catch {
-        // A rejected recovery may have committed a write without returning its receipt.
+        outcome = await waitUntil(finalizationDeadline, () => {
+          recoveryStarted = true;
+          return recovery().perform({ lease, deadline: publicationDeadline, intent, publication });
+        });
+      } catch (error) {
+        if (terminalResult) return terminalResult;
+        if (error instanceof Stop && error.reason === 'recovery_deadline' && !databaseUncertain
+          && activeDatabaseWrites === 0
+          && (!recoveryStarted || !adapters.createRecoveryCoordinator)) throw error;
+        // A rejected custom recovery or an uncertain write cannot authorize finalization.
         return result('needs_attention', 'recovery_database_uncertain', false,
           publicationDiagnostics('recovery_database_uncertain', intent));
       }
@@ -665,7 +691,7 @@ export function createCoordinator(dependencies = {}) {
             stop('recovery_deadline');
           }
           const receipt = await database(options => store.reserveModelCall(lease,
-            { ...request, key: snapshot.phase.key }, options), postReservationDeadline);
+            { ...request, key: snapshot.phase.key }, options), modelAdmissionDeadline);
           if (receipt?.status === 'reserved' && receipt.canExecute === true) modelOperationId = receipt.operationId;
           return receipt;
         },
@@ -694,8 +720,9 @@ export function createCoordinator(dependencies = {}) {
         }, timeoutMs: agentTimeoutMs }));
       const generated = await waitUntil(outcomeDeadline, () => agent.run({}));
       agentDiagnostics = safeAgentDiagnostics(generated?.diagnostics);
-      if (databaseUncertain) stop('recovery_database_uncertain');
       if (terminalResult) return terminalResult;
+      if (databaseUncertain) stop('recovery_database_uncertain');
+      if (stageFailure) throw stageFailure;
       if (generated?.blockerCode === 'model_outcome_uncertain') return result('needs_attention', 'model_outcome_uncertain', false, agentDiagnostics);
       if (generated?.blockerCode === 'investigation_human_stop' || generated?.blockerCode === 'investigation_assessment_unavailable') stop('coordinator_investigation_human_stop');
       if (generated?.status !== 'completed' || generated.proposal !== true || !successfulOutcome || !modelOperationId
@@ -724,7 +751,7 @@ export function createCoordinator(dependencies = {}) {
       budget.clamp(claimedDeadline);
       finalizationDeadline = Math.min(claimedDeadline, budget.deadline);
       publicationDeadline = finalizationDeadline - FINALIZATION_GRACE_MS;
-      outcomeDeadline = publicationDeadline - PUBLICATION_WINDOW_MS;
+      outcomeDeadline = publicationDeadline - PUBLICATION_WINDOW_MS - POST_MODEL_AUTH_MS;
       modelDeadline = outcomeDeadline - MODEL_OUTCOME_WINDOW_MS;
       modelAdmissionDeadline = modelDeadline - MIN_MODEL_WINDOW_MS - POST_RESERVATION_AUTH_MS;
       snapshot = await owned(finalizationDeadline);
@@ -831,7 +858,8 @@ export function createCoordinator(dependencies = {}) {
         ? publicationDiagnostics(reason, knownIntent)
         : modelOperationId ? { stage: 'model', category: reason, modelOperationId,
           ...(modelUsage ? { actualInputTokens: modelUsage.inputTokens,
-            actualOutputTokens: modelUsage.outputTokens } : {}) } : undefined;
+            actualOutputTokens: modelUsage.outputTokens } : {}) }
+          : { stage: 'finalization', category: reason };
       if (databaseUncertain) return result('needs_attention', 'recovery_database_uncertain', false,
         partialDiagnostics('recovery_database_uncertain'), reviewDiagnostics);
       if (budget.isExpired()) return result('needs_attention', 'recovery_deadline', false,
@@ -848,8 +876,11 @@ export function createCoordinator(dependencies = {}) {
         const persisted = await database(options => store.finishRun(lease, status,
           status === 'needs_attention' ? { blockerCode: reason } : {}, options));
         return persisted ? result(status, reason, true, diagnostics, reviewDiagnostics) : result('needs_attention', 'recovery_lease_lost', false, undefined, reviewDiagnostics);
-      } catch { return result('needs_attention', 'recovery_database_uncertain', false,
-        partialDiagnostics('recovery_database_uncertain'), reviewDiagnostics); }
+      } catch (failure) {
+        const reason = !databaseUncertain && failure instanceof Stop
+          && failure.reason === 'recovery_deadline' ? 'recovery_deadline' : 'recovery_database_uncertain';
+        return result('needs_attention', reason, false, partialDiagnostics(reason), reviewDiagnostics);
+      }
     } finally { trustedFileSession?.close?.(); budget.close(); }
   }
   return Object.freeze({ advanceTick });
