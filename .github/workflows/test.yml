@@ -9,9 +9,6 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    outputs:
-      encoded_report: ${{ steps.run-tests.outputs.encoded_report }}
-      test_exit_code: ${{ steps.run-tests.outputs.test_exit_code }}
     timeout-minutes: 15
     steps:
       - name: Check out source
@@ -24,62 +21,20 @@ jobs:
           node-version: 24
           cache: npm
       - name: Install locked dependencies without scripts
-        run: node automation/ci/guard-command.mjs install-root
+        run: npm ci --ignore-scripts
       - name: Install locked detector dependencies without scripts
-        run: node automation/ci/guard-command.mjs install-detector
+        run: npm ci --prefix detector --ignore-scripts
       - name: Verify assets
-        run: node automation/ci/guard-command.mjs verify-assets
+        run: npm run verify:assets
       - name: Test build safety
-        run: node automation/ci/guard-command.mjs test-build
+        run: npm run test:build
       - name: Run JavaScript tests
-        id: run-tests
         run: npm test
       - name: Verify parity
-        run: node automation/ci/guard-command.mjs test-parity
+        run: npm run test:parity
       - name: Build release files
-        run: node automation/ci/guard-command.mjs build
+        run: npm run build
       - name: Check distribution is committed
-        run: node automation/ci/guard-command.mjs check-dist
+        run: test -z "$(git status --porcelain --untracked-files=all -- dist)"
       - name: Validate workflow and bundle metadata
-        run: node automation/ci/guard-command.mjs validate-release
-
-  report:
-    name: test-report
-    if: always()
-    needs: [test]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    timeout-minutes: 5
-    steps:
-      - name: Validate reviewed formatter revision
-        id: pin
-        env:
-          MELLON_CI_REPORTER_REVISION: ${{ vars.MELLON_CI_REPORTER_REVISION }}
-        run: |
-          if [[ ! "$MELLON_CI_REPORTER_REVISION" =~ ^[a-f0-9]{40}$ ]]; then
-            echo "MELLON_CI_REPORTER_REVISION must be a reviewed lowercase 40-character commit SHA." >&2
-            exit 1
-          fi
-          printf 'revision=%s\n' "$MELLON_CI_REPORTER_REVISION" >> "$GITHUB_OUTPUT"
-      - name: Check out reviewed formatter
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ steps.pin.outputs.revision }}
-          path: formatter
-          persist-credentials: false
-      - name: Set up Node 24
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with:
-          node-version: 24
-      - name: Format bounded untrusted test report
-        env:
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_SHA: ${{ github.sha }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
-          MELLON_CI_REPORTER_REVISION: ${{ steps.pin.outputs.revision }}
-          MELLON_CI_ENCODED_REPORT: ${{ needs.test.outputs.encoded_report }}
-          MELLON_CI_TEST_EXIT_CODE: ${{ needs.test.outputs.test_exit_code }}
-        working-directory: formatter
-        run: node automation/ci/report-annotations.mjs
+        run: npm run validate:release

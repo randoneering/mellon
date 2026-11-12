@@ -68,21 +68,15 @@ Mark behavior that was not exercised as unverified.
    Surface an actionable notice in the GitHub Actions job summary, the Action diagnostic destination in rule 9; for missing outcome labels, ask maintainers to create them manually.
    Never include raw API errors, response bodies, credentials, or submission text.
    Test that optional setup failure preserves intended moderation behavior and produces the notice.
-9. **Keep operational failures diagnosable.** When catching or normalizing failures in moderation, intake, or CI reporting, preserve a sanitized stage, a fixed failure category, and any confirmed partial work.
+9. **Keep operational failures diagnosable.** When catching or normalizing failures in moderation or CI, preserve a sanitized stage, a fixed failure category, and any confirmed partial work.
    Use the GitHub Actions job summary for Action and CI diagnostics, including the optional-setup notices in rule 8.
-   Use the intake's `report` callback, which writes to stderr by default, for intake diagnostics.
    These destinations may include non-secret resource identifiers, such as a confirmed posted comment ID; rule 5 still prohibits raw API responses, response bodies, tokens, scorer exception messages, and submission text.
    Generic public error responses are allowed, but must not be the only diagnostic; do not report a failed operation with confirmed partial work as a plain skip.
-   Follow the stage and category pattern in `src/automation/intake.mjs` without changing published Action outputs just to add detail.
+   Keep published Action outputs unchanged when adding diagnostic detail.
    Test that new failure-handling paths preserve the sanitized diagnostics and any confirmed partial work.
    Maintainers need to know which step failed and what was already written to reconcile and retry safely.
 
 10. **Restrict PR comment authority.** Coding assistants never post PR comments.
-    Only the trusted deployed worker with the pinned `worker-command-maintainer-fallback-v1` policy may post the exact fixed `/agentic_review` command on its run-owned draft PR after its own confirmed commit, at most once per run/full head.
-    Persist intent and an attempted fence before posting; uncertain writes never authorize a repost.
-    Models receive no posting tool, and contributor review-on-push settings stay unchanged.
-    Command acknowledgement and issue-comment timestamps or SHA text do not prove review coverage.
-    Accept only supported exact-head Qodo evidence or the opted-in configured maintainer's authenticated native exact-head approval, with distinct evidence sources and unchanged CI requirements.
 
 ## Specifications
 
