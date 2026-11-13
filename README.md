@@ -164,6 +164,7 @@ npm run validate:release
 The test runners serialize files because build-safety tests rewrite `dist/` while other tests read it.
 The build produces the bundled Action, scorer, detector assets, metadata, and third-party notices in `dist/`.
 Include those files in a release commit; the Action does not install packages or download models at runtime.
+Repository maintainers can use the [isolated n8n build runner](docs/n8n-build-runner.md) to test approved source commits and export generated bundles without giving the runner publication credentials.
 
 ## Security and operations
 
