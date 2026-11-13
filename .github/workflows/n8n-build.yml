@@ -1,0 +1,78 @@
+name: n8n isolated build
+run-name: n8n-build-${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Approved n8n/issue-<number> source branch
+        required: true
+        type: string
+      source_sha:
+        description: Exact full commit SHA to test and rebuild
+        required: true
+        type: string
+      request_id:
+        description: n8n-<execution number> correlation ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: n8n-build-${{ inputs.request_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'randoneering/mellon' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      REQUEST_BRANCH: ${{ inputs.branch }}
+      REQUEST_SHA: ${{ inputs.source_sha }}
+      REQUEST_ID: ${{ inputs.request_id }}
+      SOURCE_ROOT: ${{ github.workspace }}/source
+    steps:
+      - name: Check out the reviewed runner helper
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+          sparse-checkout: .github/scripts/n8n-runner.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+
+      - name: Validate dispatch and exact source head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node control/.github/scripts/n8n-runner.mjs validate
+
+      - name: Check out the approved source commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Run fixed tests and rebuild distribution
+        run: node control/.github/scripts/n8n-runner.mjs checks
+
+      - name: Export bounded distribution results
+        id: export
+        run: node control/.github/scripts/n8n-runner.mjs export
+
+      - name: Upload the result for n8n
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.export.outputs.artifact_name }}
+          path: ${{ steps.export.outputs.path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
