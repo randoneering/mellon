@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
   buildManifest, runChecks, validateDispatch, verifyRequestedHead,
@@ -16,6 +18,21 @@ const files = () => ({
   'dist/scorer.mjs': Buffer.from('export const score = 0;\n'),
   'dist/build-meta.json': Buffer.from('{}\n'),
   'dist/THIRD_PARTY_NOTICES.txt': Buffer.from('Notices\n'),
+  'dist/detector/provenance.json': Buffer.from('{"fixture":"provenance"}\n'),
+  'dist/detector/vendor/aicomment/LICENSE': Buffer.from('License fixture\n'),
+  'dist/detector/vendor/aicomment/classifier.mjs': Buffer.from('export const fixture = true;\n'),
+  'dist/detector/vendor/aicomment/langs/c_family.mjs': Buffer.from('export const fixture = true;\n'),
+  'dist/detector/vendor/aicomment/langs/elisp.mjs': Buffer.from('export const fixture = true;\n'),
+  'dist/detector/vendor/aicomment/langs/haskell.mjs': Buffer.from('export const fixture = true;\n'),
+  'dist/detector/vendor/aicomment/langs/index.mjs': Buffer.from('export const fixture = true;\n'),
+  'dist/detector/vendor/aicomment/langs/perl.mjs': Buffer.from('export const fixture = true;\n'),
+  'dist/detector/vendor/aicomment/langs/php.mjs': Buffer.from('export const fixture = true;\n'),
+  'dist/detector/vendor/aicomment/langs/python.mjs': Buffer.from('export const fixture = true;\n'),
+  'dist/detector/vendor/aicomment/langs/registry.mjs': Buffer.from('export const fixture = true;\n'),
+  'dist/detector/vendor/aicomment/langs/shell.mjs': Buffer.from('export const fixture = true;\n'),
+  'dist/detector/vendor/aicomment/model.json': Buffer.from('{"fixture":"model"}\n'),
+  'dist/detector/vendor/aicomment/preprocess.mjs': Buffer.from('export const fixture = true;\n'),
+  'dist/detector/vendor/aicomment/pychars.mjs': Buffer.from('export const fixture = true;\n'),
 });
 
 test('accepts only a complete main-workflow dispatch bound to an issue branch', () => {
@@ -108,10 +125,38 @@ test('binds the manifest to the source, workflow, request, run, and file bytes',
   assert.equal(manifest.request_id, 'n8n-123');
   assert.equal(manifest.run_id, '123456');
   assert.equal(manifest.run_attempt, 1);
-  assert.equal(manifest.files.length, 4);
+  assert.equal(manifest.files.length, 19);
   const action = manifest.files.find(file => file.path === 'dist/index.mjs');
   assert.equal(action.contents, 'ZXhwb3J0IGNvbnN0IGFjdGlvbiA9IHRydWU7Cg==');
   assert.equal(action.sha256, createHash('sha256').update('export const action = true;\n').digest('hex'));
+});
+
+test('exports every currently packaged distribution file, including detector assets', () => {
+  const manifest = buildManifest(request(), files(), runtime());
+  const root = fileURLToPath(new URL('../../', import.meta.url));
+  const packaged = execFileSync('git', ['ls-tree', '-r', '--name-only', 'HEAD', 'dist'], { cwd: root, encoding: 'utf8' }).trim().split('\n');
+  assert.deepEqual(manifest.files.map(file => file.path).sort(), packaged.sort());
+  for (const name of ['dist/detector/provenance.json', 'dist/detector/vendor/aicomment/model.json']) {
+    const output = manifest.files.find(file => file.path === name);
+    assert.deepEqual(Buffer.from(output.contents, 'base64'), files()[name]);
+    assert.equal(output.sha256, createHash('sha256').update(files()[name]).digest('hex'));
+  }
+});
+
+test('gives reruns distinct artifact names without replacing earlier results', () => {
+  const first = buildManifest(request(), files(), runtime());
+  const rerun = buildManifest(request(), files(), { ...runtime(), run_attempt: '2' });
+  assert.equal(first.artifact_name, 'n8n-build-n8n-123-attempt-1');
+  assert.equal(rerun.artifact_name, 'n8n-build-n8n-123-attempt-2');
+  assert.notEqual(first.artifact_name, rerun.artifact_name);
+  assert.equal(rerun.run_attempt, 2);
+  assert.equal(rerun.run_id, first.run_id);
+});
+
+test('rejects an artifact that omits a packaged detector file', () => {
+  const incomplete = files();
+  delete incomplete['dist/detector/vendor/aicomment/model.json'];
+  assert.throws(() => buildManifest(request(), incomplete, runtime()), /export/);
 });
 
 test('rejects missing and extra output files', () => {

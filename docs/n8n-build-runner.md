@@ -27,14 +27,33 @@ The runner executes the repository's locked dependency installs, asset checks, b
 It intentionally does not require the rebuilt distribution to match the incoming source commit: n8n publishes those generated changes afterward.
 Existing PR CI still enforces a committed distribution.
 
-Successful runs upload `n8n-build-<request_id>` containing one `result.json`, with compression disabled and one-day retention.
-Manifest version 1 contains repository, branch, source SHA, request ID, run ID/attempt, workflow SHA, and these base64-encoded files with SHA-256 hashes:
+Successful runs upload `n8n-build-<request_id>-attempt-<run_attempt>` containing one `result.json`, with compression disabled and one-day retention.
+The helper supplies the artifact name to the upload step and records it as `artifact_name` in the manifest.
+Each rerun gets a distinct name without overwriting an earlier attempt's artifact.
+Manifest version 1 contains repository, branch, source SHA, request ID, run ID/attempt, workflow SHA, artifact name, and all 19 packaged files as base64 content with SHA-256 hashes:
 
 - `dist/index.mjs`
 - `dist/scorer.mjs`
 - `dist/build-meta.json`
 - `dist/THIRD_PARTY_NOTICES.txt`
+- `dist/detector/provenance.json`
+- `dist/detector/vendor/aicomment/LICENSE`
+- `dist/detector/vendor/aicomment/classifier.mjs`
+- `dist/detector/vendor/aicomment/model.json`
+- `dist/detector/vendor/aicomment/preprocess.mjs`
+- `dist/detector/vendor/aicomment/pychars.mjs`
+- `dist/detector/vendor/aicomment/langs/c_family.mjs`
+- `dist/detector/vendor/aicomment/langs/elisp.mjs`
+- `dist/detector/vendor/aicomment/langs/haskell.mjs`
+- `dist/detector/vendor/aicomment/langs/index.mjs`
+- `dist/detector/vendor/aicomment/langs/perl.mjs`
+- `dist/detector/vendor/aicomment/langs/php.mjs`
+- `dist/detector/vendor/aicomment/langs/python.mjs`
+- `dist/detector/vendor/aicomment/langs/registry.mjs`
+- `dist/detector/vendor/aicomment/langs/shell.mjs`
 
+This is an explicit allowlist, not a recursive export of arbitrary files.
+When the packaged distribution gains a file, update the producer and consumer contracts together; a regression test checks coverage against the tracked `dist/` tree.
 Each file is at most 8 MiB; total decoded content is at most 16 MiB.
 Missing files, symlinks, non-UTF-8 content, and oversized results fail export.
 Raw check output remains in ephemeral runner-local logs.
@@ -44,6 +63,7 @@ Failures report a fixed stage and category in the job summary without replaying 
 
 Treat artifacts as untrusted data.
 Before publishing, n8n must independently check the recorded request, repository, reviewed workflow/run identity, successful conclusion, expected run attempt, artifact name/digest, source SHA, allowed files, decoded sizes, and content hashes.
+Derive the expected artifact name from the recorded request ID and the expected run attempt; do not select a different attempt merely because its artifact exists.
 Reject an expired, ambiguous, already-consumed, or mismatched result.
 The source branch must still point at the exact tested source commit; bind any generated-file commit to that expected head.
 Never execute downloaded artifacts or accept additional file paths or commands from them.

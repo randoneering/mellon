@@ -11,6 +11,21 @@ const OUTPUTS = [
   'dist/scorer.mjs',
   'dist/build-meta.json',
   'dist/THIRD_PARTY_NOTICES.txt',
+  'dist/detector/provenance.json',
+  'dist/detector/vendor/aicomment/LICENSE',
+  'dist/detector/vendor/aicomment/classifier.mjs',
+  'dist/detector/vendor/aicomment/langs/c_family.mjs',
+  'dist/detector/vendor/aicomment/langs/elisp.mjs',
+  'dist/detector/vendor/aicomment/langs/haskell.mjs',
+  'dist/detector/vendor/aicomment/langs/index.mjs',
+  'dist/detector/vendor/aicomment/langs/perl.mjs',
+  'dist/detector/vendor/aicomment/langs/php.mjs',
+  'dist/detector/vendor/aicomment/langs/python.mjs',
+  'dist/detector/vendor/aicomment/langs/registry.mjs',
+  'dist/detector/vendor/aicomment/langs/shell.mjs',
+  'dist/detector/vendor/aicomment/model.json',
+  'dist/detector/vendor/aicomment/preprocess.mjs',
+  'dist/detector/vendor/aicomment/pychars.mjs',
 ];
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 16 * 1024 * 1024;
@@ -97,6 +112,7 @@ export function buildManifest(input, files, runtime) {
     version: 1, repository: request.repository, branch: request.branch,
     source_sha: request.source_sha, request_id: request.request_id,
     run_id: String(runtime.run_id), run_attempt: Number(runtime.run_attempt),
+    artifact_name: `n8n-build-${request.request_id}-attempt-${Number(runtime.run_attempt)}`,
     workflow_sha: runtime.workflow_sha, files: result,
   };
 }
@@ -163,12 +179,12 @@ async function main(command) {
     run_attempt: process.env.GITHUB_RUN_ATTEMPT,
     workflow_sha: process.env.GITHUB_WORKFLOW_SHA,
   });
-  const folder = path.join(tempRoot, `${request.request_id}-result`);
+  const folder = path.join(tempRoot, `${request.request_id}-attempt-${manifest.run_attempt}-result`);
   await mkdir(folder, { recursive: true, mode: 0o700 });
   const resultPath = path.join(folder, 'result.json');
   await writeFile(resultPath, JSON.stringify(manifest) + '\n', { flag: 'wx', mode: 0o600 });
   if (!process.env.GITHUB_OUTPUT) throw new RunnerError('export', 'missing-output-channel');
-  await appendFile(process.env.GITHUB_OUTPUT, `path=${resultPath}\n`);
+  await appendFile(process.env.GITHUB_OUTPUT, `path=${resultPath}\nartifact_name=${manifest.artifact_name}\n`);
   console.log('Bounded distribution manifest exported. No commits or pull requests were created.');
 }
 
