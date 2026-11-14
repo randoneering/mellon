@@ -7529,6 +7529,103 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+// src/inputs.mjs
+var DEFAULT_RESPONSE = "AI-assisted code is welcome. Please describe your work in your own words. This automated review can make mistakes. If this submission does not meet the repository's contribution policy, maintainers may close it. Contact a maintainer if you need help.";
+var EVENT_LIMIT = 4 * 1024 * 1024;
+var RESPONSE_LIMIT = 32 * 1024;
+var ACCOUNT_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\[bot\])?$/i;
+var BOT_LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\[bot\](?![\s\S])/i;
+var DEFAULT_MODERATION_BOT_LOGIN = "github-actions[bot]";
+function isTrustedModerationAuthor(user, expectedLogin = DEFAULT_MODERATION_BOT_LOGIN) {
+  return typeof expectedLogin === "string" && BOT_LOGIN_PATTERN.test(expectedLogin) && user?.type === "Bot" && typeof user.login === "string" && user.login.toLowerCase() === expectedLogin.toLowerCase();
+}
+function invalidInput() {
+  return new Error("Invalid Action input or event payload.");
+}
+function validText(value) {
+  return typeof value === "string" && value.trim().length > 0 && !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value);
+}
+function payloadBytes(payload, eventBytes) {
+  let bytes;
+  if (eventBytes !== void 0) {
+    bytes = Buffer.isBuffer(eventBytes) || eventBytes instanceof Uint8Array ? Buffer.from(eventBytes) : Buffer.from(String(eventBytes));
+  } else {
+    try {
+      bytes = Buffer.from(JSON.stringify(payload), "utf8");
+    } catch {
+      throw invalidInput();
+    }
+  }
+  if (bytes.length > EVENT_LIMIT) throw invalidInput();
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw invalidInput();
+  }
+}
+function exactRepo(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value);
+}
+function parseEvent({ eventName, repository, payload, eventBytes } = {}) {
+  if (eventName !== "issues" && eventName !== "pull_request_target") return { kind: "skip" };
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload) || typeof payload.action !== "string" || payload.action.length === 0) throw invalidInput();
+  if (payload.action !== "opened") return { kind: "skip" };
+  payloadBytes(payload, eventBytes);
+  if (!exactRepo(repository) || payload.repository?.full_name !== repository) throw invalidInput();
+  const pullRequest = eventName === "pull_request_target";
+  if (!pullRequest && Object.hasOwn(payload, "pull_request")) throw invalidInput();
+  const item = pullRequest ? payload.pull_request : payload.issue;
+  if (!item || !Number.isSafeInteger(item.number) || item.number <= 0 || !validText(item.title) || typeof item.body !== "string" && item.body !== null && item.body !== void 0 || !validText(item.user?.login) || item.user.login.length > 39) throw invalidInput();
+  return {
+    kind: pullRequest ? "pull_request" : "issue",
+    repository,
+    number: item.number,
+    title: item.title,
+    body: item.body ?? null,
+    author: item.user.login
+  };
+}
+function parsePolicy(inputs = {}) {
+  let allowlist = [];
+  if (inputs.allowlist !== void 0) {
+    if (typeof inputs.allowlist !== "string") throw invalidInput();
+    try {
+      allowlist = JSON.parse(inputs.allowlist);
+    } catch {
+      throw invalidInput();
+    }
+  }
+  if (!Array.isArray(allowlist) || allowlist.some((account) => typeof account !== "string" || !ACCOUNT_PATTERN.test(account))) throw invalidInput();
+  const response = inputs.response === void 0 ? DEFAULT_RESPONSE : inputs.response;
+  const mode = inputs.mode === void 0 ? "enforce" : inputs.mode;
+  const autoClose = inputs.autoClose === void 0 || inputs.autoClose === "" ? true : inputs.autoClose === "true" ? true : inputs.autoClose === "false" ? false : null;
+  const reviewLabel = inputs.reviewLabel === void 0 || inputs.reviewLabel === "" ? true : inputs.reviewLabel === "true" ? true : inputs.reviewLabel === "false" ? false : null;
+  if (typeof response !== "string" || !validText(response) || Buffer.byteLength(response, "utf8") > RESPONSE_LIMIT || mode !== "enforce" && mode !== "observe" || autoClose === null || reviewLabel === null) throw invalidInput();
+  const login = inputs.moderationBotLogin;
+  const moderationBotLogin = login === void 0 || login === "" ? DEFAULT_MODERATION_BOT_LOGIN : login;
+  if (typeof moderationBotLogin !== "string" || !BOT_LOGIN_PATTERN.test(moderationBotLogin)) throw invalidInput();
+  if (Object.keys(inputs).some((key) => !["allowlist", "response", "mode", "autoClose", "reviewLabel", "moderationBotLogin"].includes(key))) throw invalidInput();
+  return {
+    allowlist,
+    response,
+    cutoff: 0.8,
+    mode,
+    autoClose,
+    reviewLabel,
+    moderationBotLogin: moderationBotLogin.toLowerCase()
+  };
+}
+function createEligibleContinuation({ getContext, getInputs }) {
+  return async function run(continueEligible) {
+    const context = parseEvent(getContext());
+    if (context.kind === "skip") return { outcome: "skipped" };
+    const policy = parsePolicy(getInputs());
+    if (policy.allowlist.some((name) => name.toLowerCase() === context.author.toLowerCase())) return { outcome: "skipped" };
+    if (typeof continueEligible !== "function") throw new TypeError("An eligible continuation is required.");
+    return continueEligible(context, policy);
+  };
+}
+
 // src/github.mjs
 var API_ROOT = "https://api.github.com";
 var MAX_BODY_BYTES = 1024 * 1024;
@@ -7746,11 +7843,11 @@ function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 3e4, signal,
       if (url) throw safeError();
       return comments;
     },
-    async createComment({ repository, number, body }) {
+    async createComment({ repository, number, body }, expectedLogin = DEFAULT_MODERATION_BOT_LOGIN) {
       if (typeof body !== "string" || !body) throw safeError();
       const { value } = await request(resource(repository, number, "/comments"), { method: "POST", body: { body } });
       const [comment] = validateComments([value]);
-      if (comment.user.login !== "github-actions[bot]" || comment.user.type !== "Bot" || comment.body !== body) throw safeError();
+      if (!isTrustedModerationAuthor(comment.user, expectedLogin) || comment.body !== body) throw safeError();
       return comment;
     },
     async closeItem({ repository, number, kind }) {
@@ -7761,87 +7858,6 @@ function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 3e4, signal,
       if (!value || value.state !== "closed") throw safeError();
       return { state: "closed" };
     }
-  };
-}
-
-// src/inputs.mjs
-var DEFAULT_RESPONSE = "AI-assisted code is welcome. Please describe your work in your own words. This automated review can make mistakes. If this submission does not meet the repository's contribution policy, maintainers may close it. Contact a maintainer if you need help.";
-var EVENT_LIMIT = 4 * 1024 * 1024;
-var RESPONSE_LIMIT = 32 * 1024;
-var ACCOUNT_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\[bot\])?$/i;
-function invalidInput() {
-  return new Error("Invalid Action input or event payload.");
-}
-function validText(value) {
-  return typeof value === "string" && value.trim().length > 0 && !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(value);
-}
-function payloadBytes(payload, eventBytes) {
-  let bytes;
-  if (eventBytes !== void 0) {
-    bytes = Buffer.isBuffer(eventBytes) || eventBytes instanceof Uint8Array ? Buffer.from(eventBytes) : Buffer.from(String(eventBytes));
-  } else {
-    try {
-      bytes = Buffer.from(JSON.stringify(payload), "utf8");
-    } catch {
-      throw invalidInput();
-    }
-  }
-  if (bytes.length > EVENT_LIMIT) throw invalidInput();
-  try {
-    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  } catch {
-    throw invalidInput();
-  }
-}
-function exactRepo(value) {
-  return typeof value === "string" && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value);
-}
-function parseEvent({ eventName, repository, payload, eventBytes } = {}) {
-  if (eventName !== "issues" && eventName !== "pull_request_target") return { kind: "skip" };
-  if (payload === null || typeof payload !== "object" || Array.isArray(payload) || typeof payload.action !== "string" || payload.action.length === 0) throw invalidInput();
-  if (payload.action !== "opened") return { kind: "skip" };
-  payloadBytes(payload, eventBytes);
-  if (!exactRepo(repository) || payload.repository?.full_name !== repository) throw invalidInput();
-  const pullRequest = eventName === "pull_request_target";
-  if (!pullRequest && Object.hasOwn(payload, "pull_request")) throw invalidInput();
-  const item = pullRequest ? payload.pull_request : payload.issue;
-  if (!item || !Number.isSafeInteger(item.number) || item.number <= 0 || !validText(item.title) || typeof item.body !== "string" && item.body !== null && item.body !== void 0 || !validText(item.user?.login) || item.user.login.length > 39) throw invalidInput();
-  return {
-    kind: pullRequest ? "pull_request" : "issue",
-    repository,
-    number: item.number,
-    title: item.title,
-    body: item.body ?? null,
-    author: item.user.login
-  };
-}
-function parsePolicy(inputs = {}) {
-  let allowlist = [];
-  if (inputs.allowlist !== void 0) {
-    if (typeof inputs.allowlist !== "string") throw invalidInput();
-    try {
-      allowlist = JSON.parse(inputs.allowlist);
-    } catch {
-      throw invalidInput();
-    }
-  }
-  if (!Array.isArray(allowlist) || allowlist.some((account) => typeof account !== "string" || !ACCOUNT_PATTERN.test(account))) throw invalidInput();
-  const response = inputs.response === void 0 ? DEFAULT_RESPONSE : inputs.response;
-  const mode = inputs.mode === void 0 ? "enforce" : inputs.mode;
-  const autoClose = inputs.autoClose === void 0 || inputs.autoClose === "" ? true : inputs.autoClose === "true" ? true : inputs.autoClose === "false" ? false : null;
-  const reviewLabel = inputs.reviewLabel === void 0 || inputs.reviewLabel === "" ? true : inputs.reviewLabel === "true" ? true : inputs.reviewLabel === "false" ? false : null;
-  if (typeof response !== "string" || !validText(response) || Buffer.byteLength(response, "utf8") > RESPONSE_LIMIT || mode !== "enforce" && mode !== "observe" || autoClose === null || reviewLabel === null) throw invalidInput();
-  if (Object.keys(inputs).some((key) => !["allowlist", "response", "mode", "autoClose", "reviewLabel"].includes(key))) throw invalidInput();
-  return { allowlist, response, cutoff: 0.8, mode, autoClose, reviewLabel };
-}
-function createEligibleContinuation({ getContext, getInputs }) {
-  return async function run(continueEligible) {
-    const context = parseEvent(getContext());
-    if (context.kind === "skip") return { outcome: "skipped" };
-    const policy = parsePolicy(getInputs());
-    if (policy.allowlist.some((name) => name.toLowerCase() === context.author.toLowerCase())) return { outcome: "skipped" };
-    if (typeof continueEligible !== "function") throw new TypeError("An eligible continuation is required.");
-    return continueEligible(context, policy);
   };
 }
 
@@ -12981,8 +12997,8 @@ function validClassification(result) {
 function markerFor(context, result) {
   return `<!-- ${PROTOCOL} repo=${context.repository} item=${context.number} input=${result.input_sha256} detector=${result.detector_revision} model=${result.model_sha256} -->`;
 }
-function genuine(comment, marker) {
-  return Number.isSafeInteger(comment.id) && comment.id > 0 && comment.user?.login === "github-actions[bot]" && comment.user?.type === "Bot" && comment.body.includes(marker);
+function genuine(comment, marker, expectedLogin) {
+  return Number.isSafeInteger(comment?.id) && comment.id > 0 && isTrustedModerationAuthor(comment.user, expectedLogin) && typeof comment.body === "string" && comment.body.includes(marker);
 }
 async function currentItem(api, context) {
   const current = await api.getItem(context);
@@ -13196,8 +13212,37 @@ async function moderate({ getContext, getInputs, api, score, prepare = prepareSu
         };
       }
       const marker = markerFor(context, classified);
-      let comments = await api.listComments(context);
-      let existing = comments.find((comment) => genuine(comment, marker));
+      const expectedLogin = policy.moderationBotLogin ?? DEFAULT_MODERATION_BOT_LOGIN;
+      const confirmedState = (comment) => ({
+        commentPosted: Boolean(comment),
+        ...comment ? { comment_id: comment.id } : {},
+        score: classified.robot_score,
+        detector_revision: classified.detector_revision,
+        model_sha256: classified.model_sha256,
+        input_sha256: classified.input_sha256
+      });
+      const migrationFailure = (inventory, stage) => {
+        if (expectedLogin === DEFAULT_MODERATION_BOT_LOGIN || !inventory.some((comment) => genuine(comment, marker, DEFAULT_MODERATION_BOT_LOGIN))) return;
+        return safeFailure("Moderation identity migration requires manual review or retry with the default identity; configuration cannot re-author comments.", {
+          ...confirmedState(inventory.find((comment) => genuine(comment, marker, expectedLogin))),
+          stage,
+          category: "moderation_identity_migration_conflict",
+          uncertain: stage === "comment_reconciliation"
+        });
+      };
+      let comments;
+      try {
+        comments = await api.listComments(context);
+        if (!Array.isArray(comments)) throw new Error("Comment inventory is invalid.");
+      } catch {
+        return safeFailure(
+          "Comment inventory could not be checked safely.",
+          { stage: "comment_inventory", category: "comment_inventory_failed" }
+        );
+      }
+      const conflict = migrationFailure(comments, "comment_inventory");
+      if (conflict) return conflict;
+      let existing = comments.find((comment) => genuine(comment, marker, expectedLogin));
       let posted = Boolean(existing);
       if (!existing) {
         if (!await currentMatches(api, context)) return { outcome: "skipped", reason: "stale_before_comment", cutoff: CUTOFF, score: classified.robot_score, partial: false };
@@ -13207,29 +13252,31 @@ Automated score: ${classified.robot_score} (cutoff ${CUTOFF}). Detector: ${class
 
 ${marker}`;
         try {
-          existing = await api.createComment({ ...context, body });
-          if (!genuine(existing, marker)) throw new Error("Created comment identity is invalid.");
+          existing = await api.createComment({ ...context, body }, expectedLogin);
+          if (!genuine(existing, marker, expectedLogin) || existing.body !== body) throw new Error("Created comment identity or content is invalid.");
           posted = true;
         } catch {
-          let reconciled;
           try {
-            reconciled = (await api.listComments(context)).find((comment) => genuine(comment, marker));
+            comments = await api.listComments(context);
+            if (!Array.isArray(comments)) throw new Error("Comment inventory is invalid.");
           } catch {
-            return safeFailure("Comment outcome is uncertain; reconciliation failed.", { uncertain: true });
+            return safeFailure(
+              "Comment outcome is uncertain; reconciliation failed.",
+              { uncertain: true, stage: "comment_reconciliation", category: "comment_reconciliation_failed" }
+            );
           }
-          if (!reconciled) return safeFailure("Comment outcome is uncertain; no matching response was confirmed.", { uncertain: true });
+          const conflict2 = migrationFailure(comments, "comment_reconciliation");
+          if (conflict2) return conflict2;
+          const reconciled = comments.find((comment) => genuine(comment, marker, expectedLogin));
+          if (!reconciled) return safeFailure(
+            "Comment outcome is uncertain; no matching response was confirmed.",
+            { uncertain: true, stage: "comment_create", category: "comment_unconfirmed" }
+          );
           existing = reconciled;
           posted = true;
         }
       }
-      const partial = {
-        commentPosted: posted,
-        comment_id: existing.id,
-        score: classified.robot_score,
-        detector_revision: classified.detector_revision,
-        model_sha256: classified.model_sha256,
-        input_sha256: classified.input_sha256
-      };
+      const partial = confirmedState(existing);
       if (policy.reviewLabel) {
         try {
           if (!await currentMatches(api, context)) return {
@@ -13424,12 +13471,19 @@ async function writeOutputs(filename, content) {
     throw operationalError();
   }
 }
+var FAILURE_CATEGORIES = /* @__PURE__ */ new Map([
+  ["comment_inventory", /* @__PURE__ */ new Set(["comment_inventory_failed", "moderation_identity_migration_conflict"])],
+  ["comment_reconciliation", /* @__PURE__ */ new Set(["comment_reconciliation_failed", "moderation_identity_migration_conflict"])],
+  ["comment_create", /* @__PURE__ */ new Set(["comment_unconfirmed"])]
+]);
 function normalizeResult(result) {
+  const diagnostic = result?.outcome === "error" && FAILURE_CATEGORIES.get(result.stage)?.has(result.category) ? { stage: result.stage, category: result.category } : {};
   const hasScore = result && Object.hasOwn(result, "score") && result.score !== null;
   const score = hasScore && typeof result.score === "number" && Number.isFinite(result.score) && result.score >= 0 && result.score <= 1 ? result.score : void 0;
   if (hasScore && score === void 0) throw operationalError();
   const normalized = {
     outcome: result?.outcome,
+    ...diagnostic,
     ...result?.outcome_labels_incomplete === true ? { outcomeLabelsIncomplete: true } : {},
     ...score === void 0 ? {} : { robotScore: score },
     ...result?.outcome === "flagged" ? { labelApplied: result.label_applied === true } : {},
@@ -13528,12 +13582,14 @@ async function runAction({
         const mode = typeof getInput === "function" ? getInput("mode") : "";
         const autoClose = typeof getInput === "function" ? getInput("auto-close") : "";
         const reviewLabel = typeof getInput === "function" ? getInput("review-label") : "";
+        const moderationBotLogin = typeof getInput === "function" ? getInput("moderation-bot-login", { trimWhitespace: false }) : "";
         return {
           ...allowlist === "" ? {} : { allowlist },
           ...response === "" ? {} : { response },
           ...mode === "" ? {} : { mode },
           ...autoClose === "" ? {} : { autoClose },
-          ...reviewLabel === "" ? {} : { reviewLabel }
+          ...reviewLabel === "" ? {} : { reviewLabel },
+          ...moderationBotLogin === "" ? {} : { moderationBotLogin }
         };
       };
       let api;
@@ -13604,13 +13660,17 @@ Model SHA-256: ${result.provenance.modelSha256}
 Input SHA-256: ${result.provenance.inputSha256}` : ""}` : "";
   const labelNote = result.outcome === "flagged" && result.labelApplied ? "\n\nLabel: mellon: review" : "";
   const uncertainty = result.outcome === "error" && result.uncertainty ? "\n\nResponse confirmation: uncertain" : "";
+  const diagnostic = result.stage && result.category ? `
+
+Failure stage: ${result.stage}
+Failure category: ${result.category}${result.category === "moderation_identity_migration_conflict" ? "\nManual review or retry with the default identity (github-actions[bot]). Switching configuration cannot re-author comments." : ""}` : "";
   const setupNote = result.outcomeLabelsIncomplete ? "\n\nOutcome-label setup is incomplete. Create missing review outcome labels manually in repository settings." : "";
   try {
     const handle = await open(filename, "a");
     try {
       await handle.writeFile(`## Mellon moderation
 
-${labels[result.outcome]}${score}${labelNote}${partial}${uncertainty}${setupNote}
+${labels[result.outcome]}${score}${labelNote}${partial}${uncertainty}${diagnostic}${setupNote}
 `, "utf8");
     } finally {
       await handle.close();
@@ -13629,6 +13689,7 @@ async function main() {
 export {
   formatOutputs,
   main,
+  normalizeResult,
   runAction
 };
 /*! Bundled license information:

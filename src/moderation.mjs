@@ -1,4 +1,4 @@
-import { createEligibleContinuation } from './inputs.mjs';
+import { createEligibleContinuation, DEFAULT_MODERATION_BOT_LOGIN, isTrustedModerationAuthor } from './inputs.mjs';
 import { OUTCOME_LABELS } from './github.mjs';
 import { prepareSubmission } from './prepare.mjs';
 
@@ -23,8 +23,9 @@ function markerFor(context, result) {
   return `<!-- ${PROTOCOL} repo=${context.repository} item=${context.number} input=${result.input_sha256} detector=${result.detector_revision} model=${result.model_sha256} -->`;
 }
 
-function genuine(comment, marker) {
-  return Number.isSafeInteger(comment.id) && comment.id > 0 && comment.user?.login === 'github-actions[bot]' && comment.user?.type === 'Bot' && comment.body.includes(marker);
+function genuine(comment, marker, expectedLogin) {
+  return Number.isSafeInteger(comment?.id) && comment.id > 0 &&
+    isTrustedModerationAuthor(comment.user, expectedLogin) && typeof comment.body === 'string' && comment.body.includes(marker);
 }
 
 async function currentItem(api, context) {
@@ -207,30 +208,58 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
           input_sha256: classified.input_sha256, label: REVIEW_LABEL, label_applied: true, partial: false };
       }
       const marker = markerFor(context, classified);
-      let comments = await api.listComments(context);
-      let existing = comments.find((comment) => genuine(comment, marker));
+      const expectedLogin = policy.moderationBotLogin ?? DEFAULT_MODERATION_BOT_LOGIN;
+      const confirmedState = comment => ({
+        commentPosted: Boolean(comment), ...(comment ? { comment_id: comment.id } : {}), score: classified.robot_score,
+        detector_revision: classified.detector_revision, model_sha256: classified.model_sha256,
+        input_sha256: classified.input_sha256,
+      });
+      const migrationFailure = (inventory, stage) => {
+        if (expectedLogin === DEFAULT_MODERATION_BOT_LOGIN ||
+            !inventory.some(comment => genuine(comment, marker, DEFAULT_MODERATION_BOT_LOGIN))) return;
+        // Legacy ownership blocks migration, even when an App response is also confirmed.
+        return safeFailure('Moderation identity migration requires manual review or retry with the default identity; configuration cannot re-author comments.', {
+          ...confirmedState(inventory.find(comment => genuine(comment, marker, expectedLogin))),
+          stage, category: 'moderation_identity_migration_conflict', uncertain: stage === 'comment_reconciliation',
+        });
+      };
+      let comments;
+      try {
+        comments = await api.listComments(context);
+        if (!Array.isArray(comments)) throw new Error('Comment inventory is invalid.');
+      } catch {
+        return safeFailure('Comment inventory could not be checked safely.',
+          { stage: 'comment_inventory', category: 'comment_inventory_failed' });
+      }
+      const conflict = migrationFailure(comments, 'comment_inventory');
+      if (conflict) return conflict;
+      let existing = comments.find(comment => genuine(comment, marker, expectedLogin));
       let posted = Boolean(existing);
       if (!existing) {
         if (!await currentMatches(api, context)) return { outcome: 'skipped', reason: 'stale_before_comment', cutoff: CUTOFF, score: classified.robot_score, partial: false };
         const body = `${policy.response}\n\nAutomated score: ${classified.robot_score} (cutoff ${CUTOFF}). Detector: ${classified.detector_revision}. Model SHA-256: ${classified.model_sha256}.\n\n${marker}`;
         try {
-          existing = await api.createComment({ ...context, body });
-          if (!genuine(existing, marker)) throw new Error('Created comment identity is invalid.');
+          existing = await api.createComment({ ...context, body }, expectedLogin);
+          if (!genuine(existing, marker, expectedLogin) || existing.body !== body) throw new Error('Created comment identity or content is invalid.');
           posted = true;
         } catch {
-          let reconciled;
-          try { reconciled = (await api.listComments(context)).find((comment) => genuine(comment, marker)); }
-          catch { return safeFailure('Comment outcome is uncertain; reconciliation failed.', { uncertain: true }); }
-          if (!reconciled) return safeFailure('Comment outcome is uncertain; no matching response was confirmed.', { uncertain: true });
+          try {
+            comments = await api.listComments(context);
+            if (!Array.isArray(comments)) throw new Error('Comment inventory is invalid.');
+          } catch {
+            return safeFailure('Comment outcome is uncertain; reconciliation failed.',
+              { uncertain: true, stage: 'comment_reconciliation', category: 'comment_reconciliation_failed' });
+          }
+          const conflict = migrationFailure(comments, 'comment_reconciliation');
+          if (conflict) return conflict;
+          const reconciled = comments.find(comment => genuine(comment, marker, expectedLogin));
+          if (!reconciled) return safeFailure('Comment outcome is uncertain; no matching response was confirmed.',
+            { uncertain: true, stage: 'comment_create', category: 'comment_unconfirmed' });
           existing = reconciled;
           posted = true;
         }
       }
-      const partial = {
-        commentPosted: posted, comment_id: existing.id, score: classified.robot_score,
-        detector_revision: classified.detector_revision, model_sha256: classified.model_sha256,
-        input_sha256: classified.input_sha256,
-      };
+      const partial = confirmedState(existing);
       if (policy.reviewLabel) {
         try {
           if (!await currentMatches(api, context)) return {

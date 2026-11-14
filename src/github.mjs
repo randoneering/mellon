@@ -1,3 +1,5 @@
+import { DEFAULT_MODERATION_BOT_LOGIN, isTrustedModerationAuthor } from './inputs.mjs';
+
 const API_ROOT = 'https://api.github.com';
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_PAGES = 100;
@@ -225,11 +227,11 @@ export function createGitHubClient({ token, fetchImpl = fetch, timeoutMs = 30_00
       if (url) throw safeError();
       return comments;
     },
-    async createComment({ repository, number, body }) {
+    async createComment({ repository, number, body }, expectedLogin = DEFAULT_MODERATION_BOT_LOGIN) {
       if (typeof body !== 'string' || !body) throw safeError();
       const { value } = await request(resource(repository, number, '/comments'), { method: 'POST', body: { body } });
       const [comment] = validateComments([value]);
-      if (comment.user.login !== 'github-actions[bot]' || comment.user.type !== 'Bot' || comment.body !== body) throw safeError();
+      if (!isTrustedModerationAuthor(comment.user, expectedLogin) || comment.body !== body) throw safeError();
       return comment;
     },
     async closeItem({ repository, number, kind }) {
