@@ -23,9 +23,13 @@ function markerFor(context, result) {
   return `<!-- ${PROTOCOL} repo=${context.repository} item=${context.number} input=${result.input_sha256} detector=${result.detector_revision} model=${result.model_sha256} -->`;
 }
 
-function genuine(comment, marker, expectedLogin) {
+function hasCurrentMarker(comment, marker) {
   return Number.isSafeInteger(comment?.id) && comment.id > 0 &&
-    isTrustedModerationAuthor(comment.user, expectedLogin) && typeof comment.body === 'string' && comment.body.includes(marker);
+    typeof comment.body === 'string' && comment.body.includes(marker);
+}
+
+function genuine(comment, marker, expectedLogin) {
+  return hasCurrentMarker(comment, marker) && isTrustedModerationAuthor(comment.user, expectedLogin);
 }
 
 async function currentItem(api, context) {
@@ -214,13 +218,18 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
         detector_revision: classified.detector_revision, model_sha256: classified.model_sha256,
         input_sha256: classified.input_sha256,
       });
-      const migrationFailure = (inventory, stage) => {
-        if (expectedLogin === DEFAULT_MODERATION_BOT_LOGIN ||
-            !inventory.some(comment => genuine(comment, marker, DEFAULT_MODERATION_BOT_LOGIN))) return;
-        // Legacy ownership blocks migration, even when an App response is also confirmed.
-        return safeFailure('Moderation identity migration requires manual review or retry with the default identity; configuration cannot re-author comments.', {
+      const identityFailure = (inventory, stage) => {
+        const migrationConflict = expectedLogin !== DEFAULT_MODERATION_BOT_LOGIN &&
+          inventory.some(comment => genuine(comment, marker, DEFAULT_MODERATION_BOT_LOGIN));
+        const mismatchedBot = inventory.some(comment => hasCurrentMarker(comment, marker) &&
+          comment.user?.type === 'Bot' && typeof comment.user.login === 'string' &&
+          !isTrustedModerationAuthor(comment.user, expectedLogin));
+        if (!migrationConflict && !mismatchedBot) return;
+        // Unexpected Bot responses block duplicate writes but never confirm ownership.
+        return safeFailure('Moderation response identity requires manual review; check that the token and moderation-bot-login match.', {
           ...confirmedState(inventory.find(comment => genuine(comment, marker, expectedLogin))),
-          stage, category: 'moderation_identity_migration_conflict', uncertain: stage === 'comment_reconciliation',
+          stage, category: migrationConflict ? 'moderation_identity_migration_conflict' : 'moderation_identity_mismatch',
+          uncertain: stage === 'comment_reconciliation',
         });
       };
       let comments;
@@ -231,7 +240,7 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
         return safeFailure('Comment inventory could not be checked safely.',
           { stage: 'comment_inventory', category: 'comment_inventory_failed' });
       }
-      const conflict = migrationFailure(comments, 'comment_inventory');
+      const conflict = identityFailure(comments, 'comment_inventory');
       if (conflict) return conflict;
       let existing = comments.find(comment => genuine(comment, marker, expectedLogin));
       let posted = Boolean(existing);
@@ -250,7 +259,7 @@ export async function moderate({ getContext, getInputs, api, score, prepare = pr
             return safeFailure('Comment outcome is uncertain; reconciliation failed.',
               { uncertain: true, stage: 'comment_reconciliation', category: 'comment_reconciliation_failed' });
           }
-          const conflict = migrationFailure(comments, 'comment_reconciliation');
+          const conflict = identityFailure(comments, 'comment_reconciliation');
           if (conflict) return conflict;
           const reconciled = comments.find(comment => genuine(comment, marker, expectedLogin));
           if (!reconciled) return safeFailure('Comment outcome is uncertain; no matching response was confirmed.',

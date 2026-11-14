@@ -72,8 +72,8 @@ async function writeOutputs(filename, content) {
 }
 
 const FAILURE_CATEGORIES = new Map([
-  ['comment_inventory', new Set(['comment_inventory_failed', 'moderation_identity_migration_conflict'])],
-  ['comment_reconciliation', new Set(['comment_reconciliation_failed', 'moderation_identity_migration_conflict'])],
+  ['comment_inventory', new Set(['comment_inventory_failed', 'moderation_identity_migration_conflict', 'moderation_identity_mismatch'])],
+  ['comment_reconciliation', new Set(['comment_reconciliation_failed', 'moderation_identity_migration_conflict', 'moderation_identity_mismatch'])],
   ['comment_create', new Set(['comment_unconfirmed'])],
 ]);
 
@@ -256,9 +256,12 @@ async function writeSummary(filename, result) {
     ? '\n\nLabel: mellon: review' : '';
   const uncertainty = result.outcome === 'error' && result.uncertainty
     ? '\n\nResponse confirmation: uncertain' : '';
+  const identityNote = result.category === 'moderation_identity_migration_conflict'
+    ? '\nManual review required. Retry with the default identity (github-actions[bot]) only when it is the sole response identity. Switching configuration cannot re-author comments.'
+    : result.category === 'moderation_identity_mismatch'
+      ? '\nManual review required. Check that the token and moderation-bot-login match. Another Bot response is not trusted confirmation.' : '';
   const diagnostic = result.stage && result.category
-    ? `\n\nFailure stage: ${result.stage}\nFailure category: ${result.category}${result.category === 'moderation_identity_migration_conflict'
-      ? '\nManual review or retry with the default identity (github-actions[bot]). Switching configuration cannot re-author comments.' : ''}` : '';
+    ? `\n\nFailure stage: ${result.stage}\nFailure category: ${result.category}${identityNote}` : '';
   const setupNote = result.outcomeLabelsIncomplete
     ? '\n\nOutcome-label setup is incomplete. Create missing review outcome labels manually in repository settings.' : '';
   try {

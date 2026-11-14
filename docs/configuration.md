@@ -148,15 +148,22 @@ After an uncertain POST, Mellon lists once to seek confirmation and does not pos
 a second time. Missing or failed confirmation stops further moderation writes.
 This does not add stronger cross-run concurrency guarantees; keep serialization.
 
-When switching to an App, a canonical `github-actions[bot]` response with the current
-marker causes an operational error before posting, labeling, or closing. The guard
-also applies when both App and legacy comments exist or a legacy comment appears
-during reconciliation. The job summary reports fixed stage/category diagnostics
-and manual recovery guidance. Any independently confirmed App comment retains its
-ID and provenance as partial work; a legacy comment never becomes App confirmation.
+A Bot response with a positive ID, string body, and current marker blocks further moderation writes when its author differs from the configured identity.
+Mellon does not trust that response as confirmation, even when a configured-author response also exists.
+The check runs before posting, labeling, or closing, and again during uncertain-write reconciliation.
+This includes switching from an App back to the default identity and a token paired with the wrong `moderation-bot-login`.
+A misconfigured token can leave one unconfirmed response before reconciliation detects the mismatch; later runs stop before posting again.
+User-authored comments, invalid IDs, and different markers do not establish an identity conflict.
 
-Manually review the item or retain the default identity for its retry. Changing
-configuration cannot re-author old comments, and Mellon will not edit/reuse legacy
-authority or create a duplicate App response to migrate it. There is no historical
-scan, automatic migration, or multi-identity trust list. Live author/avatar behavior
-must be verified separately with maintainer approval; mocked tests cannot prove it.
+When switching to an App, a canonical `github-actions[bot]` response reports `moderation_identity_migration_conflict`.
+Other unexpected Bot authors report `moderation_identity_mismatch`.
+The job summary includes fixed stage/category diagnostics and asks maintainers to check the token/login pairing.
+Only an independently confirmed configured-author response retains its ID and provenance as partial work; an unexpected author never becomes confirmation.
+
+Manually review the item and check trusted workflow configuration against the supplied token's actual Bot identity.
+Retry with the default identity only when it matches the sole existing response identity and token.
+Mixed-identity responses require manual review; changing configuration cannot re-author old comments.
+Mellon does not edit responses or post replacements to migrate them.
+Another Bot can copy the current marker and cause this manual-review stop, but cannot authorize further writes.
+There is no historical scan, automatic migration, or multi-identity trust list.
+Live author/avatar behavior must be verified separately with maintainer approval; mocked tests cannot prove it.

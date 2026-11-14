@@ -397,11 +397,75 @@ test('real client enforces configured App authorship and migration stops', async
   }
 });
 
+test('real client stops mismatched Bot reruns and preserves only trusted partial work', async t => {
+  const marker = `<!-- mellon-submission-moderation-v1 repo=owner/repo item=7 input=${'b'.repeat(64)} detector=${'c'.repeat(40)} model=${'a'.repeat(64)} -->`;
+  const response = (status, body) => new Response(JSON.stringify(body), { status });
+  for (const eventName of ['issues', 'pull_request_target']) {
+    for (const expected of ['github-actions[bot]', 'mellon[bot]']) {
+      for (const inventory of ['foreign', 'mixed', 'post-mismatch', 'reconciled-mixed']) {
+        const requests = [];
+        const mixed = ['mixed', 'reconciled-mixed'].includes(inventory);
+        const startsEmpty = ['post-mismatch', 'reconciled-mixed'].includes(inventory);
+        const foreign = { id: 91, body: marker, user: { login: 'Mellon-Moderation[BoT]', type: 'Bot' } };
+        const trusted = { id: 82, body: marker, user: { login: expected.toUpperCase(), type: 'Bot' } };
+        const comments = startsEmpty ? [] : mixed ? [foreign, trusted] : [foreign];
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const safe = await setup(t, {
+            eventName, payload: eventName === 'issues' ? event : { action: 'opened', repository: event.repository, pull_request: event.issue },
+            scorer: async () => ({ protocol_version: 1, outcome: 'classified', robot_score: 0.8,
+              detector_revision: 'c'.repeat(40), model_sha256: 'a'.repeat(64), input_sha256: 'b'.repeat(64) }),
+            inputs: { token: 'fixture-credential', 'moderation-bot-login': expected, 'review-label': 'false' },
+            fetchImpl: async (url, options) => {
+              const resource = new URL(url).pathname;
+              requests.push(`${options.method} ${resource}`);
+              const itemPath = `/repos/owner/repo/${eventName === 'issues' ? 'issues' : 'pulls'}/7`;
+              if (options.method === 'GET' && resource === itemPath) {
+                return response(200, { state: 'open', merged: false, title: event.issue.title, body: event.issue.body });
+              }
+              if (options.method === 'GET' && resource.endsWith('/comments')) return response(200, comments);
+              if (options.method === 'POST' && resource.endsWith('/comments')) {
+                const posted = { ...foreign, body: JSON.parse(options.body).body };
+                comments.push(posted);
+                if (inventory === 'reconciled-mixed') comments.push(trusted);
+                return response(201, posted);
+              }
+              throw new Error('unexpected mocked request');
+            },
+          });
+          assert.equal(safe.result.outcome, 'error', `${eventName}/${expected}/${inventory}/${attempt}`);
+          assert.equal(safe.result.stage, startsEmpty && attempt === 0
+            ? 'comment_reconciliation' : 'comment_inventory');
+          assert.equal(safe.result.category, 'moderation_identity_mismatch');
+          assert.equal(safe.result.partial, mixed);
+          assert.equal(safe.result.commentId, mixed ? 82 : undefined);
+          assert.equal(safe.result.uncertainty, startsEmpty && attempt === 0);
+          const summary = await readFile(safe.summaryPath, 'utf8');
+          assert.match(summary, /Manual review.*token.*moderation-bot-login/);
+          assert.match(summary, /Failure category: moderation_identity_mismatch/);
+          if (mixed) {
+            assert.match(summary, /Comment ID: 82/);
+            assert.deepEqual(safe.result.provenance, { detectorRevision: 'c'.repeat(40),
+              modelSha256: 'a'.repeat(64), inputSha256: 'b'.repeat(64) });
+          }
+          assert.doesNotMatch(summary, /Comment ID: 91/);
+          assert.doesNotMatch(JSON.stringify(safe.result) + summary + await readFile(safe.outputPath, 'utf8'),
+            /fixture-credential|Describe your contribution|I implemented a test|Mellon-Moderation/);
+        }
+        assert.equal(requests.filter(request => request.startsWith('POST')).length, startsEmpty ? 1 : 0);
+        assert.equal(requests.some(request => request.startsWith('PATCH') || request.endsWith('/labels')), false);
+        assert.equal(comments.length, mixed ? 2 : 1);
+      }
+    }
+  }
+});
+
 test('result normalization accepts only fixed operational diagnostics', () => {
   const accepted = [
     ['comment_inventory', 'comment_inventory_failed'],
     ['comment_inventory', 'moderation_identity_migration_conflict'],
+    ['comment_inventory', 'moderation_identity_mismatch'],
     ['comment_reconciliation', 'moderation_identity_migration_conflict'],
+    ['comment_reconciliation', 'moderation_identity_mismatch'],
     ['comment_reconciliation', 'comment_reconciliation_failed'],
     ['comment_create', 'comment_unconfirmed'],
   ];
@@ -412,7 +476,7 @@ test('result normalization accepts only fixed operational diagnostics', () => {
     assert.equal(result.error, undefined);
   }
   for (const [stage, category] of [['raw detail', 'comment_unconfirmed'], ['comment_create', 'raw detail'],
-    ['comment_inventory', 'comment_unconfirmed']]) {
+    ['comment_inventory', 'comment_unconfirmed'], ['comment_create', 'moderation_identity_mismatch']]) {
     const result = normalizeResult({ outcome: 'error', stage, category });
     assert.equal(result.stage, undefined);
     assert.equal(result.category, undefined);
