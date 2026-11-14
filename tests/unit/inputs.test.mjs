@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createEligibleContinuation, parseEvent, parsePolicy } from '../../src/inputs.mjs';
+import { createEligibleContinuation, parseEvent, parsePolicy, isTrustedModerationAuthor } from '../../src/inputs.mjs';
 
 const issue = {
   action: 'opened',
@@ -87,7 +87,7 @@ test('parses review-label as a strict default-enabled boolean in every mode', ()
 });
 
 test('defaults allowlist and validates literal response and fixed cutoff', () => {
-  assert.deepEqual(parsePolicy({}), { allowlist: [], response: "AI-assisted code is welcome. Please describe your work in your own words. This automated review can make mistakes. If this submission does not meet the repository's contribution policy, maintainers may close it. Contact a maintainer if you need help.", cutoff: 0.8, mode: 'enforce', autoClose: true, reviewLabel: true });
+  assert.deepEqual(parsePolicy({}), { allowlist: [], response: "AI-assisted code is welcome. Please describe your work in your own words. This automated review can make mistakes. If this submission does not meet the repository's contribution policy, maintainers may close it. Contact a maintainer if you need help.", cutoff: 0.8, mode: 'enforce', autoClose: true, reviewLabel: true, moderationBotLogin: 'github-actions[bot]' });
   assert.deepEqual(parsePolicy(validInputs).allowlist, []);
   assert.deepEqual(parsePolicy({ allowlist: '["Alice", "dependabot[bot]"]', response: 'Exact words.' }).allowlist, ['Alice', 'dependabot[bot]']);
   for (const bad of [
@@ -130,5 +130,35 @@ test('invalid event and policy fail before eligible continuation', async () => {
   await assert.rejects(invalidEvent(async () => { calls++; }));
   const invalidPolicy = createEligibleContinuation({ getContext: () => ({ ...runner, payload: issue }), getInputs: () => ({ allowlist: 'not json', response: 'literal' }) });
   await assert.rejects(invalidPolicy(async () => { calls++; }));
+  assert.equal(calls, 0);
+});
+
+test('trusted moderation identity defaults, normalizes, and requires an exact Bot author', () => {
+  for (const moderationBotLogin of [undefined, '', 'GitHub-Actions[BoT]']) {
+    assert.equal(parsePolicy({ moderationBotLogin }).moderationBotLogin, 'github-actions[bot]');
+  }
+  for (const login of ['Mellon[BoT]', 'a[bot]', `${'a'.repeat(39)}[bot]`]) {
+    const expected = parsePolicy({ moderationBotLogin: login }).moderationBotLogin;
+    assert.equal(expected, login.toLowerCase());
+    assert.equal(isTrustedModerationAuthor({ login, type: 'Bot' }, expected), true);
+    assert.equal(isTrustedModerationAuthor({ login: expected, type: 'Bot' }, login), true);
+    for (const user of [null, {}, { login, type: 'User' }, { login, type: 'bot' },
+      { login: `other-${login}`, type: 'Bot' }, { login: 5, type: 'Bot' }]) {
+      assert.equal(isTrustedModerationAuthor(user, expected), false);
+    }
+  }
+  assert.equal(isTrustedModerationAuthor({ login: 'github-actions[bot]', type: 'Bot' }), true);
+});
+
+test('malformed moderation identities fail before eligible work', async () => {
+  let calls = 0;
+  for (const moderationBotLogin of [null, true, 1, [], {}, 'mellon', '*[bot]', 'mellon[bot],other[bot]',
+    'https://github.com/mellon[bot]', '-mellon[bot]', 'mellon-[bot]', `${'a'.repeat(40)}[bot]`,
+    ' mellon[bot]', 'mellon[bot] ', 'mellon[bot]\n', 'mellon[bot]\r', 'mellon\u0000[bot]', 'mellon\t[bot]']) {
+    assert.throws(() => parsePolicy({ moderationBotLogin }), /Invalid Action input/);
+    const run = createEligibleContinuation({ getContext: () => ({ ...runner, payload: issue }),
+      getInputs: () => ({ moderationBotLogin }) });
+    await assert.rejects(run(async () => { calls++; }), /Invalid Action input/);
+  }
   assert.equal(calls, 0);
 });

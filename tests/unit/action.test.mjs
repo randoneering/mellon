@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { runAction } from '../../src/action.mjs';
+import { normalizeResult, runAction } from '../../src/action.mjs';
 
 const event = {
   action: 'opened', repository: { full_name: 'owner/repo' },
@@ -27,7 +27,10 @@ async function setup(t, { uid = 1000, eventName = 'issues', payload = event,
   };
   const result = await runAction({
     env, getuid: () => uid,
-    getInput: (name) => inputs[name] ?? '',
+    getInput: (name, options) => {
+      if (name === 'moderation-bot-login') assert.deepEqual(options, { trimWhitespace: false });
+      return inputs[name] ?? '';
+    },
     ...(scorer ? { score: scorer } : {}),
     ...(fetchImpl ? { fetchImpl } : {}),
   });
@@ -50,10 +53,13 @@ test('unsupported and allowlisted events skip before token, scorer, and API acce
 
 test('invalid policy and root runtime fail before inference or API access', async (t) => {
   let calls = 0;
-  const invalid = await setup(t, { inputs: { token: 'secret', allowlist: '[] trailing' },
-    scorer: async () => { calls++; }, fetchImpl: async () => { calls++; } });
-  assert.equal(invalid.result.outcome, 'error');
-  assert.equal(calls, 0);
+  for (const inputs of [{ token: 'secret', allowlist: '[] trailing' },
+    { 'moderation-bot-login': ' bot[bot] ', get token() { calls++; return ''; } }]) {
+    const invalid = await setup(t, { inputs, scorer: async () => { calls++; },
+      fetchImpl: async () => { calls++; } });
+    assert.equal(invalid.result.outcome, 'error');
+    assert.equal(calls, 0);
+  }
   const root = await setup(t, { uid: 0, scorer: async () => { calls++; },
     fetchImpl: async () => { calls++; } });
   assert.equal(root.result.outcome, 'error');
@@ -328,4 +334,151 @@ test('rejects unsafe outcome and non-finite scores in output formatter', async (
   assert.throws(() => formatOutputs({ outcome: 'below_cutoff', robotScore: NaN }));
   assert.throws(() => formatOutputs({ outcome: 'below_cutoff', robotScore: 1.1 }));
   assert.throws(() => formatOutputs({ outcome: 'below_cutoff', robotScore: '0.6' }));
+});
+
+test('real client enforces configured App authorship and migration stops', async t => {
+  const marker = `<!-- mellon-submission-moderation-v1 repo=owner/repo item=7 input=${'b'.repeat(64)} detector=${'c'.repeat(40)} model=${'a'.repeat(64)} -->`;
+  const response = (status, body) => new Response(JSON.stringify(body), { status });
+  const current = () => ({ state: 'open', merged: false,
+    title: event.issue.title, body: event.issue.body });
+  for (const eventName of ['issues', 'pull_request_target']) {
+    for (const scenario of ['create', 'reuse', 'lost', 'bad-author', 'bad-body', 'mixed', 'reconciled-mixed', 'missing', 'failed-list']) {
+      const paths = [];
+      let postBody;
+      let listings = 0;
+      const app = { id: 82, body: marker, user: { login: 'Mellon[BoT]', type: 'Bot' } };
+      const legacy = { ...app, id: 81, user: { login: 'github-actions[bot]', type: 'Bot' } };
+      const safe = await setup(t, { eventName, payload: eventName === 'issues' ? event : { action: 'opened', repository: event.repository, pull_request: event.issue },
+        scorer: async () => ({ protocol_version: 1, outcome: 'classified', robot_score: 0.8,
+          detector_revision: 'c'.repeat(40), model_sha256: 'a'.repeat(64), input_sha256: 'b'.repeat(64) }), inputs: { token: 'fixture-credential', 'moderation-bot-login': 'MeLLoN[BoT]' },
+        fetchImpl: async (url, options) => {
+          const path = new URL(url).pathname;
+          paths.push(`${options.method} ${path}`);
+          const itemPath = eventName === 'issues' ? '/repos/owner/repo/issues/7' : '/repos/owner/repo/pulls/7';
+          if (options.method === 'GET' && path === itemPath) return response(200, current());
+          if (path.endsWith('/comments')) {
+            if (options.method === 'GET') {
+              listings++;
+              if (scenario === 'reuse') return response(200, [app]);
+              if (scenario === 'mixed' || (scenario === 'reconciled-mixed' && listings === 2)) return response(200, [app, legacy]);
+              if (listings === 2 && scenario === 'failed-list') return response(503, { message: 'private server detail' });
+              return response(200, listings === 2 && scenario === 'lost' ? [app] : []);
+            }
+            postBody = JSON.parse(options.body);
+            assert.deepEqual(Object.keys(postBody), ['body']);
+            if (['lost', 'reconciled-mixed', 'missing', 'failed-list'].includes(scenario)) throw new Error('private server detail');
+            if (scenario === 'bad-author') return response(201, { ...app, body: postBody.body,
+              user: { login: 'mellon[bot]', type: 'User' } });
+            return response(201, { ...app, body: scenario === 'bad-body' ? marker : postBody.body });
+          }
+          if (path.startsWith('/repos/owner/repo/labels/')) return response(200, { name: decodeURIComponent(path.split('/').at(-1)) });
+          if (path.endsWith('/labels')) return response(200, options.method === 'POST' ? [{ name: 'mellon: review' }] : []);
+          if (options.method === 'PATCH' && path === itemPath) return response(200, { ...current(), state: 'closed' });
+          throw new Error('unexpected mocked request');
+        } });
+      const successful = ['create', 'reuse', 'lost'].includes(scenario);
+      const conflict = ['mixed', 'reconciled-mixed'].includes(scenario);
+      assert.equal(safe.result.outcome, successful ? 'closed' : 'error',
+        `${eventName}/${scenario}: ${JSON.stringify(safe.result)}; requests=${paths.join(', ')}`);
+      assert.equal(paths.filter(path => path.startsWith('POST') && path.endsWith('/comments')).length,
+        ['reuse', 'mixed'].includes(scenario) ? 0 : 1);
+      assert.equal(paths.filter(path => path.startsWith('PATCH')).length, successful ? 1 : 0);
+      if (!successful) assert.equal(paths.some(path => path.endsWith('/labels')), false);
+      assert.equal(safe.result.commentId, conflict ? 82 : undefined);
+      if (conflict) {
+        assert.equal(safe.result.category, 'moderation_identity_migration_conflict');
+        assert.match(await readFile(safe.summaryPath, 'utf8'), /Manual review.*default identity/);
+        assert.match(await readFile(safe.summaryPath, 'utf8'), /Comment ID: 82/);
+        assert.doesNotMatch(await readFile(safe.summaryPath, 'utf8'), /Comment ID: 81/);
+      }
+      if (scenario === 'failed-list') assert.equal(safe.result.category, 'comment_reconciliation_failed');
+      assert.doesNotMatch(JSON.stringify(safe.result) + await readFile(safe.summaryPath, 'utf8') + await readFile(safe.outputPath, 'utf8'), /private server detail|fixture-credential|Describe your contribution|I implemented a test/);
+    }
+  }
+});
+
+test('real client stops mismatched Bot reruns and preserves only trusted partial work', async t => {
+  const marker = `<!-- mellon-submission-moderation-v1 repo=owner/repo item=7 input=${'b'.repeat(64)} detector=${'c'.repeat(40)} model=${'a'.repeat(64)} -->`;
+  const response = (status, body) => new Response(JSON.stringify(body), { status });
+  for (const eventName of ['issues', 'pull_request_target']) {
+    for (const expected of ['github-actions[bot]', 'mellon[bot]']) {
+      for (const inventory of ['foreign', 'mixed', 'post-mismatch', 'reconciled-mixed']) {
+        const requests = [];
+        const mixed = ['mixed', 'reconciled-mixed'].includes(inventory);
+        const startsEmpty = ['post-mismatch', 'reconciled-mixed'].includes(inventory);
+        const foreign = { id: 91, body: marker, user: { login: 'Mellon-Moderation[BoT]', type: 'Bot' } };
+        const trusted = { id: 82, body: marker, user: { login: expected.toUpperCase(), type: 'Bot' } };
+        const comments = startsEmpty ? [] : mixed ? [foreign, trusted] : [foreign];
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const safe = await setup(t, {
+            eventName, payload: eventName === 'issues' ? event : { action: 'opened', repository: event.repository, pull_request: event.issue },
+            scorer: async () => ({ protocol_version: 1, outcome: 'classified', robot_score: 0.8,
+              detector_revision: 'c'.repeat(40), model_sha256: 'a'.repeat(64), input_sha256: 'b'.repeat(64) }),
+            inputs: { token: 'fixture-credential', 'moderation-bot-login': expected, 'review-label': 'false' },
+            fetchImpl: async (url, options) => {
+              const resource = new URL(url).pathname;
+              requests.push(`${options.method} ${resource}`);
+              const itemPath = `/repos/owner/repo/${eventName === 'issues' ? 'issues' : 'pulls'}/7`;
+              if (options.method === 'GET' && resource === itemPath) {
+                return response(200, { state: 'open', merged: false, title: event.issue.title, body: event.issue.body });
+              }
+              if (options.method === 'GET' && resource.endsWith('/comments')) return response(200, comments);
+              if (options.method === 'POST' && resource.endsWith('/comments')) {
+                const posted = { ...foreign, body: JSON.parse(options.body).body };
+                comments.push(posted);
+                if (inventory === 'reconciled-mixed') comments.push(trusted);
+                return response(201, posted);
+              }
+              throw new Error('unexpected mocked request');
+            },
+          });
+          assert.equal(safe.result.outcome, 'error', `${eventName}/${expected}/${inventory}/${attempt}`);
+          assert.equal(safe.result.stage, startsEmpty && attempt === 0
+            ? 'comment_reconciliation' : 'comment_inventory');
+          assert.equal(safe.result.category, 'moderation_identity_mismatch');
+          assert.equal(safe.result.partial, mixed);
+          assert.equal(safe.result.commentId, mixed ? 82 : undefined);
+          assert.equal(safe.result.uncertainty, startsEmpty && attempt === 0);
+          const summary = await readFile(safe.summaryPath, 'utf8');
+          assert.match(summary, /Manual review.*token.*moderation-bot-login/);
+          assert.match(summary, /Failure category: moderation_identity_mismatch/);
+          if (mixed) {
+            assert.match(summary, /Comment ID: 82/);
+            assert.deepEqual(safe.result.provenance, { detectorRevision: 'c'.repeat(40),
+              modelSha256: 'a'.repeat(64), inputSha256: 'b'.repeat(64) });
+          }
+          assert.doesNotMatch(summary, /Comment ID: 91/);
+          assert.doesNotMatch(JSON.stringify(safe.result) + summary + await readFile(safe.outputPath, 'utf8'),
+            /fixture-credential|Describe your contribution|I implemented a test|Mellon-Moderation/);
+        }
+        assert.equal(requests.filter(request => request.startsWith('POST')).length, startsEmpty ? 1 : 0);
+        assert.equal(requests.some(request => request.startsWith('PATCH') || request.endsWith('/labels')), false);
+        assert.equal(comments.length, mixed ? 2 : 1);
+      }
+    }
+  }
+});
+
+test('result normalization accepts only fixed operational diagnostics', () => {
+  const accepted = [
+    ['comment_inventory', 'comment_inventory_failed'],
+    ['comment_inventory', 'moderation_identity_migration_conflict'],
+    ['comment_inventory', 'moderation_identity_mismatch'],
+    ['comment_reconciliation', 'moderation_identity_migration_conflict'],
+    ['comment_reconciliation', 'moderation_identity_mismatch'],
+    ['comment_reconciliation', 'comment_reconciliation_failed'],
+    ['comment_create', 'comment_unconfirmed'],
+  ];
+  for (const [stage, category] of accepted) {
+    const result = normalizeResult({ outcome: 'error', stage, category, error: 'private error' });
+    assert.equal(result.stage, stage);
+    assert.equal(result.category, category);
+    assert.equal(result.error, undefined);
+  }
+  for (const [stage, category] of [['raw detail', 'comment_unconfirmed'], ['comment_create', 'raw detail'],
+    ['comment_inventory', 'comment_unconfirmed'], ['comment_create', 'moderation_identity_mismatch']]) {
+    const result = normalizeResult({ outcome: 'error', stage, category });
+    assert.equal(result.stage, undefined);
+    assert.equal(result.category, undefined);
+  }
 });

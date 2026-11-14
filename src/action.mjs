@@ -71,13 +71,23 @@ async function writeOutputs(filename, content) {
   }
 }
 
-function normalizeResult(result) {
+const FAILURE_CATEGORIES = new Map([
+  ['comment_inventory', new Set(['comment_inventory_failed', 'moderation_identity_migration_conflict', 'moderation_identity_mismatch'])],
+  ['comment_reconciliation', new Set(['comment_reconciliation_failed', 'moderation_identity_migration_conflict', 'moderation_identity_mismatch'])],
+  ['comment_create', new Set(['comment_unconfirmed'])],
+]);
+
+export function normalizeResult(result) {
+  const diagnostic = result?.outcome === 'error' &&
+    FAILURE_CATEGORIES.get(result.stage)?.has(result.category)
+    ? { stage: result.stage, category: result.category } : {};
   const hasScore = result && Object.hasOwn(result, 'score') && result.score !== null;
   const score = hasScore && typeof result.score === 'number' && Number.isFinite(result.score)
     && result.score >= 0 && result.score <= 1 ? result.score : undefined;
   if (hasScore && score === undefined) throw operationalError();
   const normalized = {
     outcome: result?.outcome,
+    ...diagnostic,
     ...(result?.outcome_labels_incomplete === true ? { outcomeLabelsIncomplete: true } : {}),
     ...(score === undefined ? {} : { robotScore: score }),
     ...(result?.outcome === 'flagged' ? { labelApplied: result.label_applied === true } : {}),
@@ -172,12 +182,15 @@ export async function runAction({
         const mode = typeof getInput === 'function' ? getInput('mode') : '';
         const autoClose = typeof getInput === 'function' ? getInput('auto-close') : '';
         const reviewLabel = typeof getInput === 'function' ? getInput('review-label') : '';
+        const moderationBotLogin = typeof getInput === 'function'
+          ? getInput('moderation-bot-login', { trimWhitespace: false }) : '';
         return {
           ...(allowlist === '' ? {} : { allowlist }),
           ...(response === '' ? {} : { response }),
           ...(mode === '' ? {} : { mode }),
           ...(autoClose === '' ? {} : { autoClose }),
           ...(reviewLabel === '' ? {} : { reviewLabel }),
+          ...(moderationBotLogin === '' ? {} : { moderationBotLogin }),
         };
       };
       let api;
@@ -243,11 +256,17 @@ async function writeSummary(filename, result) {
     ? '\n\nLabel: mellon: review' : '';
   const uncertainty = result.outcome === 'error' && result.uncertainty
     ? '\n\nResponse confirmation: uncertain' : '';
+  const identityNote = result.category === 'moderation_identity_migration_conflict'
+    ? '\nManual review required. Retry with the default identity (github-actions[bot]) only when it is the sole response identity. Switching configuration cannot re-author comments.'
+    : result.category === 'moderation_identity_mismatch'
+      ? '\nManual review required. Check that the token and moderation-bot-login match. Another Bot response is not trusted confirmation.' : '';
+  const diagnostic = result.stage && result.category
+    ? `\n\nFailure stage: ${result.stage}\nFailure category: ${result.category}${identityNote}` : '';
   const setupNote = result.outcomeLabelsIncomplete
     ? '\n\nOutcome-label setup is incomplete. Create missing review outcome labels manually in repository settings.' : '';
   try {
     const handle = await open(filename, 'a');
-    try { await handle.writeFile(`## Mellon moderation\n\n${labels[result.outcome]}${score}${labelNote}${partial}${uncertainty}${setupNote}\n`, 'utf8'); }
+    try { await handle.writeFile(`## Mellon moderation\n\n${labels[result.outcome]}${score}${labelNote}${partial}${uncertainty}${diagnostic}${setupNote}\n`, 'utf8'); }
     finally { await handle.close(); }
   } catch {
     // Summaries are optional and contain no event text or credentials.

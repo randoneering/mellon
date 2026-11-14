@@ -353,10 +353,13 @@ test('response-only mode leaves observe mode label-only and never posts or close
 test('failed reconciliation and close failures are safe partial errors', async () => {
   const fixture = setup();
   fixture.api.createComment = async () => { throw new Error('token leaked'); };
-  fixture.api.listComments = async () => { if (fixture.calls.filter((call) => call === 'comments').length > 1) throw new Error('raw'); return []; };
+  fixture.api.listComments = async () => { fixture.calls.push('comments'); if (fixture.calls.filter((call) => call === 'comments').length > 1) throw new Error('raw'); return []; };
   const uncertain = await moderate({ getContext, getInputs, api: fixture.api, score: fixture.score });
   assert.equal(uncertain.outcome, 'error');
   assert.equal(uncertain.uncertainty, true);
+  assert.equal(uncertain.stage, 'comment_reconciliation');
+  assert.equal(uncertain.category, 'comment_reconciliation_failed');
+  assert.equal(fixture.calls.filter(call => call === 'comments').length, 2);
   assert.equal(fixture.calls.includes('close'), false);
   const closeFailure = setup();
   closeFailure.api.getReviewLabel = async () => { closeFailure.calls.push('label_lookup'); return { exists: true }; };
@@ -368,4 +371,185 @@ test('failed reconciliation and close failures are safe partial errors', async (
   assert.equal(partial.error.includes('raw token'), false);
   assert.ok(closeFailure.calls.indexOf('label_apply') < closeFailure.calls.lastIndexOf('state'));
   assert.ok(closeFailure.calls.indexOf('close') > closeFailure.calls.lastIndexOf('state'));
+});
+
+test('App identity boundaries', async () => {
+  const app = { id: 31, body: `prefix ${marker} suffix`, user: { login: 'MeLLoN[BoT]', type: 'Bot' } };
+  const legacy = { ...app, id: 91, user: { login: 'GitHub-Actions[bot]', type: 'Bot' } };
+  for (const [eventName, key] of [['issues', 'issue'], ['pull_request_target', 'pull_request']]) {
+    const context = () => ({ eventName, repository: 'o/r', payload: { ...event,
+      issue: undefined, [key]: event.issue } });
+    async function run({ first = [], second = [], response = {}, lost = false, failList = 0 } = {}) {
+      const f = setup();
+      let listings = 0;
+      f.api.listComments = async () => {
+        f.calls.push('comments');
+        if (++listings === failList) throw new Error('private API detail');
+        return listings === 1 ? first : second;
+      };
+      f.api.createComment = async (item, login) => {
+        f.calls.push('post');
+        assert.equal(login, 'mellon[bot]');
+        if (lost) throw new Error('private API detail');
+        return { ...app, body: item.body, ...response };
+      };
+      f.api.getReviewLabel = async () => ({ exists: true });
+      f.api.addLabel = async () => { f.calls.push('label'); return { confirmed: true }; };
+      const out = await moderate({ getContext: context, getInputs: () => ({ moderationBotLogin: 'MeLLoN[BoT]' }),
+        api: f.api, score: f.score });
+      assert.equal(JSON.stringify(out).includes('private API detail'), false);
+      return { out, calls: f.calls, listings };
+    }
+    function failed(r, stage, category, posts = 1) {
+      assert.equal(r.out.outcome, 'error');
+      assert.equal(r.out.stage, stage);
+      assert.equal(r.out.category, category);
+      assert.equal(r.calls.filter(c => c === 'post').length, posts);
+      assert.equal(r.calls.some(c => c === 'label' || c === 'close'), false);
+    }
+    for (const args of [{}, { first: [app] }, { lost: true, second: [app] },
+      { response: { body: marker }, second: [app] },
+      { first: [{ ...legacy, id: 0 }] }, { first: [{ ...legacy, body: 'old marker' }] }]) {
+      const r = await run(args);
+      assert.equal(r.out.outcome, 'closed');
+      assert.equal(r.out.comment_id, 31);
+      assert.equal(r.calls.filter(c => c === 'post').length, args.first?.[0] === app ? 0 : 1);
+      assert.equal(r.listings, args.second ? 2 : 1);
+    }
+    const invalid = [
+      ...[{ login: 'mellon[bot]', type: 'User' }, { login: 'github-actions[bot]', type: 'User' },
+        null, {}, { login: 4, type: 'Bot' }].map(user => ({ user })),
+      ...[0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '31'].map(id => ({ id })),
+      { body: null }, { body: marker.replace('item=4', 'item=5') },
+    ];
+    for (const response of invalid) {
+      assert.equal((await run({ first: [null, { ...app, ...response }] })).out.outcome, 'closed');
+      const r = await run({ response });
+      failed(r, 'comment_create', 'comment_unconfirmed');
+      assert.equal(r.out.uncertainty, true);
+      assert.equal(r.out.partial, false);
+    }
+    for (const login of ['other[bot]', 'mellon-extra[bot]']) {
+      failed(await run({ response: { user: { login, type: 'Bot' } } }),
+        'comment_create', 'comment_unconfirmed');
+    }
+    failed(await run({ response: { body: marker } }), 'comment_create', 'comment_unconfirmed');
+    failed(await run({ lost: true }), 'comment_create', 'comment_unconfirmed');
+    failed(await run({ failList: 1 }), 'comment_inventory', 'comment_inventory_failed', 0);
+    failed(await run({ lost: true, failList: 2 }), 'comment_reconciliation', 'comment_reconciliation_failed');
+    for (const inventory of [[legacy], [app, legacy], [legacy, app]]) {
+      for (const reconcile of [false, true]) {
+        const r = await run(reconcile ? { lost: true, second: inventory } : { first: inventory });
+        failed(r, reconcile ? 'comment_reconciliation' : 'comment_inventory',
+          'moderation_identity_migration_conflict', reconcile ? 1 : 0);
+        const partial = inventory.includes(app);
+        assert.equal(r.out.partial, partial);
+        assert.equal(r.out.comment_id, partial ? 31 : undefined);
+        assert.equal(r.out.uncertainty, reconcile);
+        if (partial) assert.deepEqual([r.out.score, r.out.detector_revision, r.out.model_sha256, r.out.input_sha256],
+          [0.8, revision, hash, inputHash]);
+      }
+    }
+  }
+});
+
+test('unexpected Bot responses stop inventory writes across repeated issue and PR runs', async () => {
+  for (const [eventName, key] of [['issues', 'issue'], ['pull_request_target', 'pull_request']]) {
+    for (const reviewLabel of ['true', 'false']) {
+      for (const [expected, actual] of [
+        ['github-actions[bot]', 'MeLLoN[BoT]'],
+        ['mellon[bot]', 'Mellon-Moderation[BoT]'],
+        ['mellon[bot]', 'unrelated[bot]'],
+      ]) {
+        const foreign = { id: 41, body: `prefix ${marker} suffix`, user: { login: actual, type: 'Bot' } };
+        for (const mixed of [false, true]) {
+          const trusted = { id: 42, body: marker, user: { login: expected.toUpperCase(), type: 'Bot' } };
+          const fixture = setup(0.8, { comments: mixed ? [trusted, foreign] : [foreign] });
+          fixture.api.getReviewLabel = async () => { fixture.calls.push('label_lookup'); return { exists: true }; };
+          fixture.api.addLabel = async () => { fixture.calls.push('label_apply'); return { confirmed: true }; };
+          for (let attempt = 0; attempt < 2; attempt++) {
+            const out = await moderate({
+              getContext: () => ({ eventName, repository: 'o/r', payload: { ...event, issue: undefined, [key]: event.issue } }),
+              getInputs: () => ({ moderationBotLogin: expected, reviewLabel }),
+              api: fixture.api, score: fixture.score,
+            });
+            assert.equal(out.outcome, 'error');
+            assert.equal(out.stage, 'comment_inventory');
+            assert.equal(out.category, 'moderation_identity_mismatch');
+            assert.equal(out.partial, mixed);
+            assert.equal(out.comment_id, mixed ? 42 : undefined);
+            assert.equal(out.uncertainty, false);
+            if (mixed) assert.deepEqual([out.score, out.detector_revision, out.model_sha256, out.input_sha256],
+              [0.8, revision, hash, inputHash]);
+          }
+          assert.deepEqual(fixture.calls, ['comments', 'comments']);
+        }
+      }
+    }
+  }
+});
+
+test('unexpected authors with invalid markers or ownership data do not establish a conflict', async () => {
+  const foreign = { id: 61, body: marker, user: { login: 'other[bot]', type: 'Bot' } };
+  const ignored = [
+    { ...foreign, body: marker.replace('item=4', 'item=5') },
+    { ...foreign, id: 0 },
+    { ...foreign, body: null },
+    { ...foreign, user: { login: 'other[bot]', type: 'User' } },
+    { ...foreign, user: null },
+    { ...foreign, user: { login: 4, type: 'Bot' } },
+  ];
+  for (const [eventName, key] of [['issues', 'issue'], ['pull_request_target', 'pull_request']]) {
+    for (const comment of ignored) {
+      const fixture = setup(0.8, { comments: [comment] });
+      fixture.api.createComment = async ({ body }) => {
+        fixture.calls.push('post');
+        return { id: 62, body, user: { login: 'mellon[bot]', type: 'Bot' } };
+      };
+      const out = await moderate({
+        getContext: () => ({ eventName, repository: 'o/r', payload: { ...event, issue: undefined, [key]: event.issue } }),
+        getInputs: () => ({ moderationBotLogin: 'mellon[bot]', reviewLabel: 'false', autoClose: 'false' }),
+        api: fixture.api, score: fixture.score,
+      });
+      assert.equal(out.outcome, 'commented');
+      assert.equal(out.comment_id, 62);
+      assert.equal(fixture.calls.filter(call => call === 'post').length, 1);
+    }
+  }
+});
+
+test('misconfigured Bot posting reconciles once and never duplicates on later runs', async () => {
+  for (const [eventName, key] of [['issues', 'issue'], ['pull_request_target', 'pull_request']]) {
+    for (const reviewLabel of ['true', 'false']) {
+      for (const expected of ['github-actions[bot]', 'mellon[bot]']) {
+        for (const lost of [false, true]) {
+          const comments = [];
+          const fixture = setup(0.8, { comments });
+          fixture.api.createComment = async ({ body }) => {
+            fixture.calls.push('post');
+            const foreign = { id: 51, body, user: { login: 'Mellon-Moderation[BoT]', type: 'Bot' } };
+            comments.push(foreign);
+            if (lost) throw new Error('private write failure');
+            return foreign;
+          };
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const out = await moderate({
+              getContext: () => ({ eventName, repository: 'o/r', payload: { ...event, issue: undefined, [key]: event.issue } }),
+              getInputs: () => ({ moderationBotLogin: expected, reviewLabel }),
+              api: fixture.api, score: fixture.score,
+            });
+            assert.equal(out.outcome, 'error');
+            assert.equal(out.stage, attempt === 0 ? 'comment_reconciliation' : 'comment_inventory');
+            assert.equal(out.category, 'moderation_identity_mismatch');
+            assert.equal(out.uncertainty, attempt === 0);
+            assert.equal(out.partial, false);
+            assert.equal(out.comment_id, undefined);
+            assert.doesNotMatch(JSON.stringify(out), /private write failure/);
+          }
+          assert.equal(comments.length, 1);
+          assert.deepEqual(fixture.calls, ['comments', 'state', 'post', 'comments', 'comments', 'comments']);
+        }
+      }
+    }
+  }
 });
