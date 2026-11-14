@@ -6,8 +6,12 @@ branding:
   color: yellow
 inputs:
   token:
-    description: Token with the required issues and pull request permissions for API operations.
+    description: GitHub Actions token or moderation App installation token with the required issues and pull request permissions.
     required: false
+  moderation-bot-login:
+    description: Expected Bot login for the token's comment author. This validates identity, not authorship or avatar configuration.
+    required: false
+    default: 'github-actions[bot]'
   allowlist:
     description: JSON array of exact account logins to exempt.
     required: false

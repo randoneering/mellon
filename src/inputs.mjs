@@ -2,6 +2,14 @@ const DEFAULT_RESPONSE = "AI-assisted code is welcome. Please describe your work
 const EVENT_LIMIT = 4 * 1024 * 1024;
 const RESPONSE_LIMIT = 32 * 1024;
 const ACCOUNT_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\[bot\])?$/i;
+const BOT_LOGIN_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\[bot\](?![\s\S])/i;
+export const DEFAULT_MODERATION_BOT_LOGIN = 'github-actions[bot]';
+
+export function isTrustedModerationAuthor(user, expectedLogin = DEFAULT_MODERATION_BOT_LOGIN) {
+  return typeof expectedLogin === 'string' && BOT_LOGIN_PATTERN.test(expectedLogin) &&
+    user?.type === 'Bot' && typeof user.login === 'string' &&
+    user.login.toLowerCase() === expectedLogin.toLowerCase();
+}
 
 function invalidInput() {
   return new Error('Invalid Action input or event payload.');
@@ -84,8 +92,12 @@ export function parsePolicy(inputs = {}) {
     : inputs.reviewLabel === 'true' ? true : inputs.reviewLabel === 'false' ? false : null;
   if (typeof response !== 'string' || !validText(response) || Buffer.byteLength(response, 'utf8') > RESPONSE_LIMIT ||
       mode !== 'enforce' && mode !== 'observe' || autoClose === null || reviewLabel === null) throw invalidInput();
-  if (Object.keys(inputs).some((key) => !['allowlist', 'response', 'mode', 'autoClose', 'reviewLabel'].includes(key))) throw invalidInput();
-  return { allowlist, response, cutoff: 0.8, mode, autoClose, reviewLabel };
+  const login = inputs.moderationBotLogin;
+  const moderationBotLogin = login === undefined || login === '' ? DEFAULT_MODERATION_BOT_LOGIN : login;
+  if (typeof moderationBotLogin !== 'string' || !BOT_LOGIN_PATTERN.test(moderationBotLogin)) throw invalidInput();
+  if (Object.keys(inputs).some((key) => !['allowlist', 'response', 'mode', 'autoClose', 'reviewLabel', 'moderationBotLogin'].includes(key))) throw invalidInput();
+  return { allowlist, response, cutoff: 0.8, mode, autoClose, reviewLabel,
+    moderationBotLogin: moderationBotLogin.toLowerCase() };
 }
 
 export function createEligibleContinuation({ getContext, getInputs }) {

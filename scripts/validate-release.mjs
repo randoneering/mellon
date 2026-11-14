@@ -13,10 +13,11 @@ try {
 const action = yaml.parse(await readFile('action.yml', 'utf8'));
 assert.equal(action.runs?.using, 'node24');
 assert.equal(action.runs?.main, 'dist/index.mjs');
-assert.deepEqual(Object.keys(action.inputs).sort(), ['allowlist', 'auto-close', 'mode', 'response', 'review-label', 'token']);
+assert.deepEqual(Object.keys(action.inputs).sort(), ['allowlist', 'auto-close', 'mode', 'moderation-bot-login', 'response', 'review-label', 'token']);
 assert.equal(action.inputs.mode.default, 'enforce');
 assert.equal(action.inputs['auto-close'].default, 'true');
 assert.equal(action.inputs['review-label'].default, 'true');
+assert.equal(action.inputs['moderation-bot-login'].default, 'github-actions[bot]');
 assert.deepEqual(Object.keys(action.outputs).sort(), ['outcome', 'robot-score']);
 
 const workflowText = await readFile('examples/submission-moderation.yml', 'utf8');
