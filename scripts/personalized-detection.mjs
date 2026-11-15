@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { pathToFileURL } from 'node:url';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
-import { parseSubmissionUrl, fetchSubmission } from '../src/personalized/github.mjs';
+import { parseSubmissionUrl, fetchSubmission, parseRepository, discoverRepositoryUrls } from '../src/personalized/github.mjs';
 import { loadDataset, addRecord, saveDataset, validateDataset } from '../src/personalized/dataset.mjs';
 import { splitDataset } from '../src/personalized/split.mjs';
 import { trainClassifier } from '../src/personalized/classifier.mjs';
@@ -125,17 +125,58 @@ async function runGuided(dependencies) {
   if (!(env.GH_TOKEN || env.GITHUB_TOKEN)) {
     throw new Error('Set GH_TOKEN or GITHUB_TOKEN for read-only GitHub access.');
   }
-  const urlFile = await ask('URL list path (leave blank to enter URLs manually): ');
+  let urlFile = '';
   let urls;
-  if (!urlFile) {
-    urls = [];
-    for (;;) {
-      const value = await ask('GitHub issue or pull request URL (blank to finish): ');
-      if (!value) break;
-      try { parseSubmissionUrl(value); } catch { output('Unsupported GitHub URL; try again.'); continue; }
-      urls.push(value);
+  for (;;) {
+    urlFile = '';
+    urls = undefined;
+    const source = await ask('Source [repo/file/manual] (blank for manual, or enter a URL-list path): ');
+    if (source === 'repo') {
+      let repository;
+      for (;;) {
+        repository = await ask('GitHub repository (owner/repo or repository URL): ');
+        try { parseRepository(repository); break; } catch { output('Enter owner/repo or an HTTPS GitHub repository URL.'); }
+      }
+      const count = async kind => {
+        for (;;) {
+          const value = await ask(`${kind} count [20] (0 to skip, maximum 100): `);
+          if (!value) return 20;
+          if (/^\d+$/.test(value) && Number(value) <= 100) return Number(value);
+          output('Enter a whole number from 0 to 100.');
+        }
+      };
+      let issues;
+      let pullRequests;
+      do {
+        issues = await count('Issue');
+        pullRequests = await count('Pull request');
+        if (issues + pullRequests === 0) output('Choose at least one issue or pull request.');
+      } while (issues + pullRequests === 0);
+      output('Selecting newest-created submissions, open and closed. This sample may be biased; labels do not prove authorship.');
+      urls = await discoverRepositoryUrls(repository, { issues, pullRequests }, env.GH_TOKEN || env.GITHUB_TOKEN, dependencies.fetchImpl ?? fetch);
+      if (!urls.length) {
+        output('No matching submissions found. Choose another source.');
+        continue;
+      }
+      output(`Selected ${urls.length} submissions. Saved labels will be skipped, not replaced with older submissions.`);
+      break;
     }
-    if (!urls.length) throw new Error('Provide at least one GitHub submission URL.');
+    urlFile = source === 'file' ? await ask('URL-list file path: ') : source === 'manual' ? '' : source;
+    if (source === 'file' && !urlFile) {
+      output('Provide a URL-list file path or choose another source.');
+      continue;
+    }
+    if (!urlFile) {
+      urls = [];
+      for (;;) {
+        const value = await ask('GitHub issue or pull request URL (blank to finish): ');
+        if (!value) break;
+        try { parseSubmissionUrl(value); } catch { output('Unsupported GitHub URL; try again.'); continue; }
+        urls.push(value);
+      }
+      if (!urls.length) throw new Error('Provide at least one GitHub submission URL.');
+    }
+    break;
   }
   const dataset = await ask('Dataset path: ');
   const model = await ask('New model path: ');
@@ -215,13 +256,13 @@ export async function runCli(argv, dependencies = {}) {
     const urls = dependencies.urls ?? (await readFile(values.get('--urls'), 'utf8')).split(/\r?\n/).map(line => line.trim()).filter(Boolean);
     if (!urls.length) throw new Error('URL list is empty.');
     const records = (await loadDataset(values.get('--dataset'))).records;
-    const existing = new Set(records.map(record => record.url));
+    const existing = new Set(records.map(record => record.url.toLowerCase()));
     const isTracked = dependencies.isTracked;
     if (isTracked && await isTracked(values.get('--dataset'))) output(`Warning: dataset destination is Git-tracked: ${values.get('--dataset')}`);
     for (const value of urls) {
       let parsed;
       try { parsed = parseSubmissionUrl(value); } catch { output('Skipped unsupported GitHub URL.'); continue; }
-      if (existing.has(parsed.canonicalUrl)) continue;
+      if (existing.has(parsed.canonicalUrl.toLowerCase())) continue;
       let snapshot;
       try { snapshot = await fetchSubmission(parsed, token, dependencies.fetchImpl ?? fetch); }
       catch { output(`Could not fetch ${parsed.canonicalUrl}; existing dataset preserved.`); continue; }
@@ -234,7 +275,7 @@ export async function runCli(argv, dependencies = {}) {
       await saveDataset(values.get('--dataset'), records, {
         ...(dependencies.isTracked ? { isTracked: dependencies.isTracked } : {}), warn: output,
       });
-      existing.add(parsed.canonicalUrl);
+      existing.add(parsed.canonicalUrl.toLowerCase());
     }
     return;
   }

@@ -139,6 +139,136 @@ test('guided manual entry collects, trains, and evaluates without leaking submis
   assert.doesNotMatch(output.join('\n'), /do-not-leak-token|Title 1|Body 1/);
 });
 
+function repositoryDeps(output = []) {
+  return {
+    ...deps([], output),
+    fetchImpl: async (url, options) => {
+      const endpoint = new URL(url);
+      if (/\/repos\/acme\/project\/(issues|pulls)$/.test(endpoint.pathname)) {
+        assert.equal(endpoint.searchParams.get('state'), 'all');
+        assert.equal(options.redirect, 'manual');
+        const numbers = endpoint.pathname.endsWith('/issues') ? [1, 2, 3, 4, 5] : [6, 7, 8, 9, 10];
+        return new Response(JSON.stringify(numbers.map(number => ({ number }))));
+      }
+      return deps([]).fetchImpl(url, options);
+    },
+    baselineModelHash: 'a'.repeat(64),
+    baselineScore: async () => 0.2,
+  };
+}
+
+test('guided repository selection labels separate issue and PR samples and writes local artifacts', async t => {
+  const files = await fixture(t);
+  const output = [];
+  const answers = ['repo', 'https://github.com/acme/project', '5', '5',
+    files.datasetPath, files.modelPath, files.reportPath,
+    ...urls.map((_, index) => index % 2 ? 'ai' : 'human')];
+  await runCli(['guided'], { ...repositoryDeps(output), prompt: async () => answers.shift() });
+  const saved = JSON.parse(await readFile(files.datasetPath, 'utf8'));
+  assert.equal(saved.records.length, 10);
+  assert.equal(saved.records.filter(record => record.url.includes('/issues/')).length, 5);
+  assert.equal(saved.records.filter(record => record.url.includes('/pull/')).length, 5);
+  assert.ok(JSON.parse(await readFile(files.reportPath, 'utf8')).detectors.personalized);
+  assert.equal(answers.length, 0);
+  assert.doesNotMatch(output.join('\n'), /do-not-leak-token|Title 1|Body 1/);
+  assert.match(output.join('\n'), /newest.created/i);
+});
+
+test('guided repository counts reprompt invalid input and allow skipping one kind', async t => {
+  const files = await fixture(t);
+  const output = [];
+  const answers = ['repo', 'https://evil.example/acme/project', 'acme/project',
+    '101', '-1', '1.5', '5', '0',
+    files.datasetPath, files.modelPath, files.reportPath, 'human', 'ai', 'human', 'ai', 'human'];
+  let pullLists = 0;
+  const options = repositoryDeps(output);
+  await runCli(['guided'], {
+    ...options, prompt: async () => answers.shift(),
+    fetchImpl: async (url, request) => {
+      if (new URL(url).pathname.endsWith('/pulls')) pullLists++;
+      return options.fetchImpl(url, request);
+    },
+  });
+  assert.equal(pullLists, 0);
+  assert.equal(JSON.parse(await readFile(files.datasetPath, 'utf8')).records.length, 5);
+  assert.equal(answers.length, 0);
+  assert.match(output.join('\n'), /0.*100/);
+});
+
+test('guided empty repository offers another source without training or requesting destinations', async t => {
+  const files = await fixture(t);
+  const output = [];
+  const answers = ['repo', 'acme/empty', '', '', 'file', files.urlFile,
+    files.datasetPath, files.modelPath, files.reportPath,
+    ...urls.map((_, index) => index % 2 ? 'ai' : 'human')];
+  const options = repositoryDeps(output);
+  await runCli(['guided'], {
+    ...options, prompt: async () => answers.shift(),
+    fetchImpl: async (url, request) => new URL(url).pathname.startsWith('/repos/acme/empty/')
+      ? new Response('[]') : options.fetchImpl(url, request),
+  });
+  assert.match(output.join('\n'), /no.*submissions.*another source/i);
+  assert.equal(JSON.parse(await readFile(files.datasetPath, 'utf8')).records.length, 10);
+  assert.equal(answers.length, 0);
+});
+
+test('guided repository defaults select 20 issues and 20 PRs', async t => {
+  const files = await fixture(t);
+  const answers = ['repo', 'acme/project', '', '', files.datasetPath, files.modelPath, files.reportPath,
+    ...Array.from({ length: 40 }, (_, index) => index % 2 ? 'ai' : 'human')];
+  const options = repositoryDeps();
+  await runCli(['guided'], {
+    ...options, prompt: async () => answers.shift(),
+    fetchImpl: async (url, request) => {
+      const endpoint = new URL(url);
+      if (/\/repos\/acme\/project\/(issues|pulls)$/.test(endpoint.pathname)) {
+        const offset = endpoint.pathname.endsWith('/issues') ? 0 : 40;
+        return new Response(JSON.stringify(Array.from({ length: 30 }, (_, i) => ({ number: i + 1 + offset }))));
+      }
+      return options.fetchImpl(url, request);
+    },
+  });
+  const saved = JSON.parse(await readFile(files.datasetPath, 'utf8'));
+  assert.equal(saved.records.filter(record => record.url.includes('/issues/')).length, 20);
+  assert.equal(saved.records.filter(record => record.url.includes('/pull/')).length, 20);
+  assert.equal(answers.length, 0);
+});
+
+test('guided rejects both-zero selection before discovery and accepts replacement counts', async t => {
+  const files = await fixture(t);
+  const output = [];
+  const answers = ['repo', 'acme/project', '0', '0', '5', '5',
+    files.datasetPath, files.modelPath, files.reportPath,
+    ...urls.map((_, index) => index % 2 ? 'ai' : 'human')];
+  await runCli(['guided'], { ...repositoryDeps(output), prompt: async () => answers.shift() });
+  assert.match(output.join('\n'), /at least one issue or pull request/i);
+  assert.equal(JSON.parse(await readFile(files.datasetPath, 'utf8')).records.length, 10);
+  assert.equal(answers.length, 0);
+});
+
+test('guided repository resume skips saved snapshots across repository casing and preserves labels', async t => {
+  const files = await fixture(t);
+  await runCli(['collect', '--urls', files.urlFile, '--dataset', files.datasetPath], {
+    ...deps(['human']), urls: ['https://github.com/Acme/Project/issues/1'],
+  });
+  const answers = ['repo', 'acme/project', '5', '5', files.datasetPath, files.modelPath, files.reportPath,
+    'ai', 'human', 'ai', 'human', 'ai', 'human', 'ai', 'human', 'ai'];
+  const options = repositoryDeps();
+  let fetchedSaved = false;
+  await runCli(['guided'], {
+    ...options, prompt: async () => answers.shift(),
+    fetchImpl: async (url, request) => {
+      if (new URL(url).pathname.endsWith('/issues/1')) fetchedSaved = true;
+      return options.fetchImpl(url, request);
+    },
+  });
+  const saved = JSON.parse(await readFile(files.datasetPath, 'utf8'));
+  assert.equal(fetchedSaved, false);
+  assert.equal(saved.records.length, 10);
+  assert.equal(saved.records.find(record => record.url.endsWith('/issues/1')).label, 'human');
+  assert.equal(answers.length, 0);
+});
+
 for (const occupied of ['model', 'report']) {
   for (const kind of ['file', 'directory', 'dangling symlink']) {
     test(`guided refuses an existing ${occupied} ${kind} before collection`, async t => {

@@ -12,7 +12,26 @@ Start the guide from the repository root:
 node scripts/personalized-detection.mjs guided
 ```
 
-Enter a URL-list file path, or leave it blank to enter GitHub issue and pull request URLs one at a time.
+Choose a source at the first prompt:
+
+| Answer | Source |
+| --- | --- |
+| `repo` | Enter `OWNER/REPO` or `https://github.com/OWNER/REPO`, then choose issue and PR counts |
+| `file` | Enter a path to a URL-list file |
+| `manual` or blank | Enter individual issue and PR URLs, then a blank line to finish |
+| A URL-list file path | Use that file directly, as before |
+
+Repository counts default to 20 issues and 20 PRs.
+Each count accepts 0 through 100; zero skips that type, and at least one count must be positive.
+The guide selects the newest-created submissions across open and closed states, excludes PRs from the issue count, and labels issues before PRs.
+For example, choose `repo`, enter `acme/project`, then enter `10` issues and `5` PRs.
+If fewer submissions exist, the guide uses the available selection.
+If none match, it offers another source without starting training.
+Each type scans at most 10 pages of 100 entries; a PR-heavy issue listing can reach that bound.
+If the scan limit stops selection, choose fewer issues or skip issues with a count of zero and retry.
+Repository discovery uses fixed GitHub API endpoints, disables redirects, and gives each request a five-second timeout.
+For access or rate-limit failures, check the repository and read-only token access, then retry after the GitHub rate limit resets if needed.
+
 Choose separate local paths for the dataset, model, and report, preferably in a private directory outside the repository.
 The guide asks for confirmation before writing to a Git-tracked destination or a new, unignored path inside a Git working tree.
 It checks symlinked directories and enclosing repositories, and stops if it cannot verify Git status.
@@ -22,6 +41,8 @@ Existing files, directories and dangling symlinks at either artifact path stop t
 Final exclusive writes still prevent overwriting an artifact created after those checks.
 
 The guide starts with collection each time and skips previously labeled URLs.
+Repository counts describe the newest selected submissions, including already labeled ones; reruns do not replace saved labels with older submissions.
+To add older examples, increase the count within the limit or provide specific URLs.
 Each accepted label is saved before the next prompt, so rerun the guide after an interruption to continue.
 If you entered URLs manually, enter them again when restarting; the guide skips URLs already labeled.
 Choose new model and report paths for each run.
@@ -76,6 +97,7 @@ Classifier version 2 tokenizes Unicode letters, marks, and numbers; scoring reta
 Small datasets may produce empty, small, or class-imbalanced holdouts; split warnings are stored with model.
 Repeated templates and near-duplicates may still leak across groups.
 Selected URLs may not represent future submissions, and reviewer labels may be wrong.
+Newest-created repository samples can overrepresent recent templates, authors, or submission types; larger counts alone do not remove that bias.
 
 The evaluation compares both detectors on the same holdout records.
 Baseline flags scores at or above 0.80; personalized classifier uses 0.50.
