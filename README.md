@@ -144,7 +144,9 @@ The cutoff is fixed and cannot be configured through an Action input.
 
 mellon only handles opening events; it does not scan existing submissions.
 See [workflow configuration](docs/configuration.md) for input limits and [moderation and reruns](docs/moderation.md) for failure and retry behavior.
-A separate local experiment workflow can train and evaluate a personalized classifier; it does not change this Action. See [personalized detection experiments](docs/personalized-detection.md).
+A separate guided CLI can select issues and PRs from a repository with configurable counts, or accept individual URLs and URL-list files, then train and evaluate a personalized classifier locally.
+It does not change this Action.
+See [personalized detection experiments](docs/personalized-detection.md).
 
 ## Build and test
 
