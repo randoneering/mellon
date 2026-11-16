@@ -4,6 +4,19 @@ n8n owns the coding agent and GitHub App publication credential.
 The `n8n isolated build` workflow only tests an approved source commit and exports generated distribution files.
 It creates no commits, PRs, labels, or comments.
 
+## Coding-task review gate
+
+The saved completion policy is [`mellon-review-gate-v1` in AGENTS.md](../AGENTS.md#review-quality-gate-mellon-review-gate-v1).
+The `mellon-triage` agent also keeps this policy in its own instructions so its published version receives the gate directly.
+Fix valid High and Medium findings across Bugs, Rule violations, and Requirement gaps; leave Low findings unchanged and report them for human attention.
+Missing classification, unresolved blockers, incomplete checks or review, stale coverage, and stalled loops mean `NOT_DONE`.
+
+This is an agent instruction gate, not a new CI or branch-protection rule.
+The read-only n8n agent cannot run Qodo or tests; it must identify missing evidence rather than invent results.
+A ready source proposal does not prove the task passed the gate.
+The external coding session or runner supplies verification, and the final report accounts for findings and Low items.
+The isolated build runner checks below remain unchanged.
+
 ## Dispatch
 
 After this workflow is reviewed and merged, n8n can dispatch `.github/workflows/n8n-build.yml` on `main`.

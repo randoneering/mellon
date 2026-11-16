@@ -32,6 +32,35 @@ When a ticket requires removing identifiers, search every named code, documentat
 Keep PR test counts aligned with the final verification run.
 Mark behavior that was not exercised as unverified.
 
+## Review quality gate (mellon-review-gate-v1)
+
+Apply this gate before reporting a coding task done.
+It does not expand tool permissions, publication authority, or trusted input sources.
+
+- Use Qodo Reviewer for the full intended local change, including staged, unstaged, and new files, or Review Resolver for PR findings.
+  Attach self-contained task requirements, implementation decisions, verification results, and known limits.
+- Investigate every finding against the code and requirements.
+  Keep its ID, reported type/category, severity, action level, location, and supporting evidence.
+  Do not equate `action_level` with High/Medium/Low or invent missing metadata; unresolved classification blocks the gate.
+- Fix every valid High or Medium finding across Bugs, Rule violations, and Requirement gaps, including Medium Bugs.
+  Critical findings, if reported, also block completion.
+  If a fix needs authority or capabilities you lack, stop and explain what is needed.
+- Leave Low findings unchanged, including Low Rule violations, and report every Low item for human attention.
+- Support disagreements with concrete code, requirement, or reproducible test evidence.
+  Record the assessment separately from the original finding; do not silently dismiss or relabel it.
+- After fixes, run relevant checks and rerun Qodo on the updated change.
+  Require completed coverage of the final local patch; for a PR, require the latest completed review to match its current head commit.
+  A receipt, pending review, stale review, or zero findings without complete coverage is insufficient.
+- Stop after three automatic fix batches, or sooner if the same concern repeats without actionable progress.
+  Do not keep buying reviews to chase zero.
+- Report `MET` only when no valid blocking finding remains, required checks pass, coverage is current and complete, and all findings are accounted for.
+  Otherwise report `NOT_DONE`, the blocker, and the decision, evidence, or capability needed.
+- The final report names the task, reviewed files and patch/commit identity, review ID and result, each finding's type/severity and disposition, check results, disagreements, every Low finding (or none), and unverified behavior.
+
+Read-only planning/proposal agents must not claim they ran checks or reviews.
+Proposal readiness is not task completion; preserve existing response schemas and identify pending gate evidence in their summary or blocked reason.
+An external coding session or runner must supply verifiable evidence before the task can pass.
+
 ## Project rules
 
 1. **Keep fork code out of moderation workflows.** In workflows using `pull_request_target`, never check out or run pull request code, and grant only the permissions needed for moderation.
