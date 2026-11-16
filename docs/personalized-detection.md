@@ -3,6 +3,18 @@
 This local workflow trains a separate classifier from selected GitHub issue and pull request snapshots.
 It does not change the GitHub Action, its pinned model, or its fixed 0.80 cutoff.
 
+## Help
+
+Show commands, token setup, repository limits, and artifact guidance without credentials or side effects:
+
+```sh
+node scripts/personalized-detection.mjs --help
+node scripts/personalized-detection.mjs guided --help
+```
+
+`collect`, `train`, and `evaluate` also accept `--help` by itself after the command.
+Do not mix help with operational arguments.
+
 ## Guided workflow
 
 Use Node 24 and Git, and set `GH_TOKEN` or `GITHUB_TOKEN` to a read-only GitHub token.

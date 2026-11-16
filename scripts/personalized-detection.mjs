@@ -26,6 +26,20 @@ async function ensurePrivateParent(path) {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 }
 const usage = 'Usage: personalized-detection.mjs guided | collect --urls FILE --dataset FILE | train --dataset FILE --model FILE | evaluate --dataset FILE --model FILE --report FILE';
+const help = [
+  usage,
+  '',
+  'guided: choose a repository, individual URLs, or a URL-list file; label, train, and evaluate locally.',
+  'Repository samples default to 20 issues and 20 PRs; each count accepts 0 through 100, with at least one positive.',
+  'collect: label snapshots from --urls and save them to --dataset, resuming saved labels.',
+  'train: read --dataset and write a new --model.',
+  'evaluate: compare the personalized model and baseline on the holdout; write a new --report.',
+  '',
+  'GitHub collection needs a read-only GH_TOKEN or GITHUB_TOKEN. Help needs neither.',
+  'Keep datasets, models, and reports local and private. Model/report paths must be new.',
+  'Labels and scores do not prove authorship. This experiment does not change the Action.',
+  'Use --help alone or after guided, collect, train, or evaluate; do not mix it with operational arguments.',
+].join('\n');
 
 function argumentsMap(args, command) {
   const allowed = {
@@ -244,12 +258,18 @@ async function runGuided(dependencies) {
 
 export async function runCli(argv, dependencies = {}) {
   const [command, ...args] = argv;
+  const output = dependencies.output ?? (line => console.log(line));
+  const commandHelp = ['guided', 'collect', 'train', 'evaluate'].includes(command)
+    && args.length === 1 && args[0] === '--help';
+  if (command === '--help' && args.length === 0 || commandHelp) {
+    output(help);
+    return;
+  }
   if (command === 'guided') {
     if (args.length) throw new Error(usage);
     return runGuided(dependencies);
   }
   const values = argumentsMap(args, command);
-  const output = dependencies.output ?? (line => console.log(line));
   if (command === 'collect') {
     const token = (dependencies.env ?? process.env).GH_TOKEN || (dependencies.env ?? process.env).GITHUB_TOKEN;
     if (!token) throw new Error('Set GH_TOKEN or GITHUB_TOKEN for read-only GitHub access.');
