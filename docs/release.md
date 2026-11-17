@@ -1,5 +1,16 @@
 # Release, security, and rollback
 
+## Release checklist
+
+1. Use Node 24 and the repository lockfile. Install dependencies only in the build job.
+2. Run the README checks, including asset verification, tests, parity, `npm run build`, and release validation.
+3. Commit `dist/index.mjs`, `dist/scorer.mjs`, `dist/detector/` provenance/assets, `dist/build-meta.json`, and `dist/THIRD_PARTY_NOTICES.txt` with the reviewed source.
+4. Confirm workflow and bundle checks passed on the exact release commit.
+5. Review the Release Drafter notes and suggested version. For the first release, set the tag and title to `v0.1.0`.
+6. Review the target commit, passing CI run, and generated files before publishing.
+7. If publishing to Marketplace, follow the publication steps below and review metadata warnings.
+8. Pin consumers to the actual reviewed release commit, not a mutable branch, tag, or unrelated SHA.
+
 ## Prepare a release
 
 Use Node 24 and the repository lockfile. Install dependencies only in the build job, run the checks in the README, and build with `npm run build`. Commit the generated `dist/index.mjs`, `dist/scorer.mjs`, `dist/detector/` provenance/assets, `dist/build-meta.json`, and `dist/THIRD_PARTY_NOTICES.txt` with the reviewed source. Do not publish a release until the exact commit has passed workflow and bundle checks. The consumer action runs packaged files and does not install npm dependencies, fetch a model, or require Go or Docker.
