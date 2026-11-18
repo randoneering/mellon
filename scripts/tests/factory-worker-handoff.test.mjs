@@ -1,9 +1,13 @@
 import test from 'node:test';
+import { promisify } from 'node:util';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createControlServer } from '../../internal/factory-worker/control.mjs';
+
+// Capture the real timer before any test installs a mock clock.
+const wait = promisify(globalThis.setTimeout);
 
 const JOB = {
   jobId: '12345678-1234-4234-8234-123456789abc', issueNumber: 52,
@@ -16,7 +20,6 @@ const WORKER = 'e'.repeat(64), RELAY = 'f'.repeat(64);
 const MODEL = 'openai-codex/gpt-6.1-sol';
 const THREAD = 'mcp:handoff-test';
 const runId = n => `run:thread:${encodeURIComponent(THREAD)}:ordinal:${n}`;
-const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function setup(t, { findings = [], seed, beforeShow, pollMs = 10, config = {} } = {}) {
   const storeDir = await mkdtemp(join(tmpdir(), 'mellon-handoff-'));
@@ -79,11 +82,22 @@ async function setup(t, { findings = [], seed, beforeShow, pollMs = 10, config =
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
   const journal = () => readFile(join(storeDir, `${JOB.jobId}.json`), 'utf8').then(JSON.parse);
-  const until = async predicate => {
-    for (let i = 0; i < 100; i++) { await wait(10); const j = await journal(); if (predicate(j)) return j; }
-    assert.fail('Expected journal transition did not occur without external polling.');
+  const until = async (predicate, read = journal) => {
+    const deadline = process.hrtime.bigint() + 5_000_000_000n;
+    do {
+      const job = await read();
+      if (predicate(job)) return job;
+      await wait(10);
+    } while (process.hrtime.bigint() < deadline);
+    assert.fail('Expected controller transition did not occur.');
   };
-  return { request, journal, until, calls, reviews, server, maxConcurrent: () => maxConcurrent };
+  // Replaying the accepted job reads public state without triggering a T3 status check.
+  const current = async () => {
+    const response = await request('/jobs', JOB);
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  return { request, current, journal, until, calls, reviews, server, maxConcurrent: () => maxConcurrent };
 }
 
 test('authorized coding completes review without an n8n status poll or publication', async t => {
@@ -102,12 +116,12 @@ test('authorized coding completes review without an n8n status poll or publicati
 test('owner follow-up progresses without a new workflow run and carries stage context', async t => {
   const s = await setup(t, { findings: [{ id: 'gap', title: 'Regression coverage', reportedSeverity: null }] });
   await s.request('/jobs', JOB);
-  const paused = await s.until(j => j.state === 'awaiting_assessment');
+  const paused = await s.until(j => j.state === 'awaiting_assessment', s.current);
   const shown = s.calls.filter(c => c === 'show').length;
   await wait(40);
   assert.equal(s.calls.filter(c => c === 'show').length, shown, 'paused jobs must not be polled');
   const response = await s.request(`/jobs/${JOB.jobId}/assessment`, {
-    decision: 'fix', assessmentRunId: paused.runId, reviewRunId: paused.review.reviewRunId, candidateDigest: paused.candidate.digest,
+    decision: 'fix', assessmentRunId: paused.assessmentRunId, reviewRunId: paused.review.reviewRunId, candidateDigest: paused.review.candidateDigest,
     findings: [{ id: 'gap', rating: 'medium', fix: true }],
   }, true);
   assert.equal(response.status, 202);
@@ -126,11 +140,12 @@ test('a fresh fix run does not expose the old run as completed', async t => {
   await s.request('/jobs', JOB);
   await s.until(j => j.state === 'running');
   await s.request(`/jobs/${JOB.jobId}`);
-  const paused = await s.until(j => j.state === 'awaiting_assessment');
-  await s.request(`/jobs/${JOB.jobId}/assessment`, {
-    decision: 'fix', assessmentRunId: paused.runId, reviewRunId: paused.review.reviewRunId, candidateDigest: paused.candidate.digest,
+  const paused = await s.until(j => j.state === 'awaiting_assessment', s.current);
+  const response = await s.request(`/jobs/${JOB.jobId}/assessment`, {
+    decision: 'fix', assessmentRunId: paused.assessmentRunId, reviewRunId: paused.review.reviewRunId, candidateDigest: paused.review.candidateDigest,
     findings: [{ id: 'gap', rating: 'medium', fix: true }],
   }, true);
+  assert.equal(response.status, 202);
   const fixing = await s.until(j => j.stage === 't3_fix_run');
   assert.equal(fixing.thread ?? null, null);
 });
@@ -151,15 +166,25 @@ test('timer and concurrent HTTP reads share one completion check', async t => {
   assert.equal(s.reviews.length, 1);
 });
 
-test('deadline fences an in-flight monitor check and prevents export', async t => {
-  let release;
-  const gate = new Promise(resolve => { release = resolve; });
-  const s = await setup(t, { beforeShow: () => gate, config: { maxJobMs: 100 } });
-  t.after(() => release());
-  await s.request('/jobs', JOB);
+test('deadline fences an in-flight monitor check and prevents export', { timeout: 10000 }, async t => {
+  const release = Promise.withResolvers();
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  const maxJobMs = 1000;
+  const s = await setup(t, { beforeShow: () => release.promise, config: { maxJobMs } });
+  t.after(() => release.resolve());
+  assert.equal((await s.request('/jobs', JOB)).status, 202);
+  await s.until(j => j.state === 'running');
+  // Drive the background monitor until its show request is held by the fake worker.
+  await s.until(() => {
+    t.mock.timers.tick(10);
+    return s.calls.includes('show');
+  });
+  t.mock.timers.tick(maxJobMs);
   await s.until(j => j.stage === 'job_deadline' && j.state === 'blocked');
-  release();
-  await wait(50);
+  release.resolve();
+  const status = async () => (await s.request(`/jobs/${JOB.jobId}`)).json();
+  const job = await s.until(job => job.state === 'blocked', status);
+  assert.equal(job.stage, 'job_deadline');
   assert.equal(s.calls.includes('export'), false);
   assert.equal(s.reviews.length, 0);
   assert.equal(s.calls.includes('stop'), true);

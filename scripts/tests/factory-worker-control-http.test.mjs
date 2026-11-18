@@ -1,10 +1,14 @@
 import test from 'node:test';
+import { promisify } from 'node:util';
 import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, chmod, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { createControlServer, fixMessage } from '../../internal/factory-worker/control.mjs';
+
+// Capture the real timer before any test installs a mock clock.
+const delay = promisify(globalThis.setTimeout);
 
 const SECRET = 'a'.repeat(64);
 const JOB = { jobId: '12345678-1234-4234-8234-123456789abc', issueNumber: 123, baseSha: 'b'.repeat(40), planSha256: 'c'.repeat(64), task: 'Only the approved file.', allowedPaths: ['tests/unit/personalized-terminal-controls.test.mjs'] };
@@ -45,6 +49,33 @@ async function running(config, run, review, relayLog, relayRun) {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   return { server, url: `http://127.0.0.1:${server.address().port}` };
 }
+// Poll with a real monotonic deadline even when a test advances the controller clock.
+async function waitUntil(read, matches, description) {
+  const deadline = process.hrtime.bigint() + 5_000_000_000n;
+  do {
+    const value = await read();
+    if (matches(value)) return value;
+    await delay(10);
+  } while (process.hrtime.bigint() < deadline);
+  assert.fail(`Timed out waiting for ${description}`);
+}
+
+async function jobStatus(app) {
+  const response = await call(app.url, '/jobs/' + JOB.jobId);
+  assert.equal(response.status, 200);
+  return response.json();
+}
+
+function waitForState(app, ...states) {
+  return waitUntil(() => jobStatus(app), job => states.includes(job.state), states.join(' or '));
+}
+
+// Reading the journal observes persistence without triggering a status check.
+function waitForJournal(dir, matches, description) {
+  return waitUntil(async () => JSON.parse(await readFile(join(dir, JOB.jobId + '.json'), 'utf8')),
+    matches, description);
+}
+
 async function stop(server) {
   server.closeAllConnections();
   await new Promise(resolve => server.close(resolve));
@@ -75,7 +106,7 @@ test('corrupt private journal fails closed without exposing data or executing a 
   } finally { await stop(app.server); }
 });
 
-test('the bounded job deadline stops only its configured worker and records the failure', async () => {
+test('the bounded job deadline stops only its configured worker and records the failure', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'mellon-control-deadline-'));
   const calls = [];
   const workerId = 'd'.repeat(64);
@@ -85,8 +116,12 @@ test('the bounded job deadline stops only its configured worker and records the 
     return { status:0,stdout:JSON.stringify({threadId:'thread-id',projectId:'project-id',runId:'run-id',modelSelection:{instanceId:'pi',model:MODEL}}) };
   });
   try {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
     assert.equal((await post(app.url, JOB)).status, 202);
-    await new Promise(resolve => setTimeout(resolve, 80));
+    await waitForJournal(dir, job => job.state === 'running', 'persisted launch');
+    t.mock.timers.tick(20);
+    const job = await waitForState(app, 'blocked');
+    assert.equal(job.stage, 'job_deadline');
     assert.deepEqual(calls.find(a => a[0] === 'stop'), ['stop', '--time', '15', workerId]);
   } finally { await stop(app.server); }
 });
@@ -104,9 +139,7 @@ test('only independently reviewed candidate data becomes a ready proposal', asyn
   const app = await running({ workerId:'d'.repeat(64),projectId:'project-id',model:MODEL,secret:SECRET,issueNumber:123,baseSha:JOB.baseSha,storeDir:dir,allowedPaths:[path],reviewDir:dir },run,review);
   try {
     assert.equal((await post(app.url,JOB)).status,202);
-    await new Promise(resolve=>setTimeout(resolve,20));
-    await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}});
-    await new Promise(resolve=>setTimeout(resolve,40));
+    await waitForState(app, 'approved');
     const proposal=await fetch(app.url+'/jobs/'+JOB.jobId+'/proposal',{headers:{authorization:'Bearer '+SECRET}});
     assert.equal(proposal.status,200);
     const value=await proposal.json();
@@ -128,18 +161,14 @@ test('a saved launching job reconciles by unique title without launching twice',
     return{status:0,stdout:JSON.stringify({thread:{threadId:'recovered-thread',projectId:'project-id',providerInstanceId:'pi',model:MODEL,status:'running',activeRunId:'run-id',latestRunId:'run-id',pendingRequestCount:0},recentRuns:[],items:[]})};
   });
   try{
-    const deadline = Date.now() + 5000;
-    while (!JSON.parse(await readFile(join(dir, JOB.jobId+'.json'))).threadId) {
-      assert.ok(Date.now() < deadline, 'background reconciliation should discover the thread');
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
+    await waitForJournal(dir, job => Boolean(job.threadId), 'reconciled thread identity');
     const response=await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}});
     const value=await response.json();
     assert.equal(value.threadId,'recovered-thread');assert.equal(starts,0);
   }finally{await stop(app.server);}
 });
 
-test('an expired job cannot become approved when its review finishes late', async () => {
+test('an expired job cannot become approved when its review finishes late', async t => {
   const dir=await mkdtemp(join(tmpdir(),'mellon-control-review-fence-'));
   const path='tests/unit/personalized-terminal-controls.test.mjs';
   let finishReview;
@@ -150,12 +179,17 @@ test('an expired job cannot become approved when its review finishes late', asyn
     return{status:0,stdout:JSON.stringify({baseSha:JOB.baseSha,files:[{path,content:'fixture\n'}]})};
   },candidate=>new Promise(resolve=>{finishReview=()=>resolve({status:'approved',candidateDigest:candidate.digest,coverageComplete:true,findingInventoryComplete:true,findings:[]});}));
   try{
-    await post(app.url,JOB);await new Promise(resolve=>setTimeout(resolve,10));
-    await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}});
-    await new Promise(resolve=>setTimeout(resolve,120));
-    finishReview();await new Promise(resolve=>setTimeout(resolve,30));
-    const response=await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}});
-    const value=await response.json();assert.equal(value.state,'blocked');assert.equal(value.stage,'job_deadline');
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+    assert.equal((await post(app.url, JOB)).status, 202);
+    await waitForState(app, 'reviewing');
+    await waitUntil(() => finishReview, Boolean, 'reviewer to receive the candidate');
+    t.mock.timers.tick(80);
+    await waitForState(app, 'blocked');
+    finishReview();
+    const job = await waitForJournal(dir, job => job.review?.status === 'approved', 'late review result');
+    assert.equal(job.state, 'blocked');
+    assert.equal(job.stage, 'job_deadline');
+    assert.equal((await call(app.url, '/jobs/' + JOB.jobId + '/proposal')).status, 409);
   }finally{await stop(app.server);}
 });
 
@@ -172,8 +206,9 @@ test('a status poll cannot reconcile or block a locally in-flight launch', async
     await post(app.url,JOB);
     const poll=await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}});
     const value=await poll.json();assert.equal(value.state,'launching');assert.equal(lists,0);
-    while(!finish)await new Promise(resolve=>setTimeout(resolve,2));
-    finish();await new Promise(resolve=>setTimeout(resolve,20));
+    await waitUntil(() => finish, Boolean, 'in-flight launch');
+    finish();
+    await waitForJournal(dir, job => job.state === 'running', 'persisted launch');
   }finally{finish?.();await stop(app.server);}
 });
 
@@ -185,13 +220,13 @@ test('a failed initial journal write does not strand an unlaunched job in memory
     return{status:0,stdout:JSON.stringify({threadId:'thread-id',projectId:'project-id',runId:'run-id',modelSelection:{instanceId:'pi',model:MODEL}})};
   });
   try{
-    await new Promise(resolve=>setTimeout(resolve,10));
+    assert.equal((await call(app.url, '/health')).status, 200);
     await chmod(dir,0o500);
     assert.equal((await post(app.url,JOB)).status,503);
     assert.equal(starts,0);
     await chmod(dir,0o700);
     assert.equal((await post(app.url,JOB)).status,202);
-    await new Promise(resolve=>setTimeout(resolve,20));
+    await waitForJournal(dir, job => job.state === 'running', 'persisted launch');
     assert.equal(starts,1);
   }finally{await chmod(dir,0o700);await stop(app.server);}
 });
@@ -207,7 +242,7 @@ test('persistent job identity prevents duplicate launches after a controller res
   let app = await running(config, run);
   try {
     assert.equal((await post(app.url, JOB)).status, 202);
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await waitForJournal(dir, job => job.state === 'running', 'persisted launch');
   } finally { await stop(app.server); }
   app = await running(config, run);
   try {
@@ -230,8 +265,7 @@ test('a later completed run on the same thread never satisfies the launched pilo
   const app=await running({workerId:'d'.repeat(64),projectId:'project-id',model:MODEL,secret:SECRET,issueNumber:123,baseSha:JOB.baseSha,storeDir:dir},run);
   try{
     assert.equal((await post(app.url,JOB)).status,202);
-    await new Promise(resolve=>setTimeout(resolve,20));
-    const value=await (await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}})).json();
+    const value = await waitForState(app, 'blocked');
     assert.equal(value.state,'blocked');assert.equal(value.stage,'t3_run_mismatch');assert.equal(exported,0);
   }finally{await stop(app.server);}
 });
@@ -248,8 +282,7 @@ test('a reconciled thread without a launch run identity blocks instead of guessi
   const app=await running({workerId:'d'.repeat(64),projectId:'project-id',model:MODEL,secret:SECRET,issueNumber:123,baseSha:JOB.baseSha,storeDir:dir},run);
   try{
     assert.equal((await post(app.url,JOB)).status,202);
-    await new Promise(resolve=>setTimeout(resolve,20));
-    const value=await (await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}})).json();
+    const value = await waitForState(app, 'blocked');
     assert.equal(value.state,'blocked');assert.equal(value.stage,'t3_run_unconfirmed');assert.equal(exported,0);
   }finally{await stop(app.server);}
 });
@@ -265,9 +298,7 @@ test('the job grant is installed through stdin before launch and revoked before 
   const app=await running({workerId:'d'.repeat(64),projectId:'project-id',model:MODEL,secret:SECRET,issueNumber:123,baseSha:JOB.baseSha,storeDir:dir,allowedPaths:['tests/unit/personalized-terminal-controls.test.mjs']},async(args,input)=>{const r=await run(args,input);log.push([order.at(-1)]);return r;},undefined,log);
   try{
     assert.equal((await post(app.url,JOB)).status,202);
-    await new Promise(resolve=>setTimeout(resolve,20));
-    await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}});
-    await new Promise(resolve=>setTimeout(resolve,30));
+    await waitForState(app, 'blocked');
     const seq=log.map(e=>e[0]).filter((x,i,a)=>['issue','install','revoke','launch','export'].includes(x)&&a.indexOf(x)===i);
     assert.deepEqual(seq,['issue','install','launch','revoke','export']);
     const install=log.find(entry=>entry[0]==='install');
@@ -290,10 +321,7 @@ test('an unconfirmed revocation blocks export so worker data never leaves with a
   const app=await running({workerId:'d'.repeat(64),projectId:'project-id',model:MODEL,secret:SECRET,issueNumber:123,baseSha:JOB.baseSha,storeDir:dir,allowedPaths:['tests/unit/personalized-terminal-controls.test.mjs']},run,undefined,undefined,async args=>args.includes('/opt/bootstrap/relay.mjs')&&args[4]==='revoke'?{status:1,stdout:''}:undefined);
   try{
     assert.equal((await post(app.url,JOB)).status,202);
-    await new Promise(resolve=>setTimeout(resolve,20));
-    await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}});
-    await new Promise(resolve=>setTimeout(resolve,30));
-    const value=await (await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}})).json();
+    const value = await waitForState(app, 'blocked');
     assert.equal(value.state,'blocked');assert.equal(value.stage,'relay_revoke_unconfirmed');assert.equal(exported,0);
     assert.equal(value.cleanupUnconfirmed, true);
     assert.equal((await post(app.url, { ...JOB, jobId: JOB2.jobId })).status, 409);
@@ -310,8 +338,7 @@ test('a failed grant issue never launches a coding run', async () => {
   const app=await running({workerId:'d'.repeat(64),projectId:'project-id',model:MODEL,secret:SECRET,issueNumber:123,baseSha:JOB.baseSha,storeDir:dir},run,undefined,undefined,async args=>args.includes('/opt/bootstrap/relay.mjs')&&args[4]==='issue'?{status:1,stdout:''}:undefined);
   try{
     assert.equal((await post(app.url,JOB)).status,202);
-    await new Promise(resolve=>setTimeout(resolve,20));
-    const value=await (await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}})).json();
+    const value = await waitForState(app, 'blocked');
     assert.equal(value.state,'blocked');assert.equal(value.stage,'relay_grant_failed');assert.equal(starts,0);
   }finally{await stop(app.server);}
 });
@@ -333,8 +360,7 @@ test('an uncertain launch that reconciliation blocks also revokes its grant', as
   const app=await running({workerId:'d'.repeat(64),projectId:'project-id',model:MODEL,secret:SECRET,issueNumber:123,baseSha:JOB.baseSha,storeDir:dir},run,undefined,log);
   try{
     assert.equal((await post(app.url,JOB)).status,202);
-    await new Promise(resolve=>setTimeout(resolve,30));
-    const value=await (await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}})).json();
+    const value = await waitForState(app, 'blocked');
     assert.equal(value.state,'blocked');assert.equal(value.stage,'t3_launch_uncertain');
     assert.deepEqual(log.filter(e=>e[0]==='revoke'),[['revoke',GRANT]]);
   }finally{await stop(app.server);}
@@ -362,13 +388,11 @@ test('a grant that lands after the job deadline is revoked and never launched', 
   assert.equal((await post(app.url, JOB)).status, 202);
   await issuing.promise;
   t.mock.timers.tick(1000);
-  const status = async () => (await call(app.url, '/jobs/' + JOB.jobId)).json();
-  let job;
-  do { job = await status(); } while (job.state === 'stopping');
+  const job = await waitForState(app, 'blocked');
   assert.equal(job.stage, 'job_deadline');
   assert.equal(job.state, 'blocked');
   release.resolve();
-  do { job = await status(); } while (job.cleanupUnconfirmed);
+  await waitUntil(() => jobStatus(app), job => job.state === 'blocked' && !job.cleanupUnconfirmed, 'late grant cleanup');
   assert.equal(starts, 0);
   assert.deepEqual(log.filter(entry => entry[0] === 'revoke'), [['revoke', GRANT]]);
 });
@@ -388,14 +412,7 @@ async function runUntilBlocked(show) {
   const app = await running({ workerId: 'd'.repeat(64), projectId: 'project-id', model: MODEL, secret: SECRET, issueNumber: 123, baseSha: JOB.baseSha, storeDir: dir, allowedPaths: ['tests/unit/personalized-terminal-controls.test.mjs'] }, startWithoutRunId(show, exported));
   try {
     assert.equal((await post(app.url, JOB)).status, 202);
-    const deadline = performance.now() + 5000;
-    let value;
-    do {
-      value = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
-      if (value.state === 'blocked') break;
-      await new Promise(resolve => setTimeout(resolve, 10));
-    } while (performance.now() < deadline);
-    assert.equal(value.state, 'blocked', 'controller must finish run validation or attempt the mocked export');
+    const value = await waitForState(app, 'blocked');
     return { value, exported: exported.count };
   } finally { await stop(app.server); }
 }
@@ -433,9 +450,8 @@ async function launchWith(startOutput) {
   const app = await running({ workerId: 'd'.repeat(64), projectId: 'project-id', model: MODEL, secret: SECRET, issueNumber: 123, baseSha: JOB.baseSha, storeDir: dir }, run);
   try {
     assert.equal((await post(app.url, JOB)).status, 202);
-    await new Promise(resolve => setTimeout(resolve, 20));
-    const value = await (await fetch(app.url + '/jobs/' + JOB.jobId, { headers: { authorization: 'Bearer ' + SECRET } })).json();
-    const journal = JSON.parse(await readFile(join(dir, JOB.jobId + '.json'), 'utf8'));
+    const value = await waitForState(app, 'running', 'blocked');
+    const journal = await waitForJournal(dir, job => job.state === value.state, 'persisted launch outcome');
     return { value, journal, lists };
   } finally { await stop(app.server); }
 }
@@ -466,13 +482,7 @@ test('the real T3 show output completes the exact launched run and starts review
   const app = await running({ workerId: 'd'.repeat(64), projectId: 'project-id', model: MODEL, secret: SECRET, issueNumber: 123, baseSha: JOB.baseSha, storeDir: dir, allowedPaths: ['tests/unit/personalized-terminal-controls.test.mjs'] }, run);
   try {
     assert.equal((await post(app.url, JOB)).status, 202);
-    const deadline = Date.now() + 5000;
-    let state;
-    do {
-      state = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
-      if (state.state === 'blocked') break;
-      await new Promise(resolve => setTimeout(resolve, 10));
-    } while (Date.now() < deadline);
+    const state = await waitForState(app, 'blocked');
     assert.equal(state.stage, 'candidate_or_review_unconfirmed');
     assert.equal(exported, 1);
   } finally { await stop(app.server); }
@@ -512,16 +522,10 @@ async function fixLoop(emulator, reviewer, extra = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'mellon-control-fix-'));
   const log = [];
   const app = await running({ workerId: 'd'.repeat(64), projectId: 'project-id', model: MODEL, secret: SECRET, issueNumber: 123, baseSha: JOB.baseSha, storeDir: dir, allowedPaths: ['tests/unit/personalized-terminal-controls.test.mjs'], ...extra }, emulator.run, reviewer.fn, log);
-  const poll = async () => (await fetch(app.url + '/jobs/' + JOB.jobId, { headers: { authorization: 'Bearer ' + SECRET } })).json();
   try {
     assert.equal((await post(app.url, JOB)).status, 202);
-    let value;
-    for (let i = 0; i < 12; i++) {
-      await new Promise(resolve => setTimeout(resolve, 15));
-      value = await poll();
-      if (['approved', 'blocked', 'awaiting_assessment'].includes(value.state)) break;
-    }
-    const journal = JSON.parse(await readFile(join(dir, JOB.jobId + '.json'), 'utf8'));
+    const value = await waitForState(app, 'approved', 'blocked', 'awaiting_assessment');
+    const journal = await waitForJournal(dir, job => job.state === value.state, 'persisted fix outcome');
     return { value, journal, log };
   } finally { await stop(app.server); }
 }
@@ -609,7 +613,7 @@ async function paused(t, options = {}) {
   t.after(() => stop(app.server));
   const get = async (path = '', secret = SECRET) => fetch(app.url + '/jobs/' + JOB.jobId + path, { headers: { authorization: 'Bearer ' + secret } });
   const assess = (body, secret = OWNER) => fetch(app.url + '/jobs/' + JOB.jobId + '/assessment', { method: 'POST', headers: { authorization: 'Bearer ' + secret, 'content-type': 'application/json' }, body: JSON.stringify(body) });
-  const waitFor = async states => { let v; for (let i = 0; i < 20; i++) { await new Promise(r => setTimeout(r, 15)); v = await (await get()).json(); if (states.includes(v.state)) return v; } return v; };
+  const waitFor = states => waitForState(app, ...states);
   assert.equal((await post(app.url, JOB)).status, 202);
   const value = await waitFor(['awaiting_assessment', 'blocked', 'approved']);
   assert.equal(value.state, 'awaiting_assessment');
@@ -677,15 +681,16 @@ test('send back returns only the chosen findings to T3, then the fixed candidate
 });
 
 test('a paused job outlives the coding deadline, gets a fresh lease to fix, and expires after its window', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
   const p = await paused(t, { config: { maxJobMs: 60, assessmentWindowMs: 400 } });
-  await new Promise(r => setTimeout(r, 90));
+  t.mock.timers.tick(90);
   assert.equal((await (await p.get()).json()).state, 'awaiting_assessment');
   assert.equal((await p.assess(p.body('fix', [{ rating: 'high', fix: true }, { rating: 'low' }]))).status, 202);
-  await p.waitFor(['approved', 'blocked']);
+  await p.waitFor(['approved']);
   assert.equal(p.emulator.state.sends.length, 1);
   assert.ok(p.log.filter(e => e[0] === 'issue').length >= 2);
   const expiring = await paused(t, { config: { assessmentWindowMs: 40 } });
-  await new Promise(r => setTimeout(r, 80));
+  t.mock.timers.tick(80);
   const expired = await (await expiring.get()).json();
   assert.equal(expired.state, 'blocked');
   assert.equal(expired.stage, 'assessment_expired');
@@ -761,7 +766,7 @@ test('an owner send-back of more than ten findings is refused, not truncated', a
 // Enablement: job-scoped paths, one active job, workspace reset, proposal metadata, claims.
 const JOB2 = { ...JOB, jobId: '22345678-1234-4234-8234-123456789abc', issueNumber: 124 };
 const buildConfig = dir => ({ workerId: 'd'.repeat(64), projectId: 'project-id', model: MODEL, secret: SECRET, storeDir: dir });
-const call = (url, path, method = 'GET', body) => fetch(url + path, { method, headers: { authorization: 'Bearer ' + SECRET, 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) });
+const call = (url, path, method = 'GET', body) => fetch(url + path, { method, signal: AbortSignal.timeout(5000), headers: { authorization: 'Bearer ' + SECRET, 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) });
 
 test('jobs carry their own no-rebuild paths; rebuild, workflow and generated paths are refused', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'mellon-control-paths-'));
@@ -786,13 +791,7 @@ test('an unsuccessful stop after a terminal run failure keeps the worker reserve
   const app = await running(buildConfig(dir), emulator.run, undefined, [], hooks);
   t.after(() => stop(app.server));
   await post(app.url, JOB);
-  const deadline = Date.now() + 5000;
-  let job;
-  do {
-    job = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
-    if (job.state === 'blocked') break;
-    await new Promise(resolve => setTimeout(resolve, 10));
-  } while (Date.now() < deadline);
+  const job = await waitForState(app, 'blocked');
   assert.equal(job.stage, 't3_failed');
   assert.equal(job.cleanupUnconfirmed, true);
   assert.equal((await post(app.url, JOB2)).status, 409);
@@ -811,13 +810,8 @@ test('only one job is active; a terminal job frees the slot', async t => {
   assert.equal((await post(app.url, JOB)).status, 202);
   assert.equal((await post(app.url, JOB2)).status, 409);
   launch.resolve();
-  const deadline = Date.now() + 5000;
-  let job;
-  do {
-    job = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
-    if (job.state === 'blocked' && !job.cleanupUnconfirmed) break;
-    await new Promise(resolve => setTimeout(resolve, 10));
-  } while (Date.now() < deadline);
+  const job = await waitUntil(() => jobStatus(app),
+    job => job.state === 'blocked' && !job.cleanupUnconfirmed, 'worker slot release');
   assert.equal(job.state, 'blocked');
   assert.equal(job.cleanupUnconfirmed, false);
   assert.equal((await post(app.url, JOB2)).status, 202);
@@ -832,7 +826,7 @@ test('the worker checkout is stashed if dirty, then reset to the job base before
   const app = await running(buildConfig(dir), emulator.run, undefined, log, dirty);
   t.after(() => stop(app.server));
   assert.equal((await post(app.url, JOB)).status, 202);
-  await new Promise(r => setTimeout(r, 30));
+  await waitForJournal(dir, job => job.state === 'running', 'reset and launch');
   const steps = log.map(e => e[0] === 'git' ? e[1] : e[0]);
   const first = name => steps.indexOf(name);
   assert.ok(first('stash') >= 0 && first('stash') < first('fetch') && first('fetch') < first('checkout') && first('checkout') < first('issue'));
@@ -854,8 +848,7 @@ test('a failed workspace reset blocks the job before any grant or launch', async
   const app = await running(buildConfig(dir), run, undefined, log, failFetch);
   t.after(() => stop(app.server));
   assert.equal((await post(app.url, JOB)).status, 202);
-  await new Promise(r => setTimeout(r, 30));
-  const value = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
+  const value = await waitForState(app, 'blocked');
   assert.equal(value.state, 'blocked');
   assert.equal(value.stage, 'workspace_reset_failed');
   assert.equal(starts, 0);
@@ -872,9 +865,7 @@ async function approvedJob(t, meta) {
   const app = await running(buildConfig(dir), emulator.run, reviewer.fn, log, exportMeta);
   t.after(() => stop(app.server));
   assert.equal((await post(app.url, JOB)).status, 202);
-  let value;
-  for (let i = 0; i < 12; i++) { await new Promise(r => setTimeout(r, 15)); value = await (await call(app.url, '/jobs/' + JOB.jobId)).json(); if (value.state === 'approved') break; }
-  assert.equal(value.state, 'approved');
+  await waitForState(app, 'approved');
   return { app, dir };
 }
 
@@ -943,7 +934,7 @@ test('a blocked job stays visible to the scheduler until it is acknowledged', as
   t.after(() => stop(app.server));
   assert.equal((await (await call(app.url, '/jobs/active')).json()).job, null);
   assert.equal((await post(app.url, JOB)).status, 202);
-  await new Promise(r => setTimeout(r, 30));
+  await waitForState(app, 'blocked');
   const seen = await (await call(app.url, '/jobs/active')).json();
   assert.equal(seen.job.state, 'blocked');
   assert.equal((await call(app.url, `/jobs/${JOB.jobId}/acknowledge`, 'POST', {})).status, 200);
@@ -957,15 +948,16 @@ test('a deadline holds the slot until its revoke and worker stop finish', async 
   const emulator = t3Emulator();
   const slowStop = async args => (args[0] === 'stop') ? (await stopping, { status: 0, stdout: 'd'.repeat(64) }) : undefined;
   const app = await running({ ...buildConfig(dir), maxJobMs: 40 }, async (args, input) => (args.includes('show') ? { status: 0, stdout: JSON.stringify({ thread: { threadId: REAL_START.threadId, projectId: 'project-id', providerInstanceId: 'pi', model: MODEL, status: 'running', activeRunId: REAL_START.runId, latestRunId: REAL_START.runId, runCount: 1, pendingRequestCount: 0 }, messages: [] }) } : emulator.run(args, input)), undefined, [], slowStop);
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
   t.after(() => { releaseStop(); return stop(app.server); });
   assert.equal((await post(app.url, JOB)).status, 202);
-  await new Promise(r => setTimeout(r, 80));
+  await waitForJournal(dir, job => job.state === 'running', 'persisted launch');
+  t.mock.timers.tick(40);
   const during = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
   assert.equal(during.state, 'stopping');
   assert.equal((await post(app.url, JOB2)).status, 409);
   releaseStop();
-  await new Promise(r => setTimeout(r, 30));
-  const after = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
+  const after = await waitForState(app, 'blocked');
   assert.equal(after.state, 'blocked');
   assert.equal(after.stage, 'job_deadline');
   assert.equal((await post(app.url, JOB2)).status, 202);
@@ -999,10 +991,11 @@ test('the uncertain-publication age is configurable and bounded', async t => {
   const app = await running({ ...buildConfig(dir), publicationClaimMs: 30 }, emulator.run, reviewSequence(['approved']).fn, [], exportMeta);
   t.after(() => stop(app.server));
   assert.equal((await post(app.url, JOB)).status, 202);
-  for (let i = 0; i < 12; i++) { await new Promise(r => setTimeout(r, 15)); if ((await (await call(app.url, '/jobs/' + JOB.jobId)).json()).state === 'approved') break; }
+  await waitForState(app, 'approved');
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   assert.equal((await call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' })).status, 200);
   assert.equal((await call(app.url, `/jobs/${JOB.jobId}/publication-failed`, 'POST', { reason: 'uncertain' })).status, 409);
-  await new Promise(r => setTimeout(r, 50));
+  t.mock.timers.tick(50);
   const released = await call(app.url, `/jobs/${JOB.jobId}/publication-failed`, 'POST', { reason: 'uncertain' });
   assert.equal(released.status, 200);
   assert.equal((await released.json()).stage, 'publication_uncertain');
@@ -1013,30 +1006,32 @@ test('the uncertain-publication age is configurable and bounded', async t => {
   }
 });
 
-test('a status poll in flight when the deadline fires cannot free the slot during cleanup', async t => {
+test('a status poll in flight when the deadline fires cannot free the slot during cleanup', { timeout: 10000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'mellon-control-inflight-poll-'));
+  const enteredShow = Promise.withResolvers();
   let releaseShow, releaseStop;
   const showGate = new Promise(r => { releaseShow = r; });
   const stopGate = new Promise(r => { releaseStop = r; });
   const emulator = t3Emulator();
   const hooks = async args => {
     if (args[0] === 'stop') { await stopGate; return { status: 0, stdout: 'd'.repeat(64) }; }
-    if (args.includes('show')) { await showGate; return { status: 0, stdout: JSON.stringify({ thread: { threadId: REAL_START.threadId, projectId: 'project-id', providerInstanceId: 'pi', model: MODEL, status: 'failed', activeRunId: null, latestRunId: REAL_START.runId, runCount: 1, pendingRequestCount: 0 }, messages: [] }) }; }
+    if (args.includes('show')) { enteredShow.resolve(); await showGate; return { status: 0, stdout: JSON.stringify({ thread: { threadId: REAL_START.threadId, projectId: 'project-id', providerInstanceId: 'pi', model: MODEL, status: 'failed', activeRunId: null, latestRunId: REAL_START.runId, runCount: 1, pendingRequestCount: 0 }, messages: [] }) }; }
     return undefined;
   };
   const app = await running({ ...buildConfig(dir), maxJobMs: 60 }, emulator.run, undefined, [], hooks);
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
   t.after(() => { releaseShow(); releaseStop(); return stop(app.server); });
   assert.equal((await post(app.url, JOB)).status, 202);
-  await new Promise(r => setTimeout(r, 20));
+  await waitForJournal(dir, job => job.state === 'running', 'persisted launch');
   const poll = call(app.url, '/jobs/' + JOB.jobId);
-  await new Promise(r => setTimeout(r, 70));
+  await enteredShow.promise;
+  t.mock.timers.tick(60);
   releaseShow();
   const during = await (await poll).json();
   assert.equal(during.state, 'stopping');
   assert.equal((await post(app.url, JOB2)).status, 409);
   releaseStop();
-  await new Promise(r => setTimeout(r, 30));
-  assert.equal((await (await call(app.url, '/jobs/' + JOB.jobId)).json()).state, 'blocked');
+  await waitForState(app, 'blocked');
 });
 
 test('launch waits for the T3 service after a worker start, and blocks if it never answers', async t => {
@@ -1049,7 +1044,7 @@ test('launch waits for the T3 service after a worker start, and blocks if it nev
   const app = await running({ ...buildConfig(dir), readinessIntervalMs: 5 }, emulator.run, undefined, log, slowReady);
   t.after(() => stop(app.server));
   assert.equal((await post(app.url, JOB)).status, 202);
-  await new Promise(r => setTimeout(r, 60));
+  await waitForJournal(dir, job => job.state === 'running', 'readiness and launch');
   assert.equal(probes, 3);
   assert.equal(log.filter(e => e[0] === 'issue').length, 1);
 
@@ -1060,8 +1055,7 @@ test('launch waits for the T3 service after a worker start, and blocks if it nev
   const app2 = await running({ ...buildConfig(dir2), readinessIntervalMs: 2, readinessAttempts: 4 }, async (a, i) => { if (a.includes('start')) starts++; return emulator.run(a, i); }, undefined, log2, never);
   t.after(() => stop(app2.server));
   assert.equal((await post(app2.url, JOB)).status, 202);
-  await new Promise(r => setTimeout(r, 60));
-  const value = await (await call(app2.url, '/jobs/' + JOB.jobId)).json();
+  const value = await waitForState(app2, 'blocked');
   assert.equal(value.state, 'blocked');
   assert.equal(value.stage, 'worker_not_ready');
   assert.equal(log2.filter(e => e[0] === 'issue').length, 0);
@@ -1081,13 +1075,7 @@ test('readiness rejects a successful probe that arrives past its overall deadlin
   const app = await running(buildConfig(dir), t3Emulator().run, undefined, log, late);
   t.after(() => stop(app.server));
   assert.equal((await post(app.url, JOB)).status, 202);
-  const until = Date.now() + 5000;
-  let job;
-  do {
-    job = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
-    if (job.state === 'blocked') break;
-    await new Promise(resolve => setTimeout(resolve, 10));
-  } while (Date.now() < until);
+  const job = await waitForState(app, 'blocked');
   assert.equal(job.stage, 'worker_not_ready');
   assert.equal(log.some(entry => entry[0] === 'issue'), false);
 });
@@ -1099,9 +1087,8 @@ test('a new pause after an unchanged owner fix accepts a fresh assessment claim'
   const app = await running({ workerId: 'd'.repeat(64), projectId: 'project-id', model: MODEL, secret: SECRET, storeDir: dir, maxFixRounds: 0, assessmentSecret: OWNER }, emulator.run, reviewer.fn);
   t.after(() => stop(app.server));
   const get = async () => (await call(app.url, '/jobs/' + JOB.jobId)).json();
-  const waitState = async s => { let v; for (let i = 0; i < 20; i++) { await new Promise(r => setTimeout(r, 15)); v = await get(); if (v.state === s) return v; } return v; };
   assert.equal((await post(app.url, JOB)).status, 202);
-  const first = await waitState('awaiting_assessment');
+  const first = await waitForState(app, 'awaiting_assessment');
   assert.equal(first.assessmentClaimed, false);
   const claim = () => call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'assess', reviewRunId: first.review.reviewRunId });
   assert.equal((await claim()).status, 200);
@@ -1109,8 +1096,7 @@ test('a new pause after an unchanged owner fix accepts a fresh assessment claim'
   assert.equal((await claim()).status, 409);
   const body = { decision: 'fix', assessmentRunId: first.assessmentRunId, reviewRunId: first.review.reviewRunId, candidateDigest: first.review.candidateDigest, findings: [{ id: 'finding-1', rating: 'critical', fix: true }, { id: 'finding-2', rating: 'low' }] };
   assert.equal((await fetch(app.url + `/jobs/${JOB.jobId}/assessment`, { method: 'POST', headers: { authorization: 'Bearer ' + OWNER, 'content-type': 'application/json' }, body: JSON.stringify(body) })).status, 202);
-  await new Promise(r => setTimeout(r, 20));
-  const again = await waitState('awaiting_assessment');
+  const again = await waitForState(app, 'awaiting_assessment');
   assert.equal(again.stage, 'review_no_progress');
   assert.equal(again.review.reviewRunId, first.review.reviewRunId);
   assert.notEqual(first.assessmentRunId, again.assessmentRunId);
@@ -1141,9 +1127,7 @@ async function approvedRebuild(t, extra = {}) {
   const app = await running({ ...buildConfig(dir), ...extra }, emulator.run, reviewSequence(['approved']).fn, [], exportFiles);
   t.after(() => stop(app.server));
   assert.equal((await post(app.url, REBUILD_JOB)).status, 202);
-  let value;
-  for (let i = 0; i < 12; i++) { await new Promise(r => setTimeout(r, 15)); value = await (await call(app.url, '/jobs/' + JOB.jobId)).json(); if (value.state === 'approved') break; }
-  assert.equal(value.state, 'approved');
+  await waitForState(app, 'approved');
   const proposal = await (await call(app.url, `/jobs/${JOB.jobId}/proposal`)).json();
   assert.equal(proposal.structuredOutput.requires_dist_rebuild, true);
   return app;
@@ -1189,14 +1173,15 @@ test('generated commits must chain from the recorded head, once per generated pa
 });
 
 test('a live runner stage holds the claim past the plain claim age; an overrun stage can be released', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const app = await approvedRebuild(t, { publicationClaimMs: 20, runnerStageMs: 120 });
   await call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' });
   await stage(app, { stage: 'source_committed', commitSha: SRC });
   const runner = await (await stage(app, { stage: 'runner', requestId: 'n8n-1000001' })).json();
   assert.ok(runner.publishDeadlineAt > Date.now() + 60);
-  await new Promise(r => setTimeout(r, 50));
+  t.mock.timers.tick(50);
   assert.equal((await call(app.url, `/jobs/${JOB.jobId}/publication-failed`, 'POST', { reason: 'uncertain' })).status, 409);
-  await new Promise(r => setTimeout(r, 100));
+  t.mock.timers.tick(100);
   const released = await call(app.url, `/jobs/${JOB.jobId}/publication-failed`, 'POST', { reason: 'uncertain' });
   assert.equal(released.status, 200);
   assert.equal((await released.json()).stage, 'publication_uncertain');
