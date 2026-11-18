@@ -62,29 +62,35 @@ test('defaults to enforce and accepts only explicit enforce or observe mode', ()
   }
 });
 
-test('parses auto-close as a strict default-enabled boolean in every mode', () => {
-  for (const mode of ['enforce', 'observe']) {
-    assert.equal(parsePolicy({ mode }).autoClose, true);
-    assert.equal(parsePolicy({ mode, autoClose: '' }).autoClose, true);
-    assert.equal(parsePolicy({ mode, autoClose: 'true' }).autoClose, true);
-    assert.equal(parsePolicy({ mode, autoClose: 'false' }).autoClose, false);
-    for (const autoClose of ['TRUE', 'false ', 'yes', '0', null, true, 0]) {
-      assert.throws(() => parsePolicy({ mode, autoClose }));
-    }
-  }
-});
+function casePermutations(value) {
+  return [...value].reduce((prefixes, letter) => prefixes.flatMap((prefix) =>
+    [prefix + letter.toLowerCase(), prefix + letter.toUpperCase()]), ['']);
+}
 
-test('parses review-label as a strict default-enabled boolean in every mode', () => {
-  for (const mode of ['enforce', 'observe']) {
-    assert.equal(parsePolicy({ mode }).reviewLabel, true);
-    assert.equal(parsePolicy({ mode, reviewLabel: '' }).reviewLabel, true);
-    assert.equal(parsePolicy({ mode, reviewLabel: 'true' }).reviewLabel, true);
-    assert.equal(parsePolicy({ mode, reviewLabel: 'false' }).reviewLabel, false);
-    for (const reviewLabel of ['TRUE', 'false ', 'yes', '0', null, true, 0]) {
-      assert.throws(() => parsePolicy({ mode, reviewLabel }));
+for (const [input, name] of [['autoClose', 'auto-close'], ['reviewLabel', 'review-label']]) {
+  test(`parses ${name} as a case-insensitive, strict default-enabled boolean in every mode`, () => {
+    for (const mode of ['enforce', 'observe']) {
+      assert.equal(parsePolicy({ mode })[input], true);
+      for (const value of [undefined, '']) {
+        assert.equal(parsePolicy({ mode, [input]: value })[input], true);
+      }
+      for (const expected of [true, false]) {
+        for (const value of casePermutations(String(expected))) {
+          assert.equal(parsePolicy({ mode, [input]: value })[input], expected);
+        }
+      }
+      for (const value of [
+        'yes', 'no', '1', '0', ' ', '\t', '\n', 'tru', 'fals', 'truefalse', 'truee',
+        ' true', 'false ', 'TRUE\n', '\tFalse', 'true\r', 'false\0',
+        null, true, false, 0, 1, NaN, [], ['true'], ['false'], {}, new String('true'),
+      ]) {
+        assert.throws(() => parsePolicy({ mode, [input]: value }), {
+          name: 'Error', message: 'Invalid Action input or event payload.',
+        });
+      }
     }
-  }
-});
+  });
+}
 
 test('defaults allowlist and validates literal response and fixed cutoff', () => {
   assert.deepEqual(parsePolicy({}), { allowlist: [], response: "AI-assisted code is welcome. Please describe your work in your own words. This automated review can make mistakes. If this submission does not meet the repository's contribution policy, maintainers may close it. Contact a maintainer if you need help.", cutoff: 0.8, mode: 'enforce', autoClose: true, reviewLabel: true, moderationBotLogin: 'github-actions[bot]' });

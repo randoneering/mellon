@@ -69,6 +69,13 @@ export function parseEvent({ eventName, repository, payload, eventBytes } = {}) 
   };
 }
 
+function parseBoolean(value) {
+  if (value === undefined || value === '') return true;
+  if (typeof value !== 'string') return null;
+  const normalized = value.toLowerCase();
+  return normalized === 'true' ? true : normalized === 'false' ? false : null;
+}
+
 export function parsePolicy(inputs = {}) {
   let allowlist = [];
   if (inputs.allowlist !== undefined) {
@@ -84,12 +91,8 @@ export function parsePolicy(inputs = {}) {
 
   const response = inputs.response === undefined ? DEFAULT_RESPONSE : inputs.response;
   const mode = inputs.mode === undefined ? 'enforce' : inputs.mode;
-  const autoClose = inputs.autoClose === undefined || inputs.autoClose === ''
-    ? true
-    : inputs.autoClose === 'true' ? true : inputs.autoClose === 'false' ? false : null;
-  const reviewLabel = inputs.reviewLabel === undefined || inputs.reviewLabel === ''
-    ? true
-    : inputs.reviewLabel === 'true' ? true : inputs.reviewLabel === 'false' ? false : null;
+  const autoClose = parseBoolean(inputs.autoClose);
+  const reviewLabel = parseBoolean(inputs.reviewLabel);
   if (typeof response !== 'string' || !validText(response) || Buffer.byteLength(response, 'utf8') > RESPONSE_LIMIT ||
       mode !== 'enforce' && mode !== 'observe' || autoClose === null || reviewLabel === null) throw invalidInput();
   const login = inputs.moderationBotLogin;
