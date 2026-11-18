@@ -70,6 +70,20 @@ It runs only fixed T3 CLI and relay commands in its own worker and relay; it has
 - A fix run that leaves the candidate unchanged, or findings left after the last round, pause the job in `awaiting_assessment`.
 - An uncertain launch or send is never repeated; the job blocks for a person to reconcile.
 
+### Scheduled builds
+
+- Each job names its own issue, base commit and allowed paths.
+  Paths must need no dist rebuild: `tests/unit|integration/*.test.mjs`, `docs/**/*.md`, `README.md` or `src/personalized/*.mjs`.
+  Anything else is refused before launch.
+- One job runs at a time; `blocked` and `published` jobs free the slot.
+- Before launch, the controller starts the worker if a deadline stopped it, stashes any leftovers in the worker checkout, including ignored files (kept, not deleted), fetches the base commit and checks it out detached.
+- A job past its deadline holds the slot in `stopping` until its grant is revoked and the worker has stopped.
+- T3 may write `.factory-proposal.json` with a PR `title` and `summary`.
+  It never becomes candidate content; an off-shape title or summary falls back to `chore(factory): address issue #<n>`.
+- `GET /jobs/active` returns the active job, or a blocked one the scheduler has not recorded yet (`POST /jobs/<id>/acknowledge`).
+- `POST /jobs/<id>/claim` takes an assessment once per review run, or publication once per job.
+  A publication claim that never reaches `POST /jobs/<id>/published` blocks further publication until the owner reconciles GitHub state.
+
 ### Owner assessment
 
 A paused job waits for its owner's decision on the remaining findings in the implementation.
@@ -80,6 +94,10 @@ The plan was already approved through the `n8n: build` label.
 - The body names the reviewed `reviewRunId` and `candidateDigest`, then rates every open finding exactly once: `low`, `medium`, `high`, `critical` or `invalid`, with an optional note.
 - `approve` publishes only when every finding is `low`, or `invalid` with a reason.
   The proposal then carries those ratings for the PR body; Qodo's reported metadata stays unchanged.
-- `fix` sends only the findings marked `fix: true` back to the same T3 thread with the owner's notes.
+- `fix` sends only the findings marked `fix: true` back to the same T3 thread with the owner's rating and note, and asks T3 to fix each one or explain a conflict with the plan.
   It renews the coding lease, runs the usual review afterwards, and is capped by `maxOwnerFixRounds` (default 2).
 - A paused job ignores the coding deadline and expires after `assessmentWindowMs` (default 24 hours).
+- An assessment claim covers one pause; if a send-back leaves the candidate unchanged, the job pauses again and accepts a new form.
+- `POST /jobs/<id>/publication-failed` releases a claimed publication: `policy` when nothing was written, `uncertain` only after the claim is older than `publicationClaimMs` (default 15 minutes).
+  Both block the job; for `uncertain`, check the issue branch and any PR before relabeling the issue.
+- Before granting model access, the controller probes T3's server inside the worker up to 45 times, 2 seconds apart (longer if probes time out); if it never answers, the job blocks as `worker_not_ready`.

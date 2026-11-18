@@ -13,18 +13,25 @@ export function authorizedControlRequest(header, secret) {
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 
+// Changes that never reach the bundled Action, so no dist rebuild is needed.
+// src/personalized/ is a separate CLI and is not imported by src/action.mjs.
+export const NO_REBUILD_PATH = /^(?:tests\/(?:unit|integration)\/[A-Za-z0-9_-]+\.test\.mjs|docs\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\.md|README\.md|src\/personalized\/[A-Za-z0-9_-]+\.mjs)$/;
+
 export function validateControlJob(value, config) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
-      || Object.keys(value).some(k => !['jobId', 'issueNumber', 'baseSha', 'planSha256', 'task'].includes(k))
-      || !UUID.test(value.jobId ?? '') || !Number.isSafeInteger(value.issueNumber)
-      || value.issueNumber < 1 || value.issueNumber !== config.issueNumber
-      || !/^[a-f0-9]{40}$/.test(value.baseSha ?? '') || value.baseSha !== config.baseSha
+      || Object.keys(value).some(k => !['jobId', 'issueNumber', 'baseSha', 'planSha256', 'task', 'allowedPaths'].includes(k))
+      || !UUID.test(value.jobId ?? '') || !Number.isSafeInteger(value.issueNumber) || value.issueNumber < 1
+      || (config.issueNumber !== undefined && value.issueNumber !== config.issueNumber)
+      || !/^[a-f0-9]{40}$/.test(value.baseSha ?? '') || (config.baseSha !== undefined && value.baseSha !== config.baseSha)
+      || !Array.isArray(value.allowedPaths) || !value.allowedPaths.length || value.allowedPaths.length > 10
+      || new Set(value.allowedPaths).size !== value.allowedPaths.length
+      || value.allowedPaths.some(path => typeof path !== 'string' || !NO_REBUILD_PATH.test(path))
       || !/^[a-f0-9]{64}$/.test(value.planSha256 ?? '')
       || typeof value.task !== 'string' || !value.task.trim() || value.task.includes('\0')
       || Buffer.byteLength(value.task, 'utf8') > 32768) reject();
   return {
     jobId: value.jobId, issueNumber: value.issueNumber, baseSha: value.baseSha,
-    planSha256: value.planSha256, task: value.task,
+    planSha256: value.planSha256, task: value.task, allowedPaths: [...value.allowedPaths],
   };
 }
 
@@ -78,4 +85,17 @@ export function validateAssessment(value, job, nowIso) {
   }
   if (value.decision === 'fix' && !findings.some(f => f.fix && f.rating !== 'invalid')) return { error: 'assessment_names_no_fix' };
   return { assessment: { decision: value.decision, reviewRunId: job.review.reviewRunId, candidateDigest: job.candidate.digest, assessedAt: nowIso, findings } };
+}
+
+const SECRET_TEXT = /-----BEGIN[^\r\n]*PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/;
+
+// PR title and summary written by the worker are untrusted; anything off-shape
+// falls back to a fixed title so a good candidate is not lost over metadata.
+export function proposalMetadata(meta, issueNumber) {
+  const title = meta?.title;
+  const summary = meta?.summary;
+  if (typeof title === 'string' && /^(?:feat|fix|test|docs|refactor|perf|chore)\([a-z0-9-]{1,30}\): [^\x00-\x1f\x7f]{3,90}$/.test(title)
+      && typeof summary === 'string' && summary.trim() && summary.length <= 4000 && !/[\x00\x1b]/.test(summary)
+      && !SECRET_TEXT.test(title) && !SECRET_TEXT.test(summary)) return { title, summary: summary.trim(), source: 'worker' };
+  return { title: `chore(factory): address issue #${issueNumber}`, summary: `Changes for issue #${issueNumber}. See the linked issue and its saved plan.`, source: 'fallback' };
 }

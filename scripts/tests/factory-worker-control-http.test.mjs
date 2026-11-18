@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { createControlServer, fixMessage } from '../../internal/factory-worker/control.mjs';
 
 const SECRET = 'a'.repeat(64);
-const JOB = { jobId: '12345678-1234-4234-8234-123456789abc', issueNumber: 123, baseSha: 'b'.repeat(40), planSha256: 'c'.repeat(64), task: 'Only the approved file.' };
+const JOB = { jobId: '12345678-1234-4234-8234-123456789abc', issueNumber: 123, baseSha: 'b'.repeat(40), planSha256: 'c'.repeat(64), task: 'Only the approved file.', allowedPaths: ['tests/unit/personalized-terminal-controls.test.mjs'] };
 const MODEL = 'openai-codex/gpt-6.1-sol';
 
 const RELAY = { relayId: 'e'.repeat(64), relayHost: 'mellon-factory-relay-0123456789ab', assessmentSecret: 'b'.repeat(64) };
@@ -22,6 +22,15 @@ function withRelay(run, relayLog = [], relayRun) {
       relayLog.push(args.slice(4));
       if (args[4] === 'issue') return { status: 0, stdout: JSON.stringify({ grantId: GRANT, capability: 'a.b.c', expiresAt: Date.now() + 60000 }) };
       if (args[4] === 'revoke') return { status: 0, stdout: '{"revoked":true}' };
+    }
+    if (args[0] === 'start' && args[1] === 'd'.repeat(64)) { relayLog.push(['worker-start']); return { status: 0, stdout: args[1] }; }
+    if (args[0] === 'exec' && String(args.at(-1)).includes('mellon-t3-ready')) { relayLog.push(['t3-ready']); return { status: 0, stdout: 'mellon-t3-ready' }; }
+    if (args[0] === 'exec' && args[2] === 'git') {
+      let rest = args.slice(5);
+      while (rest[0] === '-c') rest = rest.slice(2);
+      relayLog.push(['git', ...rest]);
+      if (args.includes('rev-parse')) return { status: 0, stdout: JOB.baseSha };
+      return { status: 0, stdout: '' };
     }
     if (args.includes('-e') && String(args.at(-1)).includes('mellon-capability')) {
       relayLog.push(['install', input]);
@@ -705,4 +714,293 @@ test('an owner send-back of more than ten findings is refused, not truncated', a
   assert.equal(response.status, 422);
   assert.equal((await response.json()).error, 'too_many_fix_findings');
   assert.equal(p.emulator.state.sends.length, 0);
+});
+
+// Enablement: job-scoped paths, one active job, workspace reset, proposal metadata, claims.
+const JOB2 = { ...JOB, jobId: '22345678-1234-4234-8234-123456789abc', issueNumber: 124 };
+const buildConfig = dir => ({ workerId: 'd'.repeat(64), projectId: 'project-id', model: MODEL, secret: SECRET, storeDir: dir });
+const call = (url, path, method = 'GET', body) => fetch(url + path, { method, headers: { authorization: 'Bearer ' + SECRET, 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) });
+
+test('jobs carry their own no-rebuild paths; rebuild, workflow and generated paths are refused', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-paths-'));
+  const app = await running(buildConfig(dir), t3Emulator().run);
+  t.after(() => stop(app.server));
+  for (const allowedPaths of [['src/action.mjs'], ['.github/workflows/ci.yml'], ['dist/index.mjs'], ['package.json'], ['src/github.mjs'], [], ['README.md', 'README.md']]) {
+    assert.equal((await post(app.url, { ...JOB, allowedPaths })).status, 400);
+  }
+  assert.equal((await post(app.url, { ...JOB, allowedPaths: ['src/personalized/cli.mjs', 'docs/guide/setup.md', 'README.md', 'tests/integration/x.test.mjs'] })).status, 202);
+});
+
+test('only one job is active; a terminal job frees the slot', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-busy-'));
+  const app = await running(buildConfig(dir), async args => args.includes('start') ? { status: 1, stdout: '' } : args.includes('list') ? { status: 0, stdout: '[]' } : { status: 1, stdout: '' });
+  t.after(() => stop(app.server));
+  assert.equal((await post(app.url, JOB)).status, 202);
+  assert.equal((await post(app.url, JOB2)).status, 409);
+  await new Promise(r => setTimeout(r, 30));
+  assert.equal((await (await call(app.url, '/jobs/' + JOB.jobId)).json()).state, 'blocked');
+  assert.equal((await post(app.url, JOB2)).status, 202);
+});
+
+test('the worker checkout is stashed if dirty, then reset to the job base before any grant or launch', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-reset-'));
+  const log = [];
+  const emulator = t3Emulator();
+  const dirty = async args => (args[0] === 'exec' && args[2] === 'git' && args.includes('status') && !log.some(e => e[1] === 'stash'))
+    ? (log.push(['git', 'status']), { status: 0, stdout: '?? leftover.txt\n' }) : undefined;
+  const app = await running(buildConfig(dir), emulator.run, undefined, log, dirty);
+  t.after(() => stop(app.server));
+  assert.equal((await post(app.url, JOB)).status, 202);
+  await new Promise(r => setTimeout(r, 30));
+  const steps = log.map(e => e[0] === 'git' ? e[1] : e[0]);
+  const first = name => steps.indexOf(name);
+  assert.ok(first('stash') >= 0 && first('stash') < first('fetch') && first('fetch') < first('checkout') && first('checkout') < first('issue'));
+  assert.equal(emulator.state.sends.length, 0);
+  const stash = log.find(e => e[1] === 'stash');
+  // --all keeps ignored files too, so nothing a job wrote reaches the next one.
+  assert.ok(stash.includes('--all'));
+  assert.ok(log.some(e => e[1] === 'status' && e.includes('--ignored')));
+  assert.ok(log.findIndex(e => e[0] === 'worker-start') >= 0 && log.findIndex(e => e[0] === 'worker-start') < log.findIndex(e => e[1] === 'stash'));
+  assert.ok(log.find(e => e[1] === 'checkout').includes(JOB.baseSha));
+});
+
+test('a failed workspace reset blocks the job before any grant or launch', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-reset-fail-'));
+  const log = [];
+  let starts = 0;
+  const run = async args => { if (args.includes('start')) starts++; return { status: 0, stdout: '{}' }; };
+  const failFetch = async args => (args[0] === 'exec' && args[2] === 'git' && args.includes('fetch')) ? { status: 1, stdout: '' } : undefined;
+  const app = await running(buildConfig(dir), run, undefined, log, failFetch);
+  t.after(() => stop(app.server));
+  assert.equal((await post(app.url, JOB)).status, 202);
+  await new Promise(r => setTimeout(r, 30));
+  const value = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
+  assert.equal(value.state, 'blocked');
+  assert.equal(value.stage, 'workspace_reset_failed');
+  assert.equal(starts, 0);
+  assert.equal(log.filter(e => e[0] === 'issue').length, 0);
+});
+
+async function approvedJob(t, meta) {
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-meta-'));
+  const emulator = t3Emulator();
+  const exportMeta = async args => (args[0] === 'exec' && args.includes('--input-type=module') && args.at(-1) === '-' && !args.includes('-e'))
+    ? { status: 0, stdout: JSON.stringify({ baseSha: JOB.baseSha, files: [{ path: JOB.allowedPaths[0], content: 'x\n' }], ...(meta === undefined ? {} : { meta }) }) } : undefined;
+  const reviewer = reviewSequence(['approved']);
+  const log = [];
+  const app = await running(buildConfig(dir), emulator.run, reviewer.fn, log, exportMeta);
+  t.after(() => stop(app.server));
+  assert.equal((await post(app.url, JOB)).status, 202);
+  let value;
+  for (let i = 0; i < 12; i++) { await new Promise(r => setTimeout(r, 15)); value = await (await call(app.url, '/jobs/' + JOB.jobId)).json(); if (value.state === 'approved') break; }
+  assert.equal(value.state, 'approved');
+  return { app, dir };
+}
+
+test('PR title and summary come from validated worker metadata, with a fixed fallback', async t => {
+  const good = await approvedJob(t, { title: 'docs(readme): explain setup', summary: 'Adds setup notes.' });
+  let proposal = await (await call(good.app.url, '/jobs/' + JOB.jobId + '/proposal')).json();
+  assert.equal(proposal.structuredOutput.title, 'docs(readme): explain setup');
+  assert.equal(proposal.structuredOutput.summary, 'Adds setup notes.');
+  assert.deepEqual(proposal.structuredOutput.files.map(f => f.path), JOB.allowedPaths);
+  for (const meta of [undefined, { title: 'Explain setup\nwith injection', summary: 'x' }, { title: 'feat(x): ' + 'a'.repeat(200), summary: 'x' }, { title: 'docs(readme): ok', summary: 'ghp_' + 'a'.repeat(30) }]) {
+    const bad = await approvedJob(t, meta);
+    proposal = await (await call(bad.app.url, '/jobs/' + JOB.jobId + '/proposal')).json();
+    assert.equal(proposal.structuredOutput.title, `chore(factory): address issue #${JOB.issueNumber}`);
+    assert.equal(proposal.metadataSource, 'fallback');
+  }
+});
+
+test('publication is claimed once; an unfinished claim cannot be retaken, and publishing frees the slot', async t => {
+  const { app } = await approvedJob(t, { title: 'test(x): add cases', summary: 'Adds cases.' });
+  const active = await (await call(app.url, '/jobs/active')).json();
+  assert.equal(active.job.jobId, JOB.jobId);
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/published`, 'POST', { prNumber: 9, prUrl: 'https://github.com/randoneering/mellon/pull/9', commitSha: 'a'.repeat(40) })).status, 409);
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' })).status, 200);
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' })).status, 409);
+  assert.equal((await post(app.url, JOB2)).status, 409);
+  for (const body of [{ prNumber: 9, prUrl: 'https://evil.example/pull/9', commitSha: 'a'.repeat(40) }, { prNumber: 9, prUrl: 'https://github.com/randoneering/mellon/pull/10', commitSha: 'a'.repeat(40) }, { prNumber: 9, prUrl: 'https://github.com/randoneering/mellon/pull/9', commitSha: 'zz' }]) {
+    assert.equal((await call(app.url, `/jobs/${JOB.jobId}/published`, 'POST', body)).status, 400);
+  }
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/published`, 'POST', { prNumber: 9, prUrl: 'https://github.com/randoneering/mellon/pull/9', commitSha: 'a'.repeat(40) })).status, 200);
+  assert.equal((await (await call(app.url, '/jobs/' + JOB.jobId)).json()).state, 'published');
+  assert.equal((await (await call(app.url, '/jobs/active')).json()).job, null);
+  assert.equal((await post(app.url, JOB2)).status, 202);
+});
+
+test('an assessment is claimed once per review run', async t => {
+  const p = await paused(t);
+  const claim = () => call(p.app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'assess', reviewRunId: p.value.review.reviewRunId });
+  assert.equal((await claim()).status, 200);
+  assert.equal((await claim()).status, 409);
+  assert.equal((await call(p.app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'assess', reviewRunId: 'other' })).status, 409);
+  assert.equal((await call(p.app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' })).status, 409);
+});
+
+test('a blocked job stays visible to the scheduler until it is acknowledged', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-ack-'));
+  const app = await running(buildConfig(dir), async args => args.includes('start') ? { status: 1, stdout: '' } : args.includes('list') ? { status: 0, stdout: '[]' } : { status: 1, stdout: '' });
+  t.after(() => stop(app.server));
+  assert.equal((await (await call(app.url, '/jobs/active')).json()).job, null);
+  assert.equal((await post(app.url, JOB)).status, 202);
+  await new Promise(r => setTimeout(r, 30));
+  const seen = await (await call(app.url, '/jobs/active')).json();
+  assert.equal(seen.job.state, 'blocked');
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/acknowledge`, 'POST', {})).status, 200);
+  assert.equal((await (await call(app.url, '/jobs/active')).json()).job, null);
+});
+
+test('a deadline holds the slot until its revoke and worker stop finish', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-stopping-'));
+  let releaseStop;
+  const stopping = new Promise(resolve => { releaseStop = resolve; });
+  const emulator = t3Emulator();
+  const slowStop = async args => (args[0] === 'stop') ? (await stopping, { status: 0, stdout: 'd'.repeat(64) }) : undefined;
+  const app = await running({ ...buildConfig(dir), maxJobMs: 40 }, async (args, input) => (args.includes('show') ? { status: 0, stdout: JSON.stringify({ thread: { threadId: REAL_START.threadId, projectId: 'project-id', providerInstanceId: 'pi', model: MODEL, status: 'running', activeRunId: REAL_START.runId, latestRunId: REAL_START.runId, runCount: 1, pendingRequestCount: 0 }, messages: [] }) } : emulator.run(args, input)), undefined, [], slowStop);
+  t.after(() => { releaseStop(); return stop(app.server); });
+  assert.equal((await post(app.url, JOB)).status, 202);
+  await new Promise(r => setTimeout(r, 80));
+  const during = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
+  assert.equal(during.state, 'stopping');
+  assert.equal((await post(app.url, JOB2)).status, 409);
+  releaseStop();
+  await new Promise(r => setTimeout(r, 30));
+  const after = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
+  assert.equal(after.state, 'blocked');
+  assert.equal(after.stage, 'job_deadline');
+  assert.equal((await post(app.url, JOB2)).status, 202);
+});
+
+test('a publication that wrote nothing can be released at once as a policy block', async t => {
+  const { app } = await approvedJob(t, { title: 'test(x): add cases', summary: 'Adds cases.' });
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/publication-failed`, 'POST', { reason: 'policy' })).status, 409);
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' })).status, 200);
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/publication-failed`, 'POST', { reason: 'other' })).status, 400);
+  const released = await call(app.url, `/jobs/${JOB.jobId}/publication-failed`, 'POST', { reason: 'policy' });
+  assert.equal(released.status, 200);
+  const value = await released.json();
+  assert.equal(value.state, 'blocked');
+  assert.equal(value.stage, 'publication_policy_blocked');
+  assert.equal((await post(app.url, JOB2)).status, 202);
+});
+
+test('a fresh publish claim exposes its time and cannot be released as uncertain yet', async t => {
+  const { app } = await approvedJob(t, { title: 'test(x): add cases', summary: 'Adds cases.' });
+  const claimed = await (await call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' })).json();
+  assert.equal(typeof claimed.publishClaimedAt, 'number');
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/publication-failed`, 'POST', { reason: 'uncertain' })).status, 409);
+});
+
+test('the uncertain-publication age is configurable and bounded', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-uncertain-'));
+  const emulator = t3Emulator();
+  const exportMeta = async args => (args[0] === 'exec' && args.includes('--input-type=module') && args.at(-1) === '-' && !args.includes('-e'))
+    ? { status: 0, stdout: JSON.stringify({ baseSha: JOB.baseSha, files: [{ path: JOB.allowedPaths[0], content: 'x\n' }] }) } : undefined;
+  const app = await running({ ...buildConfig(dir), publicationClaimMs: 30 }, emulator.run, reviewSequence(['approved']).fn, [], exportMeta);
+  t.after(() => stop(app.server));
+  assert.equal((await post(app.url, JOB)).status, 202);
+  for (let i = 0; i < 12; i++) { await new Promise(r => setTimeout(r, 15)); if ((await (await call(app.url, '/jobs/' + JOB.jobId)).json()).state === 'approved') break; }
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' })).status, 200);
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/publication-failed`, 'POST', { reason: 'uncertain' })).status, 409);
+  await new Promise(r => setTimeout(r, 50));
+  const released = await call(app.url, `/jobs/${JOB.jobId}/publication-failed`, 'POST', { reason: 'uncertain' });
+  assert.equal(released.status, 200);
+  assert.equal((await released.json()).stage, 'publication_uncertain');
+  const seen = await (await call(app.url, '/jobs/active')).json();
+  assert.equal(seen.job.stage, 'publication_uncertain');
+  for (const publicationClaimMs of [0, 2 * 3600000 + 1, 1.5]) {
+    assert.throws(() => createControlServer({ ...buildConfig(dir), ...RELAY, publicationClaimMs }), /Controller budget rejected/);
+  }
+});
+
+test('a status poll in flight when the deadline fires cannot free the slot during cleanup', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-inflight-poll-'));
+  let releaseShow, releaseStop;
+  const showGate = new Promise(r => { releaseShow = r; });
+  const stopGate = new Promise(r => { releaseStop = r; });
+  const emulator = t3Emulator();
+  const hooks = async args => {
+    if (args[0] === 'stop') { await stopGate; return { status: 0, stdout: 'd'.repeat(64) }; }
+    if (args.includes('show')) { await showGate; return { status: 0, stdout: JSON.stringify({ thread: { threadId: REAL_START.threadId, projectId: 'project-id', providerInstanceId: 'pi', model: MODEL, status: 'failed', activeRunId: null, latestRunId: REAL_START.runId, runCount: 1, pendingRequestCount: 0 }, messages: [] }) }; }
+    return undefined;
+  };
+  const app = await running({ ...buildConfig(dir), maxJobMs: 60 }, emulator.run, undefined, [], hooks);
+  t.after(() => { releaseShow(); releaseStop(); return stop(app.server); });
+  assert.equal((await post(app.url, JOB)).status, 202);
+  await new Promise(r => setTimeout(r, 20));
+  const poll = call(app.url, '/jobs/' + JOB.jobId);
+  await new Promise(r => setTimeout(r, 70));
+  releaseShow();
+  const during = await (await poll).json();
+  assert.equal(during.state, 'stopping');
+  assert.equal((await post(app.url, JOB2)).status, 409);
+  releaseStop();
+  await new Promise(r => setTimeout(r, 30));
+  assert.equal((await (await call(app.url, '/jobs/' + JOB.jobId)).json()).state, 'blocked');
+});
+
+test('launch waits for the T3 service after a worker start, and blocks if it never answers', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-t3-ready-'));
+  let probes = 0;
+  const slowReady = async args => (args[0] === 'exec' && String(args.at(-1)).includes('mellon-t3-ready'))
+    ? (++probes < 3 ? { status: 1, stdout: '' } : { status: 0, stdout: 'mellon-t3-ready' }) : undefined;
+  const emulator = t3Emulator();
+  const log = [];
+  const app = await running({ ...buildConfig(dir), readinessIntervalMs: 5 }, emulator.run, undefined, log, slowReady);
+  t.after(() => stop(app.server));
+  assert.equal((await post(app.url, JOB)).status, 202);
+  await new Promise(r => setTimeout(r, 60));
+  assert.equal(probes, 3);
+  assert.equal(log.filter(e => e[0] === 'issue').length, 1);
+
+  const dir2 = await mkdtemp(join(tmpdir(), 'mellon-control-t3-never-'));
+  const never = async args => (args[0] === 'exec' && String(args.at(-1)).includes('mellon-t3-ready')) ? { status: 1, stdout: '' } : undefined;
+  const log2 = [];
+  let starts = 0;
+  const app2 = await running({ ...buildConfig(dir2), readinessIntervalMs: 2, readinessAttempts: 4 }, async (a, i) => { if (a.includes('start')) starts++; return emulator.run(a, i); }, undefined, log2, never);
+  t.after(() => stop(app2.server));
+  assert.equal((await post(app2.url, JOB)).status, 202);
+  await new Promise(r => setTimeout(r, 60));
+  const value = await (await call(app2.url, '/jobs/' + JOB.jobId)).json();
+  assert.equal(value.state, 'blocked');
+  assert.equal(value.stage, 'worker_not_ready');
+  assert.equal(log2.filter(e => e[0] === 'issue').length, 0);
+  assert.equal(starts, 0);
+});
+
+test('a new pause after an unchanged owner fix accepts a fresh assessment claim', async t => {
+  const emulator = t3Emulator({ contents: ['same\n'] });
+  const reviewer = twoFindings();
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-reclaim-'));
+  const app = await running({ workerId: 'd'.repeat(64), projectId: 'project-id', model: MODEL, secret: SECRET, storeDir: dir, maxFixRounds: 0, assessmentSecret: OWNER }, emulator.run, reviewer.fn);
+  t.after(() => stop(app.server));
+  const get = async () => (await call(app.url, '/jobs/' + JOB.jobId)).json();
+  const waitState = async s => { let v; for (let i = 0; i < 20; i++) { await new Promise(r => setTimeout(r, 15)); v = await get(); if (v.state === s) return v; } return v; };
+  assert.equal((await post(app.url, JOB)).status, 202);
+  const first = await waitState('awaiting_assessment');
+  assert.equal(first.assessmentClaimed, false);
+  const claim = () => call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'assess', reviewRunId: first.review.reviewRunId });
+  assert.equal((await claim()).status, 200);
+  assert.equal((await get()).assessmentClaimed, true);
+  assert.equal((await claim()).status, 409);
+  const body = { decision: 'fix', reviewRunId: first.review.reviewRunId, candidateDigest: first.review.candidateDigest, findings: [{ id: 'finding-1', rating: 'critical', fix: true }, { id: 'finding-2', rating: 'low' }] };
+  assert.equal((await fetch(app.url + `/jobs/${JOB.jobId}/assessment`, { method: 'POST', headers: { authorization: 'Bearer ' + OWNER, 'content-type': 'application/json' }, body: JSON.stringify(body) })).status, 202);
+  await new Promise(r => setTimeout(r, 20));
+  const again = await waitState('awaiting_assessment');
+  assert.equal(again.stage, 'review_no_progress');
+  assert.equal(again.review.reviewRunId, first.review.reviewRunId);
+  assert.equal(again.assessmentClaimed, false);
+  assert.equal((await claim()).status, 200);
+  assert.equal((await claim()).status, 409);
+});
+
+test('an owner send-back tells T3 the owner wants each finding fixed, with rating and note', () => {
+  const owner = fixMessage([{ ...FINDING, ownerRating: 'critical', ownerNote: 'Trim to pointers.' }], { owner: true });
+  assert.match(owner, /owner reviewed/i);
+  assert.match(owner, /"ownerRating":"critical"/);
+  assert.match(owner, /Trim to pointers\./);
+  assert.doesNotMatch(owner, /leave it unchanged if it is not valid/);
+  assert.match(owner, /explain/i);
+  const automatic = fixMessage([FINDING]);
+  assert.match(automatic, /leave it unchanged if it is not valid/);
 });

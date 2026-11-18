@@ -1,5 +1,5 @@
 import { runBoundedProcess } from './process.mjs';
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { validateCandidate } from './candidate.mjs';
@@ -84,17 +84,19 @@ export async function reviewCandidate(candidate, config) {
     for (const file of checked.files) {
       const target = resolve(root, file.path);
       if (!target.startsWith(root+'/')) throw new Error(ERROR);
-      // This pilot accepts only its planned new file; existing source is never overwritten here.
+      // Existing files may be replaced, but never through a symlink in the clone.
       await mkdir(resolve(target, '..'), { recursive: true, mode: 0o700 });
-      await writeFile(target, file.content, { flag: 'wx', mode: 0o600 });
+      const existing = await lstat(target).catch(() => null);
+      if (existing && !existing.isFile()) throw new Error(ERROR);
+      await writeFile(target, file.content, { mode: 0o600 });
     }
     await run('git', ['-C', root, 'add', '--', ...checked.files.map(f => f.path)]);
     const treeSha = await run('git', ['-C', root, 'write-tree']);
     const contextFile = join(config.reviewDir, `${checked.digest}.context.json`);
     const context = {
-      notes: 'Controlled factory pilot issue47. Only add tests/unit/personalized-terminal-controls.test.mjs. Test runCli through mocked GitHub collection/private temporary dataset for OSC and C1 terminal controls, preserving LF/TAB. No source/dependency/workflow/dist edits, live API calls or private data. New tests must fail under removed escape behavior. Full current candidate snapshot is supplied uncommitted at the approved base; official tests run later in isolated GitHub CI. This is trusted external Qodo review, not a worker claim. Preserve category/action_level/severity separately; unknown classification blocks automated publication, Low stays unchanged. Source tree and candidate digest are independently pinned. Never post PR comments.',
-      decisions: ['User authorizes one purpose-built issue/branch draft-PR pilot; merge manual.', 'T3 Code/Pi produced the candidate inside an isolated container; the controller validates scope and reviews immutable file data independently.'],
-      recent_work: ['Added only the approved new terminal-control regression test file.'],
+      notes: `Mellon factory build for issue #${config.issueNumber}. Only these planned paths may change: ${checked.files.map(f => f.path).join(', ')}. No dist, workflow, dependency or generated-file edits; no live API calls or private data. The full candidate is supplied uncommitted at the approved base; official tests run later in GitHub CI. This is an independent Qodo review, not a worker claim. Report category, action level and severity separately; Low findings stay unchanged and unclassified findings go to the owner. Source tree and candidate digest are independently pinned. Never post PR comments.`,
+      decisions: ['The maintainer approved the saved plan with the n8n: build label; merge stays manual.', 'T3 Code with Pi produced the candidate inside an isolated container; the controller validates scope and reviews immutable file data independently.'],
+      recent_work: [`Candidate changes for issue #${config.issueNumber} limited to the planned paths.`],
     };
     await writeFile(contextFile, JSON.stringify(context), { flag: 'wx', mode: 0o600 });
     stage = 'qodo_preflight';

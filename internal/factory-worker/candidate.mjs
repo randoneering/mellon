@@ -40,11 +40,15 @@ import {spawnSync} from 'node:child_process';
 const base=${JSON.stringify(config.baseSha)},allowed=${JSON.stringify(config.allowedPaths)},root='/workspace/mellon';
 const git=args=>{const r=spawnSync('git',['-C',root,'-c','core.fsmonitor=false','-c','core.hooksPath=/dev/null','--no-pager',...args],{encoding:'utf8',maxBuffer:1048576});if(r.status!==0)throw new Error('Candidate git read failed.');return r.stdout;};
 if(process.getuid()!==10001||git(['rev-parse','HEAD']).trim()!==base)throw new Error('Candidate base mismatch.');
-const changed=[...new Set([...git(['diff','--no-ext-diff','--no-textconv','--name-only','--no-renames','-z',base,'--']).split('\\0'),...git(['ls-files','--others','--exclude-standard','-z']).split('\\0')].filter(Boolean))];
+// The worker's PR metadata file is read separately and never becomes candidate content.
+const META='.factory-proposal.json';
+const changed=[...new Set([...git(['diff','--no-ext-diff','--no-textconv','--name-only','--no-renames','-z',base,'--']).split('\\0'),...git(['ls-files','--others','--exclude-standard','-z']).split('\\0')].filter(p=>p&&p!==META))];
 if(!changed.length||changed.some(p=>!allowed.includes(p)))throw new Error('Candidate paths differ from plan.');
 const credentials=JSON.parse(fs.readFileSync('/worker-state/pi-agent/auth.json','utf8'));
 const secrets=Object.values(credentials).flatMap(c=>[c.access,c.refresh,c.key]).filter(v=>typeof v==='string'&&v.length>10);
 let total=0;
 const files=changed.sort().map(p=>{const target=path.join(root,p),info=fs.lstatSync(target);if(!info.isFile()||info.isSymbolicLink()||info.size>131072||!fs.realpathSync(target).startsWith(root+'/'))throw new Error('Unsafe candidate file.');const fd=fs.openSync(target,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);let data;try{data=fs.readFileSync(fd);}finally{fs.closeSync(fd);}total+=data.length;if(total>131072)throw new Error('Candidate too large.');const content=data.toString('utf8');if(!Buffer.from(content).equals(data)||content.includes('\\0')||secrets.some(s=>content.includes(s)))throw new Error('Unsafe candidate content.');return{path:p,content};});
-console.log(JSON.stringify({baseSha:base,files}));`;
+let meta;
+try{const target=path.join(root,META),info=fs.lstatSync(target);if(info.isFile()&&!info.isSymbolicLink()&&info.size<=16384){const fd=fs.openSync(target,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);let raw;try{raw=fs.readFileSync(fd,'utf8');}finally{fs.closeSync(fd);}const v=JSON.parse(raw);if(v&&typeof v.title==='string'&&typeof v.summary==='string'&&!secrets.some(s=>raw.includes(s)))meta={title:v.title.slice(0,200),summary:v.summary.slice(0,5000)};}}catch{}
+console.log(JSON.stringify({baseSha:base,files,...(meta?{meta}:{})}));`;
 }

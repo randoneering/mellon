@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validateControlJob, authorizedControlRequest, safeThreadState } from '../../internal/factory-worker/control-policy.mjs';
+import { validateControlJob, authorizedControlRequest, safeThreadState, proposalMetadata, NO_REBUILD_PATH } from '../../internal/factory-worker/control-policy.mjs';
 
 const CONFIG = { issueNumber: 123, baseSha: 'a'.repeat(40), secret: 's'.repeat(64), projectId: 'project-id', model: 'openai-codex/gpt-6.1-sol' };
-const JOB = { jobId: '12345678-1234-4234-8234-123456789abc', issueNumber: 123, baseSha: 'a'.repeat(40), planSha256: 'b'.repeat(64), task: 'Implement only the reviewed pilot file.' };
+const JOB = { jobId: '12345678-1234-4234-8234-123456789abc', issueNumber: 123, baseSha: 'a'.repeat(40), planSha256: 'b'.repeat(64), task: 'Implement only the reviewed pilot file.', allowedPaths: ['tests/unit/personalized-terminal-controls.test.mjs'] };
 
 test('controller accepts only the approved issue/base and bounded data payload', () => {
   assert.deepEqual(validateControlJob(JOB, CONFIG), JOB);
@@ -41,4 +41,21 @@ test('completion without recentRuns needs completed status, no active run, zero 
   }
   assert.equal(safeThreadState({ thread: base, recentRuns: [{ runId: 'run-id', status: 'failed' }] }, 'thread-id', CONFIG).complete, false);
   assert.equal(safeThreadState({ thread: base, recentRuns: [] }, 'thread-id', CONFIG).complete, false);
+});
+
+test('no-rebuild paths cover tests, docs, README and personalized code only', () => {
+  for (const path of ['tests/unit/a.test.mjs', 'tests/integration/b-c.test.mjs', 'docs/a.md', 'docs/guide/deep/x.md', 'README.md', 'src/personalized/cli.mjs']) assert.equal(NO_REBUILD_PATH.test(path), true, path);
+  for (const path of ['src/action.mjs', 'src/personalized/../action.mjs', 'docs/../src/x.md', 'dist/index.mjs', '.github/workflows/ci.yml', 'package.json', 'tests/fixtures/x.json', 'README.md/x', 'docs/a.txt', 'scripts/validate-release.mjs']) assert.equal(NO_REBUILD_PATH.test(path), false, path);
+  for (const config of [{}, CONFIG]) assert.deepEqual(validateControlJob(JOB, config), JOB);
+});
+
+test('worker PR metadata must be one safe conventional line and a clean summary', () => {
+  assert.deepEqual(proposalMetadata({ title: 'docs(readme): explain setup', summary: ' Adds notes. ' }, 5), { title: 'docs(readme): explain setup', summary: 'Adds notes.', source: 'worker' });
+  for (const meta of [undefined, {}, { title: 'Explain setup', summary: 'x' }, { title: 'docs(readme): x\ny', summary: 's' }, { title: 'docs(Readme): bad scope', summary: 's' },
+    { title: 'docs(readme): ok text', summary: '' }, { title: 'docs(readme): ok text', summary: 'a\u001b[31m' }, { title: 'docs(readme): ok text', summary: 'x'.repeat(4001) },
+    { title: 'docs(readme): ok text', summary: 'token ghp_' + 'a'.repeat(30) }]) {
+    const result = proposalMetadata(meta, 5);
+    assert.equal(result.source, 'fallback');
+    assert.equal(result.title, 'chore(factory): address issue #5');
+  }
 });
