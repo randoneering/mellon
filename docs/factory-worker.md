@@ -60,9 +60,18 @@ It runs only fixed T3 CLI and relay commands in its own worker and relay; it has
 
 - Each job binds to the exact run ID that `t3 thread start --json` returns.
   A later or different run on the same thread blocks the job.
+- While listening, the controller checks running jobs every 10 seconds (`completionPollMs`), even when n8n's schedule is paused.
+  One check runs per job at a time, shared with HTTP status reads.
+  Completed runs proceed to independent review; paused and finished jobs are not polled.
+  Restart resumes checks for existing running jobs without launching another run.
+  n8n still owns assessment delivery and publication.
 - The controller issues a relay grant before each model session and revokes it before any export.
 - It exports only planned paths, then reviews them with Qodo outside the worker, in a fresh clone on a named local branch.
   At a detached HEAD Qodo cannot build a finding inventory, and an incomplete inventory blocks the job.
+- Worker prompts and Qodo context identify this as the source-candidate stage.
+  For rebuild jobs, unchanged `dist/` is expected until the isolated runner executes; it is not proof of a missing source implementation.
+  Source defects, missing tests, rebuild-policy mismatches and documentation gaps still get reported.
+  The worker cannot expand edit scope to satisfy a finding, and final publication still requires verified build artifacts and signed heads.
 - When the review reports findings that Qodo classifies Medium, High or Critical, the controller sends those to the same T3 thread as one follow-up run.
   Low and unclassified findings never go back automatically: the gate leaves Low unchanged and forbids guessing a severity.
   It re-fences the job to the new run ID, then exports and reviews again.

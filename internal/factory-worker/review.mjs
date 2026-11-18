@@ -3,6 +3,7 @@ import { lstat, mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { validateCandidate } from './candidate.mjs';
+import { reviewerStageContext } from './handoff-context.mjs';
 
 const ERROR = 'Factory review evidence rejected.';
 
@@ -105,7 +106,7 @@ export async function reviewCandidate(candidate, config) {
     const treeSha = await run('git', ['-C', root, 'write-tree']);
     const contextFile = join(config.reviewDir, `${checked.digest}.context.json`);
     const context = {
-      notes: `Mellon factory build for issue #${config.issueNumber}. Only these planned paths may change: ${checked.files.map(f => f.path).join(', ')}. No dist, workflow, dependency or generated-file edits; no live API calls or private data. The full candidate is supplied uncommitted at the approved base; official tests run later in GitHub CI. This is an independent Qodo review, not a worker claim. Report category, action level and severity separately; Low findings stay unchanged and unclassified findings go to the owner. Source tree and candidate digest are independently pinned. Never post PR comments.`,
+      notes: reviewerStageContext(config) + '\n\n' + `Mellon factory build for issue #${config.issueNumber}. Only these planned paths may change: ${checked.files.map(f => f.path).join(', ')}. No dist, workflow, dependency or generated-file edits; no live API calls or private data. The full candidate is supplied uncommitted at the approved base; official tests run later in GitHub CI. This is an independent Qodo review, not a worker claim. Report category, action level and severity separately; Low findings stay unchanged and unclassified findings go to the owner. Source tree and candidate digest are independently pinned. Never post PR comments.`,
       decisions: ['The maintainer approved the saved plan with the n8n: build label; merge stays manual.', 'T3 Code with Pi produced the candidate inside an isolated container; the controller validates scope and reviews immutable file data independently.'],
       recent_work: [`Candidate changes for issue #${config.issueNumber} limited to the planned paths.`],
     };

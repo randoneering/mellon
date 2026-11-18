@@ -9,6 +9,7 @@ import { authorizedControlRequest, validateControlJob, safeThreadState, validate
 import { candidateProgram, validateCandidate } from './candidate.mjs';
 import { reviewCandidate } from './review.mjs';
 import { GENERATED_PATHS } from './publication.mjs';
+import { workerStageContext } from './handoff-context.mjs';
 
 const RELAY_PORT = 8790;
 // Any HTTP answer on T3's local port means its server is listening.
@@ -83,6 +84,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
   const runnerStageMs = config.runnerStageMs ?? 50 * 60000;
   const readinessIntervalMs = config.readinessIntervalMs ?? 2000;
   const readinessAttempts = config.readinessAttempts ?? 45;
+  const completionPollMs = config.completionPollMs ?? 10000;
   if (!Number.isSafeInteger(maxJobMs) || maxJobMs < 1 || maxJobMs > 3600000
       || !Number.isSafeInteger(maxFixRounds) || maxFixRounds < 0 || maxFixRounds > 3
       || !Number.isSafeInteger(maxOwnerFixRounds) || maxOwnerFixRounds < 0 || maxOwnerFixRounds > 3
@@ -90,7 +92,8 @@ export function createControlServer(config, run = execute, review = reviewCandid
       || !Number.isSafeInteger(publicationClaimMs) || publicationClaimMs < 1 || publicationClaimMs > 2 * 3600000
       || !Number.isSafeInteger(runnerStageMs) || runnerStageMs < 1 || runnerStageMs > 2 * 3600000
       || !Number.isSafeInteger(readinessIntervalMs) || readinessIntervalMs < 1 || readinessIntervalMs > 10000
-      || !Number.isSafeInteger(readinessAttempts) || readinessAttempts < 1 || readinessAttempts > 120) throw new Error('Controller budget rejected.');
+      || !Number.isSafeInteger(readinessAttempts) || readinessAttempts < 1 || readinessAttempts > 120
+      || !Number.isSafeInteger(completionPollMs) || completionPollMs < 10 || completionPollMs > 60000) throw new Error('Controller budget rejected.');
   // An owner send-back renews the coding lease, so deadlines live on the job.
   const deadlineOf = job => job.deadlineAt ?? job.createdAt + maxJobMs;
   // Terminal jobs free the single slot; everything else holds it.
@@ -106,14 +109,17 @@ export function createControlServer(config, run = execute, review = reviewCandid
     if (!p) return (job.publishClaim?.at ?? 0) + publicationClaimMs;
     return p.stageAt + (p.stage === 'runner' ? runnerStageMs : publicationClaimMs);
   };
-  const scope = job => ({ ...config, issueNumber: job.issueNumber, baseSha: job.baseSha, allowedPaths: job.allowedPaths });
+  const scope = job => ({ ...config, issueNumber: job.issueNumber, baseSha: job.baseSha, allowedPaths: job.allowedPaths, requiresRebuild: job.requiresRebuild === true });
   const jobs = new Map();
   const timers = new Map();
   const saves = new Map();
   const launches = new Set();
   const initialWrites = new Set();
+  const statusChecks = new Map();
+  let closed = false;
+  let completionTimer;
   const leaseValid = (job, generation) => (job.generation ?? 0) === generation
-    && job.state !== 'blocked' && Date.now() < deadlineOf(job);
+    && !closed && job.state !== 'blocked' && Date.now() < deadlineOf(job);
   function arm(job) {
     clearTimeout(timers.get(job.jobId));
     if (['blocked', 'approved', 'published'].includes(job.state)) return;
@@ -278,7 +284,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
     }
     try {
       const value = await cli(['start', '--provider', 'pi', '--model', config.model,
-        '--title', `factory ${job.jobId}`, '/workspace/mellon', '-'], job.task);
+        '--title', `factory ${job.jobId}`, '/workspace/mellon', '-'], workerStageContext(job) + '\n\nTASK DATA:\n' + job.task);
       // T3 0.1.5 prints {threadId, projectId, runId}. Provider and model are checked
       // on every status read; a selection, if present, must also match.
       if (typeof value.threadId !== 'string' || value.projectId !== config.projectId
@@ -361,7 +367,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
       return;
     }
     let sent = null;
-    try { sent = await cli(['send', job.threadId, '-'], fixMessage(findings, { owner: counter === 'ownerFixRounds' })); } catch {}
+    try { sent = await cli(['send', job.threadId, '-'], workerStageContext(job) + '\n\n' + fixMessage(findings, { owner: counter === 'ownerFixRounds' })); } catch {}
     // An uncertain send is never repeated: T3 may already have queued it.
     if (!leaseValid(job, generation) || sent?.threadId !== job.threadId || typeof sent?.runId !== 'string'
         || sent.runId === job.runId || (job.runHistory ?? []).includes(sent.runId)
@@ -374,6 +380,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
     // Re-fence atomically: only the follow-up run may complete this job now.
     job.runHistory = [...(job.runHistory ?? []), job.runId];
     job.runId = sent.runId;
+    job.thread = null;
     job.reviewStarted = false;
     job.state = 'running'; job.stage = 't3_fix_run';
     await save(job);
@@ -421,14 +428,15 @@ export function createControlServer(config, run = execute, review = reviewCandid
       await requestFix(job, generation, chosen, 'ownerFixRounds');
     })().catch(() => { job.state = 'blocked'; job.stage = 'owner_fix_failed'; });
   };
-  const status = async job => {
+  const checkStatus = async job => {
+    if (closed) return;
     if (!job.threadId && job.state === 'launching' && !launches.has(job.jobId)) await reconcile(job);
     if (!job.threadId || ['blocked', 'stopping', 'reviewing', 'fixing', 'approved', 'awaiting_assessment', 'published'].includes(job.state)) return;
     const generation = job.generation ?? 0;
     try {
       const value = await cli(['show', '--messages', '1', job.threadId]);
       // A deadline may have fired while show ran; its cleanup owns the job now.
-      if (job.reviewStarted || ['blocked', 'stopping'].includes(job.state) || (job.generation ?? 0) !== generation) return;
+      if (closed || job.reviewStarted || ['blocked', 'stopping'].includes(job.state) || (job.generation ?? 0) !== generation) return;
       job.thread = safeThreadState(value, job.threadId, config);
       // Only the exact launched run may satisfy this job; a later run on the
       // same thread proves nothing about the pilot's own outcome.
@@ -455,10 +463,39 @@ export function createControlServer(config, run = execute, review = reviewCandid
       if (job.state === 'blocked') await revoke(job).catch(() => {});
       await save(job);
     } catch {
-      if (['blocked', 'stopping'].includes(job.state) || (job.generation ?? 0) !== generation) return;
+      if (closed || ['blocked', 'stopping'].includes(job.state) || (job.generation ?? 0) !== generation) return;
       if (job.stage !== 'job_deadline') { job.state = 'blocked'; job.stage = 't3_state_unconfirmed'; }
       await revoke(job).catch(() => {});
       await save(job);
+    }
+  };
+  // Timer and HTTP callers share one check, so completion cannot export twice.
+  const status = job => {
+    if (statusChecks.has(job.jobId)) return statusChecks.get(job.jobId);
+    const pending = checkStatus(job).finally(() => statusChecks.delete(job.jobId));
+    statusChecks.set(job.jobId, pending);
+    return pending;
+  };
+  const monitor = async () => {
+    try {
+      await ready;
+      if (!closed && journalReady) {
+        for (const job of jobs.values()) {
+          if (closed) break;
+          if (!['running', 'candidate_ready'].includes(job.state)) continue;
+          try { await status(job); }
+          catch {
+            // Preserve a failed journal stage without leaking command output.
+            if (!closed && !['blocked', 'stopping'].includes(job.state)) {
+              job.state = 'blocked'; job.stage = 'controller_journal_failed';
+              await revoke(job).catch(() => {});
+              await save(job).catch(() => {});
+            }
+          }
+        }
+      }
+    } finally {
+      if (!closed) { completionTimer = setTimeout(monitor, completionPollMs); completionTimer.unref(); }
     }
   };
   const safe = job => ({
@@ -644,7 +681,15 @@ export function createControlServer(config, run = execute, review = reviewCandid
     } catch { send(400, { error: 'factory_request_rejected' }); }
   });
   server.requestTimeout = 30000;
-  server.on('close', () => { for (const timer of timers.values()) clearTimeout(timer); });
+  server.once('listening', () => {
+    completionTimer = setTimeout(monitor, completionPollMs);
+    completionTimer.unref();
+  });
+  server.on('close', () => {
+    closed = true;
+    clearTimeout(completionTimer);
+    for (const timer of timers.values()) clearTimeout(timer);
+  });
   return server;
 }
 
