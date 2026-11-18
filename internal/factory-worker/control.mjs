@@ -246,7 +246,8 @@ export function createControlServer(config, run = execute, review = reviewCandid
       await save({ ...job, ...changes });
       Object.assign(job, changes);
       return true;
-    } catch {
+    } catch (error) {
+      if (!send) throw error;
       send(503, { error: 'controller_journal_unavailable' });
       return false;
     } finally {
@@ -401,14 +402,10 @@ export function createControlServer(config, run = execute, review = reviewCandid
     } catch { if (leaseValid(job, generation)) { job.state = 'blocked'; job.stage = 'candidate_or_review_unconfirmed'; } }
     await save(job);
   };
-  const pause = async (job, stage) => {
-    job.state = 'awaiting_assessment';
-    job.stage = stage;
-    job.assessClaim = null;
-    job.assessmentUntil = Date.now() + assessmentWindowMs;
-    arm(job);
-    await save(job);
-  };
+  const pause = (job, stage) => commitTransition(job, {
+    state: 'awaiting_assessment', stage, assessClaim: null,
+    assessmentUntil: Date.now() + assessmentWindowMs,
+  });
   const requestFix = async (job, generation, findings = job.review.findings, counter = 'fixRounds') => {
     job.previousCandidateDigest = job.candidate.digest;
     job[counter] = (job[counter] ?? 0) + 1;

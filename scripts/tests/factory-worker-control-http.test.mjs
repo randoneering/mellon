@@ -784,12 +784,26 @@ test('an unsuccessful stop after a terminal run failure keeps the worker reserve
 
 test('only one job is active; a terminal job frees the slot', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'mellon-control-busy-'));
-  const app = await running(buildConfig(dir), async args => args[0] === 'stop' ? { status: 0, stdout: '' } : args.includes('start') ? { status: 1, stdout: '' } : args.includes('list') ? { status: 0, stdout: '[]' } : { status: 1, stdout: '' });
-  t.after(() => stop(app.server));
+  const launch = Promise.withResolvers();
+  const app = await running(buildConfig(dir), async args => {
+    if (args.includes('start')) await launch.promise;
+    if (args[0] === 'stop') return { status: 0, stdout: '' };
+    if (args.includes('list')) return { status: 0, stdout: '[]' };
+    return { status: 1, stdout: '' };
+  });
+  t.after(() => { launch.resolve(); return stop(app.server); });
   assert.equal((await post(app.url, JOB)).status, 202);
   assert.equal((await post(app.url, JOB2)).status, 409);
-  await new Promise(r => setTimeout(r, 30));
-  assert.equal((await (await call(app.url, '/jobs/' + JOB.jobId)).json()).state, 'blocked');
+  launch.resolve();
+  const deadline = Date.now() + 5000;
+  let job;
+  do {
+    job = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
+    if (job.state === 'blocked' && !job.cleanupUnconfirmed) break;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  } while (Date.now() < deadline);
+  assert.equal(job.state, 'blocked');
+  assert.equal(job.cleanupUnconfirmed, false);
   assert.equal((await post(app.url, JOB2)).status, 202);
 });
 
