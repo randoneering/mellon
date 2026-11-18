@@ -97,7 +97,16 @@ export function createControlServer(config, run = execute, review = reviewCandid
   // An owner send-back renews the coding lease, so deadlines live on the job.
   const deadlineOf = job => job.deadlineAt ?? job.createdAt + maxJobMs;
   // Terminal jobs free the single slot; everything else holds it.
-  const TERMINAL = new Set(['blocked', 'published']);
+  // A failed run can still use the shared worker or an outstanding grant.
+  // This check also applies to blocked jobs restored from older journals.
+  const holdsSlot = job => {
+    if (launches.has(job.jobId)) return true;
+    if (job.state !== 'blocked') return job.state !== 'published';
+    if (job.workerStopped === false || (job.grantId && !job.grantRevoked)) return true;
+    const uncertainRun = ['job_deadline', 't3_launch_uncertain', 't3_fix_uncertain', 't3_run_unconfirmed',
+      't3_run_mismatch', 't3_needs_input', 't3_state_unconfirmed'].includes(job.stage);
+    return uncertainRun && job.workerStopped !== true;
+  };
   // Each job carries its own issue, base and paths; the config holds only the boundary.
   // A claim only counts for the current pause; a later pause (even on the same review run) needs a new form.
   const pauseStart = job => (job.assessmentUntil ?? 0) - assessmentWindowMs;
@@ -142,14 +151,8 @@ export function createControlServer(config, run = execute, review = reviewCandid
       if (['blocked', 'approved', 'awaiting_assessment', 'published'].includes(job.state)) return;
       job.generation = (job.generation ?? 0) + 1;
       // 'stopping' keeps the slot until cleanup ends, so no new job starts on a worker about to stop.
-      job.state = 'stopping';
       job.stage = 'job_deadline';
-      await save(job).catch(() => {});
-      await revoke(job).catch(() => {});
-      try { job.workerStopped = (await run(['stop', '--time', '15', config.workerId])).status === 0; }
-      catch { job.workerStopped = false; }
-      job.state = 'blocked';
-      await save(job).catch(() => {});
+      await containRun(job);
     }, Math.max(0, remaining));
     timer.unref();
     timers.set(job.jobId, timer);
@@ -180,6 +183,21 @@ export function createControlServer(config, run = execute, review = reviewCandid
     if (value.revoked !== true) throw new Error('Relay revocation unconfirmed.');
     job.grantRevoked = true;
     await save(job);
+  };
+  const containRun = async job => {
+    // Keep admission closed throughout cleanup, even after revocation succeeds.
+    job.state = 'stopping';
+    clearTimeout(timers.get(job.jobId));
+    await save(job).catch(() => {});
+    await revoke(job).catch(() => {});
+    try { job.workerStopped = (await run(['stop', '--time', '15', config.workerId])).status === 0; }
+    catch { job.workerStopped = false; }
+    try {
+      await save({ ...job, state: 'blocked' });
+      job.state = 'blocked';
+    } catch {
+      journalReady = false;
+    }
   };
   const grant = async (job, generation) => {
     const remaining = Math.max(1, deadlineOf(job) - Date.now());
@@ -247,8 +265,12 @@ export function createControlServer(config, run = execute, review = reviewCandid
         job.state = 'running';
         job.stage = 't3_reconciled';
       } else { job.state = 'blocked'; job.stage = 't3_launch_uncertain'; }
-    } catch { if (leaseValid(job, generation)) { job.state = 'blocked'; job.stage = 't3_launch_uncertain'; } }
-    if (job.state === 'blocked') await revoke(job).catch(() => {});
+    } catch {
+      if (!leaseValid(job, generation)) return;
+      job.state = 'blocked';
+      job.stage = 't3_launch_uncertain';
+    }
+    if (job.state === 'blocked') { await containRun(job); return; }
     await save(job);
   };
   // Leftovers are stashed (kept), never deleted; the job starts from its exact base.
@@ -397,7 +419,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
     if (!leaseValid(job, generation) || sent?.threadId !== job.threadId || typeof sent?.runId !== 'string'
         || sent.runId === job.runId || (job.runHistory ?? []).includes(sent.runId)
         || !['started', 'queued'].includes(sent.delivery)) {
-      if (leaseValid(job, generation)) { job.state = 'blocked'; job.stage = 't3_fix_uncertain'; }
+      if (leaseValid(job, generation)) { job.state = 'blocked'; job.stage = 't3_fix_uncertain'; await containRun(job); return; }
       await revoke(job).catch(() => {});
       await save(job);
       return;
@@ -479,13 +501,12 @@ export function createControlServer(config, run = execute, review = reviewCandid
       }
       else if (job.thread.terminalFailure) { job.state = 'blocked'; job.stage = 't3_failed'; }
       else if (job.thread.pendingRequests > 0 || job.thread.status === 'waiting') { job.state = 'blocked'; job.stage = 't3_needs_input'; }
-      if (job.state === 'blocked') await revoke(job).catch(() => {});
+      if (job.state === 'blocked') { await containRun(job); return; }
       await save(job);
     } catch {
       if (closed || ['blocked', 'stopping'].includes(job.state) || (job.generation ?? 0) !== generation) return;
       if (job.stage !== 'job_deadline') { job.state = 'blocked'; job.stage = 't3_state_unconfirmed'; }
-      await revoke(job).catch(() => {});
-      await save(job);
+      await containRun(job);
     }
   };
   // Timer and HTTP callers share one check, so completion cannot export twice.
@@ -501,7 +522,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
       if (!closed && journalReady) {
         for (const job of jobs.values()) {
           if (closed) break;
-          if (!['running', 'candidate_ready'].includes(job.state)) continue;
+          if (!['launching', 'running', 'candidate_ready'].includes(job.state) || initialWrites.has(job.jobId) || launches.has(job.jobId)) continue;
           try { await status(job); }
           catch {
             // Preserve a failed journal stage without leaking command output.
@@ -519,7 +540,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
   };
   const safe = job => ({
     jobId: job.jobId, issueNumber: job.issueNumber, baseSha: job.baseSha, planSha256: job.planSha256, allowedPaths: job.allowedPaths,
-    state: job.state, stage: job.stage, threadId: job.threadId ?? null,
+    state: job.state, stage: job.stage, cleanupUnconfirmed: job.state === 'blocked' && holdsSlot(job), threadId: job.threadId ?? null,
     thread: job.thread ?? null, review: job.review ?? null, fixRounds: job.fixRounds ?? 0,
     assessmentRunId: job.state === 'awaiting_assessment' ? job.runId : null,
     ownerFixRounds: job.ownerFixRounds ?? 0, assessmentUntil: job.assessmentUntil ?? null,
@@ -553,7 +574,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
         const existing = jobs.get(input.jobId);
         if (existing && initialWrites.has(input.jobId)) { send(503, { error: 'job_intent_pending' }); return; }
         if (existing) { if (existing.digest !== digest) { send(409, { error: 'job_identity_conflict' }); return; } send(200, safe(existing)); return; }
-        if ([...jobs.values()].some(j => !TERMINAL.has(j.state))) { send(409, { error: 'factory_busy' }); return; }
+        if ([...jobs.values()].some(j => holdsSlot(j))) { send(409, { error: 'factory_busy' }); return; }
         const job = { ...input, digest, generation: 0, state: 'launching', stage: 't3_launch', createdAt: Date.now() };
         jobs.set(job.jobId, job);
         initialWrites.add(job.jobId);
@@ -594,7 +615,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
       if (url.pathname === '/jobs/active' && request.method === 'GET') {
         // The scheduler sees the active job, or a finished one it has not recorded yet.
         const list = [...jobs.values()].sort((a, b) => b.createdAt - a.createdAt);
-        const job = list.find(j => !TERMINAL.has(j.state)) ?? list.find(j => j.state === 'blocked' && !j.acknowledged);
+        const job = list.find(j => holdsSlot(j)) ?? list.find(j => j.state === 'blocked' && !j.acknowledged);
         if (job) await status(job);
         send(200, { job: job ? safe(job) : null });
         return;

@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { mkdir, open, readFile, readdir, rename, rm, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
@@ -25,10 +25,11 @@ export async function issueGrant(grantsDir, { jobId, ttlMs, maxRequests }) {
   }
   await mkdir(grantsDir, { recursive: true, mode: 0o700 });
   const grantId = randomBytes(16).toString('hex');
-  const record = { grantId, jobId, model: MODEL, expiresAt: Date.now() + ttlMs, maxRequests };
+  const record = { budgetVersion: 1, grantId, jobId, model: MODEL, expiresAt: Date.now() + ttlMs, maxRequests };
   const temporary = join(grantsDir, `${grantId}.tmp`);
   const handle = await open(temporary, 'wx', 0o600);
   try { await handle.writeFile(JSON.stringify(record)); await handle.sync(); } finally { await handle.close(); }
+  await mkdir(join(grantsDir, grantId + '.reservations'), { mode: 0o700 });
   await rename(temporary, join(grantsDir, `${grantId}.json`));
   // JWT-shaped only because the unchanged Pi Codex client parses an account
   // claim locally; it carries no real account data and no signature value.
@@ -40,8 +41,32 @@ export async function issueGrant(grantsDir, { jobId, ttlMs, maxRequests }) {
 
 export async function revokeGrant(grantsDir, grantId) {
   if (!GRANT.test(grantId ?? '')) throw new Error('Relay grant input rejected.');
-  try { await unlink(join(grantsDir, `${grantId}.json`)); return true; }
-  catch (error) { if (error.code === 'ENOENT') return true; throw new Error('Relay grant revocation failed.'); }
+  try { await unlink(join(grantsDir, `${grantId}.json`)); }
+  catch (error) { if (error.code !== 'ENOENT') throw new Error('Relay grant revocation failed.'); }
+  await rm(join(grantsDir, grantId + '.reservations'), { recursive: true, force: true });
+  return true;
+}
+
+// Each slot can be claimed once, even across processes. A crash after a claim
+// conservatively spends that slot. Revocation removes the reservation directory.
+async function reserveRequest(grantsDir, grant) {
+  const directory = join(grantsDir, grant.grantId + '.reservations');
+  const ledger = await open(directory, 'r');
+  try {
+    const used = (await readdir(directory)).length;
+    for (let slot = used; slot < grant.maxRequests; slot++) {
+      try {
+        const claim = await open(join(directory, String(slot)), 'wx', 0o600);
+        await claim.close();
+      } catch (error) {
+        if (error.code === 'EEXIST') continue;
+        throw error;
+      }
+      await ledger.sync();
+      return true;
+    }
+    return false;
+  } finally { await ledger.close(); }
 }
 
 function accountId(token) {
@@ -57,7 +82,7 @@ export function createRelay(config) {
   const maxResponseBytes = config.maxResponseBytes ?? 64 * 1024 * 1024;
   const requestMs = config.requestMs ?? 15 * 60 * 1000;
   const upstream = config.fetch ?? globalThis.fetch;
-  const counts = new Map();
+
 
   const grantFor = async header => {
     const match = /^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$/.exec(header ?? '');
@@ -70,7 +95,8 @@ export function createRelay(config) {
     // Re-read on every request so a revocation is effective immediately.
     try { record = JSON.parse(await readFile(join(config.grantsDir, `${grantId}.json`), 'utf8')); }
     catch { return null; }
-    if (record.grantId !== grantId || record.model !== MODEL || !JOB.test(record.jobId ?? '')
+    if (record.budgetVersion !== 1 || !Number.isSafeInteger(record.maxRequests) || record.maxRequests < 1 || record.maxRequests > 2000
+        || record.grantId !== grantId || record.model !== MODEL || !JOB.test(record.jobId ?? '')
         || !Number.isSafeInteger(record.expiresAt) || record.expiresAt <= Date.now()) return null;
     return record;
   };
@@ -103,9 +129,7 @@ export function createRelay(config) {
       let body;
       try { body = JSON.parse(decoded.toString('utf8')); } catch { fail(400, 'invalid_request'); return; }
       if (body?.model !== MODEL) { fail(403, 'model_rejected'); return; }
-      const used = counts.get(grant.grantId) ?? 0;
-      if (used >= grant.maxRequests) { fail(429, 'request_budget_exhausted'); return; }
-      counts.set(grant.grantId, used + 1);
+      if (!await reserveRequest(config.grantsDir, grant)) { fail(429, 'request_budget_exhausted'); return; }
       let token;
       let account;
       try { token = await config.getAccessToken(); account = accountId(token); }

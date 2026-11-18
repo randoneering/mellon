@@ -122,12 +122,17 @@ test('a saved launching job reconciles by unique title without launching twice',
   const digest=createHash('sha256').update(JSON.stringify(JOB)).digest('hex');
   await writeFile(join(dir,JOB.jobId+'.json'),JSON.stringify({...JOB,digest,state:'launching',stage:'t3_launch',createdAt:Date.now()}));
   let starts=0;
-  const app=await running({workerId:'d'.repeat(64),projectId:'project-id',model:MODEL,secret:SECRET,issueNumber:123,baseSha:JOB.baseSha,storeDir:dir},async args=>{
+  const app=await running({workerId:'d'.repeat(64),projectId:'project-id',model:MODEL,secret:SECRET,completionPollMs:10,issueNumber:123,baseSha:JOB.baseSha,storeDir:dir},async args=>{
     if(args.includes('start'))starts++;
     if(args.includes('list'))return{status:0,stdout:JSON.stringify([{threadId:'recovered-thread',projectId:'project-id',title:'factory '+JOB.jobId,providerInstanceId:'pi',model:MODEL}])};
     return{status:0,stdout:JSON.stringify({thread:{threadId:'recovered-thread',projectId:'project-id',providerInstanceId:'pi',model:MODEL,status:'running',activeRunId:'run-id',latestRunId:'run-id',pendingRequestCount:0},recentRuns:[],items:[]})};
   });
   try{
+    const deadline = Date.now() + 5000;
+    while (!JSON.parse(await readFile(join(dir, JOB.jobId+'.json'))).threadId) {
+      assert.ok(Date.now() < deadline, 'background reconciliation should discover the thread');
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
     const response=await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}});
     const value=await response.json();
     assert.equal(value.threadId,'recovered-thread');assert.equal(starts,0);
@@ -217,6 +222,7 @@ test('a later completed run on the same thread never satisfies the launched pilo
   const dir=await mkdtemp(join(tmpdir(),'mellon-control-run-fence-'));
   let exported=0;
   const run=async args=>{
+    if (args[0] === 'stop') return { status: 0, stdout: '' };
     if(args.includes('start'))return{status:0,stdout:JSON.stringify({threadId:'thread-id',projectId:'project-id',runId:'run-id',modelSelection:{instanceId:'pi',model:MODEL}})};
     if(args.includes('show'))return{status:0,stdout:JSON.stringify({thread:{threadId:'thread-id',projectId:'project-id',providerInstanceId:'pi',model:MODEL,status:'completed',activeRunId:null,latestRunId:'later-run',pendingRequestCount:0},recentRuns:[{runId:'later-run',status:'completed'},{runId:'run-id',status:'completed'}],items:[]})};
     exported++;return{status:1,stdout:''};
@@ -234,6 +240,7 @@ test('a reconciled thread without a launch run identity blocks instead of guessi
   const dir=await mkdtemp(join(tmpdir(),'mellon-control-run-unknown-'));
   let exported=0;
   const run=async args=>{
+    if (args[0] === 'stop') return { status: 0, stdout: '' };
     if(args.includes('start'))return{status:0,stdout:JSON.stringify({threadId:'thread-id',projectId:'project-id',runId:null,modelSelection:{instanceId:'pi',model:MODEL}})};
     if(args.includes('show'))return{status:0,stdout:JSON.stringify({thread:{threadId:'thread-id',projectId:'project-id',providerInstanceId:'pi',model:MODEL,status:'completed',activeRunId:null,latestRunId:'run-id',pendingRequestCount:0},recentRuns:[{runId:'run-id',status:'completed'}],items:[]})};
     exported++;return{status:1,stdout:''};
@@ -288,6 +295,8 @@ test('an unconfirmed revocation blocks export so worker data never leaves with a
     await new Promise(resolve=>setTimeout(resolve,30));
     const value=await (await fetch(app.url+'/jobs/'+JOB.jobId,{headers:{authorization:'Bearer '+SECRET}})).json();
     assert.equal(value.state,'blocked');assert.equal(value.stage,'relay_revoke_unconfirmed');assert.equal(exported,0);
+    assert.equal(value.cleanupUnconfirmed, true);
+    assert.equal((await post(app.url, { ...JOB, jobId: JOB2.jobId })).status, 409);
   }finally{await stop(app.server);}
 });
 
@@ -355,6 +364,7 @@ test('a grant that lands after the job deadline is revoked and never launched', 
 const firstRun = id => `run:thread:${encodeURIComponent(id)}:ordinal:1`;
 function startWithoutRunId(show, exported) {
   return async args => {
+    if (args[0] === 'stop') return { status: 0, stdout: '' };
     if (args.includes('start')) return { status: 0, stdout: JSON.stringify({ threadId: 'mcp:thread-id', projectId: 'project-id', runId: null }) };
     if (args.includes('show')) return { status: 0, stdout: JSON.stringify({ thread: { threadId: 'mcp:thread-id', projectId: 'project-id', providerInstanceId: 'pi', model: MODEL, status: 'completed', activeRunId: null, pendingRequestCount: 0, ...show }, recentRuns: [{ runId: show.latestRunId, status: 'completed' }], items: [] }) };
     exported.count++; return { status: 1, stdout: '' };
@@ -747,9 +757,34 @@ test('jobs carry their own no-rebuild paths; rebuild, workflow and generated pat
   assert.equal((await post(app.url, { ...JOB, allowedPaths: ['src/personalized/cli.mjs', 'docs/guide/setup.md', 'README.md', 'tests/integration/x.test.mjs'] })).status, 202);
 });
 
+test('an unsuccessful stop after a terminal run failure keeps the worker reserved', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-stop-failed-'));
+  const emulator = t3Emulator();
+  const hooks = async args => {
+    if (args[0] === 'stop') return { status: 1, stdout: '' };
+    if (args.includes('show')) return { status: 0, stdout: JSON.stringify({ thread: {
+      threadId: REAL_START.threadId, projectId: 'project-id', providerInstanceId: 'pi', model: MODEL,
+      status: 'failed', latestRunId: REAL_START.runId, activeRunId: null, pendingRequestCount: 0, runCount: 1,
+    } }) };
+  };
+  const app = await running(buildConfig(dir), emulator.run, undefined, [], hooks);
+  t.after(() => stop(app.server));
+  await post(app.url, JOB);
+  const deadline = Date.now() + 5000;
+  let job;
+  do {
+    job = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
+    if (job.state === 'blocked') break;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  } while (Date.now() < deadline);
+  assert.equal(job.stage, 't3_failed');
+  assert.equal(job.cleanupUnconfirmed, true);
+  assert.equal((await post(app.url, JOB2)).status, 409);
+});
+
 test('only one job is active; a terminal job frees the slot', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'mellon-control-busy-'));
-  const app = await running(buildConfig(dir), async args => args.includes('start') ? { status: 1, stdout: '' } : args.includes('list') ? { status: 0, stdout: '[]' } : { status: 1, stdout: '' });
+  const app = await running(buildConfig(dir), async args => args[0] === 'stop' ? { status: 0, stdout: '' } : args.includes('start') ? { status: 1, stdout: '' } : args.includes('list') ? { status: 0, stdout: '[]' } : { status: 1, stdout: '' });
   t.after(() => stop(app.server));
   assert.equal((await post(app.url, JOB)).status, 202);
   assert.equal((await post(app.url, JOB2)).status, 409);
@@ -874,7 +909,7 @@ test('an assessment is claimed once per review run', async t => {
 
 test('a blocked job stays visible to the scheduler until it is acknowledged', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'mellon-control-ack-'));
-  const app = await running(buildConfig(dir), async args => args.includes('start') ? { status: 1, stdout: '' } : args.includes('list') ? { status: 0, stdout: '[]' } : { status: 1, stdout: '' });
+  const app = await running(buildConfig(dir), async args => args[0] === 'stop' ? { status: 0, stdout: '' } : args.includes('start') ? { status: 1, stdout: '' } : args.includes('list') ? { status: 0, stdout: '[]' } : { status: 1, stdout: '' });
   t.after(() => stop(app.server));
   assert.equal((await (await call(app.url, '/jobs/active')).json()).job, null);
   assert.equal((await post(app.url, JOB)).status, 202);

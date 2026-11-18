@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readdir, stat } from 'node:fs/promises';
+import { mkdtemp, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { zstdCompressSync } from 'node:zlib';
@@ -11,7 +11,7 @@ const REAL = `h.${Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { 
 const PATH = '/backend-api/codex/responses';
 
 async function relay(t, options = {}) {
-  const grantsDir = await mkdtemp(join(tmpdir(), 'mellon-relay-'));
+  const grantsDir = options.grantsDir ?? await mkdtemp(join(tmpdir(), 'mellon-relay-'));
   const calls = [];
   const upstream = options.upstream ?? (async (url, init) => {
     calls.push({ url, headers: Object.fromEntries(init.headers), body: Buffer.from(init.body) });
@@ -55,7 +55,7 @@ test('the worker capability satisfies the unchanged Pi account-claim parser with
 test('grant files are private and revocation takes effect on the next request', async t => {
   const r = await relay(t);
   const grant = await issueGrant(r.grantsDir, { jobId: JOB, ttlMs: 60000, maxRequests: 5 });
-  const [file] = await readdir(r.grantsDir);
+  const file = grant.grantId + '.json';
   assert.equal((await stat(join(r.grantsDir, file))).mode & 0o777, 0o600);
   assert.equal((await send(r.url, grant.capability)).status, 200);
   assert.equal(await revokeGrant(r.grantsDir, grant.grantId), true);
@@ -130,4 +130,22 @@ test('upstream and credential failures return fixed errors without raw details',
   const denied = await send(failing.url, second.capability);
   assert.equal(denied.status, 503);
   assert.equal((await denied.text()).includes('canary'), false);
+});
+
+test('a replacement relay shares the persisted request budget', async t => {
+  const first = await relay(t);
+  const { capability } = await issueGrant(first.grantsDir, { jobId: JOB, ttlMs: 60000, maxRequests: 1 });
+  assert.equal((await send(first.url, capability)).status, 200);
+  const second = await relay(t, { grantsDir: first.grantsDir });
+  assert.equal((await send(second.url, capability)).status, 429);
+  assert.equal(second.calls.length, 0);
+});
+
+test('concurrent relay processes admit exactly the remaining allowance', async t => {
+  const first = await relay(t);
+  const second = await relay(t, { grantsDir: first.grantsDir });
+  const { capability } = await issueGrant(first.grantsDir, { jobId: JOB, ttlMs: 60000, maxRequests: 1 });
+  const responses = await Promise.all([send(first.url, capability), send(second.url, capability)]);
+  assert.deepEqual(responses.map(r => r.status).sort(), [200, 429]);
+  assert.equal(first.calls.length + second.calls.length, 1);
 });

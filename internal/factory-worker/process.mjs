@@ -8,7 +8,8 @@ export function runBoundedProcess(command, args, options = {}) {
   const maxBytes = options.maxBytes ?? 8 * 1024 * 1024;
   return new Promise(resolveResult => {
     let settled = false;
-    let stdout = '';
+    const chunks = [];
+    let bytes = 0;
     let bounded = true;
     let timedOut = false;
     const timers = [];
@@ -35,13 +36,15 @@ export function runBoundedProcess(command, args, options = {}) {
     };
     timers.push(setTimeout(() => { timedOut = true; stopChild(); }, timeout));
     child.stdout.on('data', data => {
-      stdout += data.toString();
-      if (stdout.length > maxBytes && bounded) { bounded = false; stopChild(); }
+      if (!bounded) return;
+      bytes += data.length;
+      if (bytes <= maxBytes) chunks.push(data);
+      else { bounded = false; chunks.length = 0; stopChild(); }
     });
     child.once('error', () => finish({ status: 1, stdout: '', timedOut }));
     child.once('exit', code => {
       if (timedOut) finish({ status: 124, stdout: '', timedOut: true });
-      else finish({ status: bounded ? code : 1, stdout: bounded ? stdout : '', timedOut: false });
+      else finish({ status: bounded ? code : 1, stdout: bounded ? Buffer.concat(chunks).toString('utf8') : '', timedOut: false });
     });
     if (options.input !== undefined) {
       child.stdin.on('error', () => {});

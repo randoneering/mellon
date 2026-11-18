@@ -63,9 +63,9 @@ It runs only fixed T3 CLI and relay commands in its own worker and relay; it has
 - While listening, the controller checks running jobs every 10 seconds (`completionPollMs`), even when n8n's schedule is paused.
   One check runs per job at a time, shared with HTTP status reads.
   Completed runs proceed to independent review; paused and finished jobs are not polled.
-  Restart resumes checks for existing running jobs without launching another run.
+  Restart also reconciles a journaled launch by its unique title without starting another run.
   n8n still owns assessment delivery and publication.
-- The controller issues a relay grant before each model session and revokes it before any export.
+- The controller issues a relay grant before each model session and revokes it before any export. The relay records each request reservation on disk, so restarting the relay preserves the remaining allowance. When upgrading from in-memory accounting, issue fresh grants for new sessions.
 - It exports only planned paths, then reviews them with Qodo outside the worker, in a fresh clone on a named local branch.
   At a detached HEAD Qodo cannot build a finding inventory, and an incomplete inventory blocks the job.
 - Worker prompts and Qodo context identify this as the source-candidate stage.
@@ -84,7 +84,7 @@ It runs only fixed T3 CLI and relay commands in its own worker and relay; it has
 - Each job names its own issue, base commit and allowed paths.
   Paths must need no dist rebuild: `tests/unit|integration/*.test.mjs`, `docs/**/*.md`, `README.md` or `src/personalized/*.mjs`.
   Anything else is refused before launch.
-- One job runs at a time; `blocked` and `published` jobs free the slot.
+- One job runs at a time. A blocked job with an unconfirmed grant revocation or worker stop holds the slot. Its status reports `cleanupUnconfirmed`; reconcile the private worker and grant before resuming builds.
 - Before launch, the controller starts the worker if a deadline stopped it, stashes any leftovers in the worker checkout, including ignored files (kept, not deleted), fetches the base commit and checks it out detached.
 - A job past its deadline holds the slot in `stopping` until its grant is revoked and the worker has stopped.
 - T3 may write `.factory-proposal.json` with a PR `title` and `summary`.

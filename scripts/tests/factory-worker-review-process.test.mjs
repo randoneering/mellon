@@ -24,3 +24,9 @@ test('a child ignoring SIGTERM is force-killed and settles within a bounded grac
   assert.equal(result.timedOut,true);assert.notEqual(result.status,0);
   assert.ok(Date.now()-started<2000);
 });
+
+test('multibyte output counts against the byte budget', async () => {
+  const result = await executeReviewProcess(process.execPath, ['-e', 'process.stdout.write("界".repeat(40))'], { maxBytes: 100 });
+  assert.notEqual(result.status, 0);
+  assert.equal(result.stdout, '');
+});
