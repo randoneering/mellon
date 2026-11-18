@@ -7585,6 +7585,12 @@ function parseEvent({ eventName, repository, payload, eventBytes } = {}) {
     author: item.user.login
   };
 }
+function parseBoolean(value) {
+  if (value === void 0 || value === "") return true;
+  if (typeof value !== "string") return null;
+  const normalized = value.toLowerCase();
+  return normalized === "true" ? true : normalized === "false" ? false : null;
+}
 function parsePolicy(inputs = {}) {
   let allowlist = [];
   if (inputs.allowlist !== void 0) {
@@ -7598,8 +7604,8 @@ function parsePolicy(inputs = {}) {
   if (!Array.isArray(allowlist) || allowlist.some((account) => typeof account !== "string" || !ACCOUNT_PATTERN.test(account))) throw invalidInput();
   const response = inputs.response === void 0 ? DEFAULT_RESPONSE : inputs.response;
   const mode = inputs.mode === void 0 ? "enforce" : inputs.mode;
-  const autoClose = inputs.autoClose === void 0 || inputs.autoClose === "" ? true : inputs.autoClose === "true" ? true : inputs.autoClose === "false" ? false : null;
-  const reviewLabel = inputs.reviewLabel === void 0 || inputs.reviewLabel === "" ? true : inputs.reviewLabel === "true" ? true : inputs.reviewLabel === "false" ? false : null;
+  const autoClose = parseBoolean(inputs.autoClose);
+  const reviewLabel = parseBoolean(inputs.reviewLabel);
   if (typeof response !== "string" || !validText(response) || Buffer.byteLength(response, "utf8") > RESPONSE_LIMIT || mode !== "enforce" && mode !== "observe" || autoClose === null || reviewLabel === null) throw invalidInput();
   const login = inputs.moderationBotLogin;
   const moderationBotLogin = login === void 0 || login === "" ? DEFAULT_MODERATION_BOT_LOGIN : login;
