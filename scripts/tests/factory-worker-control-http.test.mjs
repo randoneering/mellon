@@ -382,22 +382,26 @@ function startWithoutRunId(show, exported) {
     exported.count++; return { status: 1, stdout: '' };
   };
 }
-async function pollOnce(show) {
+async function runUntilBlocked(show) {
   const dir = await mkdtemp(join(tmpdir(), 'mellon-control-first-run-'));
   const exported = { count: 0 };
   const app = await running({ workerId: 'd'.repeat(64), projectId: 'project-id', model: MODEL, secret: SECRET, issueNumber: 123, baseSha: JOB.baseSha, storeDir: dir, allowedPaths: ['tests/unit/personalized-terminal-controls.test.mjs'] }, startWithoutRunId(show, exported));
   try {
     assert.equal((await post(app.url, JOB)).status, 202);
-    await new Promise(resolve => setTimeout(resolve, 20));
-    await fetch(app.url + '/jobs/' + JOB.jobId, { headers: { authorization: 'Bearer ' + SECRET } });
-    await new Promise(resolve => setTimeout(resolve, 30));
-    const value = await (await fetch(app.url + '/jobs/' + JOB.jobId, { headers: { authorization: 'Bearer ' + SECRET } })).json();
+    const deadline = performance.now() + 5000;
+    let value;
+    do {
+      value = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
+      if (value.state === 'blocked') break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    } while (performance.now() < deadline);
+    assert.equal(value.state, 'blocked', 'controller must finish run validation or attempt the mocked export');
     return { value, exported: exported.count };
   } finally { await stop(app.server); }
 }
 
 test('a thread this controller started binds to its first and only run when T3 omits the run id', async () => {
-  const { value, exported } = await pollOnce({ runCount: 1, latestRunId: firstRun('mcp:thread-id') });
+  const { value, exported } = await runUntilBlocked({ runCount: 1, latestRunId: firstRun('mcp:thread-id') });
   assert.equal(exported, 1);
   assert.notEqual(value.stage, 't3_run_unconfirmed');
 });
@@ -409,7 +413,7 @@ for (const [label, show] of [
   ['a non-first ordinal with one run', { runCount: 1, latestRunId: `run:thread:${encodeURIComponent('mcp:thread-id')}:ordinal:2` }],
 ]) {
   test(`without a launch run id, ${label} blocks instead of binding`, async () => {
-    const { value, exported } = await pollOnce(show);
+    const { value, exported } = await runUntilBlocked(show);
     assert.equal(value.state, 'blocked');
     assert.equal(value.stage, 't3_run_unconfirmed');
     assert.equal(exported, 0);
