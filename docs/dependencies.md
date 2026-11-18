@@ -12,7 +12,7 @@ The scorer uses the locked `wink-nlp` 2.4.0 package and the `wink-eng-lite-web-m
 
 The parser token stream supplies source line maps; preparation consumes fence and blockquote spans. Markdown is not rendered to HTML, and no plugins, highlighting, link fetching, or code execution are enabled. Parser, Action, and scorer dependencies share a Node process and the Action credential trust boundary. They are not sandboxed from the token.
 
-The detector's pinned upstream source, model assets, checksum records, and notices are vendored distribution inputs rather than npm dependencies. Model provenance is separately pinned because the upstream source repository does not contain that published artifact. See [detector details](detector.md).
+The detector's pinned upstream source, model assets, checksum records, and notices are vendored distribution inputs rather than npm dependencies. Model provenance is separately pinned because the upstream source repository does not contain that published artifact. See [detector details](scorer.md).
 
 ## Build and parity checks
 
