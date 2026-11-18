@@ -100,7 +100,7 @@ The plan was already approved through the `n8n: build` label.
 
 - `POST /jobs/<id>/assessment` uses its own `assessmentSecret`.
   The job credential cannot reach it, and the assessment credential cannot read or start jobs.
-- The body names the reviewed `reviewRunId` and `candidateDigest`, then rates every open finding exactly once: `low`, `medium`, `high`, `critical` or `invalid`, with an optional note.
+- The form must echo the paused job’s `assessmentRunId` from the status response alongside the reviewed `reviewRunId` and `candidateDigest`, then rates every open finding exactly once: `low`, `medium`, `high`, `critical` or `invalid`, with an optional note.
 - `approve` publishes only when every finding is `low`, or `invalid` with a reason.
   The proposal then carries those ratings for the PR body; Qodo's reported metadata stays unchanged.
 - `fix` sends only the findings marked `fix: true` back to the same T3 thread with the owner's rating and note, and asks T3 to fix each one or explain a conflict with the plan.

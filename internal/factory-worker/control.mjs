@@ -114,6 +114,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
   const timers = new Map();
   const saves = new Map();
   const launches = new Set();
+  const transitions = new Set();
   const initialWrites = new Set();
   const statusChecks = new Map();
   let closed = false;
@@ -206,11 +207,34 @@ export function createControlServer(config, run = execute, review = reviewCandid
       const handle = await open(temporary, 'wx', 0o600);
       try { await handle.writeFile(content); await handle.sync(); } finally { await handle.close(); }
       await rename(temporary, join(config.storeDir, `${job.jobId}.json`));
-      const directory = await open(config.storeDir, 'r');
-      try { await directory.sync(); } finally { await directory.close(); }
+      try {
+        const directory = await open(config.storeDir, 'r');
+        try { await directory.sync(); } finally { await directory.close(); }
+      } catch (error) {
+        // Rename succeeded. Only recovery from disk can establish the current state.
+        journalReady = false;
+        throw error;
+      }
     });
     saves.set(job.jobId, next);
     return next;
+  };
+  // Keep the previous state visible until the journal confirms the transition.
+  // Callers validate and enter this section without yielding to another request.
+  const commitTransition = async (job, changes, send) => {
+    transitions.add(job.jobId);
+    clearTimeout(timers.get(job.jobId));
+    try {
+      await save({ ...job, ...changes });
+      Object.assign(job, changes);
+      return true;
+    } catch {
+      send(503, { error: 'controller_journal_unavailable' });
+      return false;
+    } finally {
+      transitions.delete(job.jobId);
+      if (!closed) arm(job);
+    }
   };
   const reconcile = async job => {
     const generation = job.generation ?? 0;
@@ -350,6 +374,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
   const pause = async (job, stage) => {
     job.state = 'awaiting_assessment';
     job.stage = stage;
+    job.assessClaim = null;
     job.assessmentUntil = Date.now() + assessmentWindowMs;
     arm(job);
     await save(job);
@@ -393,33 +418,27 @@ export function createControlServer(config, run = execute, review = reviewCandid
     const value = JSON.parse(body);
     const job = jobs.get(jobId);
     if (!job || job.state !== 'awaiting_assessment' || Date.now() >= (job.assessmentUntil ?? 0)) { send(409, { error: 'job_not_awaiting_assessment' }); return; }
-    if (value?.reviewRunId !== job.review?.reviewRunId || value?.candidateDigest !== job.candidate?.digest) { send(409, { error: 'assessment_stale' }); return; }
+    if (transitions.has(jobId)) { send(409, { error: 'transition_pending' }); return; }
+    if (typeof job.runId !== 'string' || value?.assessmentRunId !== job.runId || value?.reviewRunId !== job.review?.reviewRunId || value?.candidateDigest !== job.candidate?.digest) { send(409, { error: 'assessment_stale' }); return; }
     const checked = validateAssessment(value, job, new Date().toISOString());
     if (checked.error) { send(422, { error: checked.error }); return; }
     if (checked.assessment.decision === 'fix' && (job.ownerFixRounds ?? 0) >= maxOwnerFixRounds) { send(409, { error: 'owner_fix_rounds_exhausted' }); return; }
     if (checked.assessment.decision === 'fix' && checked.assessment.findings.filter(f => f.fix && f.rating !== 'invalid').length > MAX_FIX_FINDINGS) {
       send(422, { error: 'too_many_fix_findings' }); return;
     }
-    job.assessments = [...(job.assessments ?? []), checked.assessment];
-    job.assessment = checked.assessment;
-    if (checked.assessment.decision === 'approve') {
-      job.state = 'approved';
-      job.stage = 'owner_approved';
-      arm(job);
-      await save(job);
-      send(200, safe(job));
+    const assessment = { ...checked.assessment, assessmentRunId: job.runId };
+    const decision = { assessment, assessments: [...(job.assessments ?? []), assessment] };
+    if (assessment.decision === 'approve') {
+      if (await commitTransition(job, { ...decision, state: 'approved', stage: 'owner_approved' }, send)) send(200, safe(job));
       return;
     }
-    // Send-back: a fresh coding lease, a fenced generation, and only the chosen findings.
-    job.generation = (job.generation ?? 0) + 1;
-    job.deadlineAt = Date.now() + maxJobMs;
-    const chosen = checked.assessment.findings.filter(f => f.fix && f.rating !== 'invalid').map(f => ({
+    const chosen = assessment.findings.filter(f => f.fix && f.rating !== 'invalid').map(f => ({
       ...job.review.findings.find(r => r.id === f.id), ownerRating: f.rating, ownerNote: f.note,
     }));
-    job.state = 'fixing';
-    job.stage = 'owner_fix_request';
-    arm(job);
-    await save(job);
+    if (!await commitTransition(job, {
+      ...decision, state: 'fixing', stage: 'owner_fix_request',
+      generation: (job.generation ?? 0) + 1, deadlineAt: Date.now() + maxJobMs,
+    }, send)) return;
     send(202, safe(job));
     const generation = job.generation;
     void (async () => {
@@ -502,6 +521,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
     jobId: job.jobId, issueNumber: job.issueNumber, baseSha: job.baseSha, planSha256: job.planSha256, allowedPaths: job.allowedPaths,
     state: job.state, stage: job.stage, threadId: job.threadId ?? null,
     thread: job.thread ?? null, review: job.review ?? null, fixRounds: job.fixRounds ?? 0,
+    assessmentRunId: job.state === 'awaiting_assessment' ? job.runId : null,
     ownerFixRounds: job.ownerFixRounds ?? 0, assessmentUntil: job.assessmentUntil ?? null,
     publishClaimedAt: job.publishClaim?.at ?? null, assessClaimedFor: job.assessClaim?.reviewRunId ?? null,
     assessmentClaimed: assessmentClaimed(job),
@@ -586,19 +606,20 @@ export function createControlServer(config, run = execute, review = reviewCandid
         const value = body ? JSON.parse(body) : {};
         const job = jobs.get(action[1]);
         if (!job) { send(404, { error: 'unknown_job' }); return; }
+        if (transitions.has(job.jobId)) { send(409, { error: 'transition_pending' }); return; }
         if (action[2] === 'claim') {
+          let changes;
           if (value.action === 'assess') {
             if (job.state !== 'awaiting_assessment' || value.reviewRunId !== job.review?.reviewRunId
                 || assessmentClaimed(job)) { send(409, { error: 'assessment_not_claimable' }); return; }
-            job.assessClaim = { reviewRunId: job.review.reviewRunId, at: Date.now() };
+            changes = { assessClaim: { reviewRunId: job.review.reviewRunId, at: Date.now() } };
           } else if (value.action === 'publish') {
             // One claim only: an unfinished claim means a write may have happened.
             if (job.state !== 'approved' || job.publishClaim) { send(409, { error: 'publication_not_claimable' }); return; }
-            job.publishClaim = { at: Date.now() };
-            job.publishProgress = { stage: 'claimed', stageAt: Date.now(), generated: [] };
+            const at = Date.now();
+            changes = { publishClaim: { at }, publishProgress: { stage: 'claimed', stageAt: at, generated: [] } };
           } else { send(400, { error: 'factory_request_rejected' }); return; }
-          await save(job);
-          send(200, safe(job));
+          if (await commitTransition(job, changes, send)) send(200, safe(job));
           return;
         }
         if (action[2] === 'published') {
@@ -610,18 +631,16 @@ export function createControlServer(config, run = execute, review = reviewCandid
               || done.changedPaths.some(path => !done.generated.includes(path)))) { send(409, { error: 'publication_build_incomplete' }); return; }
           if (!Number.isSafeInteger(value.prNumber) || value.prNumber < 1 || !/^[a-f0-9]{40}$/.test(value.commitSha ?? '')
               || value.prUrl !== `https://github.com/randoneering/mellon/pull/${value.prNumber}`) { send(400, { error: 'factory_request_rejected' }); return; }
-          job.publication = { prNumber: value.prNumber, prUrl: value.prUrl, commitSha: value.commitSha, at: Date.now() };
-          job.state = 'published';
-          job.stage = 'draft_pr_opened';
-          job.acknowledged = true;
-          arm(job);
-          await save(job);
-          send(200, safe(job));
+          if (!job.requiresRebuild && (done?.stage !== 'source_committed' || done.source !== value.commitSha || done.head !== value.commitSha)) {
+            send(409, { error: 'publication_source_incomplete' }); return;
+          }
+          const publication = { prNumber: value.prNumber, prUrl: value.prUrl, commitSha: value.commitSha, at: Date.now() };
+          if (await commitTransition(job, { publication, state: 'published', stage: 'draft_pr_opened', acknowledged: true }, send)) send(200, safe(job));
           return;
         }
         if (action[2] === 'publication-stage') {
           // Stages run in order: claimed -> source_committed -> runner (rebuild jobs) -> generated...
-          const progress = job.publishProgress;
+          const progress = structuredClone(job.publishProgress);
           const sha = v => /^[a-f0-9]{40}$/.test(v ?? '');
           const shapes = {
             source_committed: () => sha(value.commitSha),
@@ -646,8 +665,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
           // The runner's verified result names exactly which generated files must be committed.
           if (value.stage === 'built') { progress.runId = String(value.runId); progress.changedPaths = [...value.changedPaths]; }
           if (value.stage === 'generated') { progress.head = value.headSha; progress.generated.push(value.path); }
-          await save(job);
-          send(200, safe(job));
+          if (await commitTransition(job, { publishProgress: progress }, send)) send(200, safe(job));
           return;
         }
         if (action[2] === 'publication-failed') {
@@ -656,16 +674,12 @@ export function createControlServer(config, run = execute, review = reviewCandid
           if (!['policy', 'uncertain'].includes(value.reason)) { send(400, { error: 'factory_request_rejected' }); return; }
           if (job.state !== 'approved' || !job.publishClaim
               || (value.reason === 'uncertain' && Date.now() < publishDeadline(job))) { send(409, { error: 'publication_not_releasable' }); return; }
-          job.state = 'blocked';
-          job.stage = value.reason === 'policy' ? 'publication_policy_blocked' : 'publication_uncertain';
-          await save(job);
-          send(200, safe(job));
+          const stage = value.reason === 'policy' ? 'publication_policy_blocked' : 'publication_uncertain';
+          if (await commitTransition(job, { state: 'blocked', stage }, send)) send(200, safe(job));
           return;
         }
         if (job.state !== 'blocked') { send(409, { error: 'job_not_blocked' }); return; }
-        job.acknowledged = true;
-        await save(job);
-        send(200, safe(job));
+        if (await commitTransition(job, { acknowledged: true }, send)) send(200, safe(job));
         return;
       }
       const match = /^\/jobs\/([a-f0-9-]{36})$/.exec(url.pathname);

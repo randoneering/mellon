@@ -107,7 +107,7 @@ test('owner follow-up progresses without a new workflow run and carries stage co
   await wait(40);
   assert.equal(s.calls.filter(c => c === 'show').length, shown, 'paused jobs must not be polled');
   const response = await s.request(`/jobs/${JOB.jobId}/assessment`, {
-    decision: 'fix', reviewRunId: paused.review.reviewRunId, candidateDigest: paused.candidate.digest,
+    decision: 'fix', assessmentRunId: paused.runId, reviewRunId: paused.review.reviewRunId, candidateDigest: paused.candidate.digest,
     findings: [{ id: 'gap', rating: 'medium', fix: true }],
   }, true);
   assert.equal(response.status, 202);
@@ -128,7 +128,7 @@ test('a fresh fix run does not expose the old run as completed', async t => {
   await s.request(`/jobs/${JOB.jobId}`);
   const paused = await s.until(j => j.state === 'awaiting_assessment');
   await s.request(`/jobs/${JOB.jobId}/assessment`, {
-    decision: 'fix', reviewRunId: paused.review.reviewRunId, candidateDigest: paused.candidate.digest,
+    decision: 'fix', assessmentRunId: paused.runId, reviewRunId: paused.review.reviewRunId, candidateDigest: paused.candidate.digest,
     findings: [{ id: 'gap', rating: 'medium', fix: true }],
   }, true);
   const fixing = await s.until(j => j.stage === 't3_fix_run');

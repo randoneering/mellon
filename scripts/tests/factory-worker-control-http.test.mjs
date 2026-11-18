@@ -440,9 +440,14 @@ test('the real T3 show output completes the exact launched run and starts review
   const app = await running({ workerId: 'd'.repeat(64), projectId: 'project-id', model: MODEL, secret: SECRET, issueNumber: 123, baseSha: JOB.baseSha, storeDir: dir, allowedPaths: ['tests/unit/personalized-terminal-controls.test.mjs'] }, run);
   try {
     assert.equal((await post(app.url, JOB)).status, 202);
-    await new Promise(resolve => setTimeout(resolve, 20));
-    await fetch(app.url + '/jobs/' + JOB.jobId, { headers: { authorization: 'Bearer ' + SECRET } });
-    await new Promise(resolve => setTimeout(resolve, 30));
+    const deadline = Date.now() + 5000;
+    let state;
+    do {
+      state = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
+      if (state.state === 'blocked') break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    } while (Date.now() < deadline);
+    assert.equal(state.stage, 'candidate_or_review_unconfirmed');
     assert.equal(exported, 1);
   } finally { await stop(app.server); }
 });
@@ -582,9 +587,20 @@ async function paused(t, options = {}) {
   assert.equal((await post(app.url, JOB)).status, 202);
   const value = await waitFor(['awaiting_assessment', 'blocked', 'approved']);
   assert.equal(value.state, 'awaiting_assessment');
-  const body = (decision, ratings, extra = {}) => ({ decision, reviewRunId: value.review.reviewRunId, candidateDigest: value.review.candidateDigest, findings: [{ id: 'finding-1', ...ratings[0] }, { id: 'finding-2', ...ratings[1] }], ...extra });
+  const body = (decision, ratings, extra = {}) => ({ decision, assessmentRunId: value.assessmentRunId, reviewRunId: value.review.reviewRunId, candidateDigest: value.review.candidateDigest, findings: [{ id: 'finding-1', ...ratings[0] }, { id: 'finding-2', ...ratings[1] }], ...extra });
   return { app, dir, emulator, reviewer, log, value, get, assess, waitFor, body };
 }
+
+test('a failed approval write leaves the proposal inaccessible and the decision retryable', async t => {
+  const p = await paused(t);
+  const approval = p.body('approve', [{ rating: 'low' }, { rating: 'low' }]);
+  await chmod(p.dir, 0o500);
+  try {
+    assert.equal((await p.assess(approval)).status, 503);
+    assert.equal((await p.get('/proposal')).status, 409);
+  } finally { await chmod(p.dir, 0o700); }
+  assert.equal((await p.assess(approval)).status, 200);
+});
 
 test('owner assessment needs its own credential; neither credential works for the other endpoint', async t => {
   const p = await paused(t);
@@ -657,7 +673,7 @@ test('owner send-backs are bounded separately from automatic fix rounds', async 
   assert.equal((await p.assess(p.body('fix', [{ rating: 'high', fix: true }, { rating: 'low' }]))).status, 202);
   const again = await p.waitFor(['awaiting_assessment', 'blocked']);
   assert.equal(again.state, 'awaiting_assessment');
-  const next = { decision: 'fix', reviewRunId: again.review.reviewRunId, candidateDigest: again.review.candidateDigest, findings: [{ id: 'finding-1', rating: 'high', fix: true }, { id: 'finding-2', rating: 'low' }] };
+  const next = { decision: 'fix', assessmentRunId: again.assessmentRunId, reviewRunId: again.review.reviewRunId, candidateDigest: again.review.candidateDigest, findings: [{ id: 'finding-1', rating: 'high', fix: true }, { id: 'finding-2', rating: 'low' }] };
   assert.equal((await p.assess(next)).status, 409);
 });
 
@@ -709,7 +725,7 @@ test('an owner send-back of more than ten findings is refused, not truncated', a
   const many = Array.from({ length: 11 }, (_, i) => ({ ...FINDING, id: `f-${i}`, title: `finding ${i}` }));
   const reviewer = { calls: [], fn: async c => { reviewer.calls.push(c.digest); return { status: 'awaiting_assessment', candidateDigest: c.digest, reviewRunId: 'r-1', coverageComplete: true, findingInventoryComplete: true, findings: many }; } };
   const p = await paused(t, { reviewer });
-  const body = { decision: 'fix', reviewRunId: p.value.review.reviewRunId, candidateDigest: p.value.review.candidateDigest, findings: many.map(f => ({ id: f.id, rating: 'high', fix: true })) };
+  const body = { decision: 'fix', assessmentRunId: p.value.assessmentRunId, reviewRunId: p.value.review.reviewRunId, candidateDigest: p.value.review.candidateDigest, findings: many.map(f => ({ id: f.id, rating: 'high', fix: true })) };
   const response = await p.assess(body);
   assert.equal(response.status, 422);
   assert.equal((await response.json()).error, 'too_many_fix_findings');
@@ -822,10 +838,29 @@ test('publication is claimed once; an unfinished claim cannot be retaken, and pu
   for (const body of [{ prNumber: 9, prUrl: 'https://evil.example/pull/9', commitSha: 'a'.repeat(40) }, { prNumber: 9, prUrl: 'https://github.com/randoneering/mellon/pull/10', commitSha: 'a'.repeat(40) }, { prNumber: 9, prUrl: 'https://github.com/randoneering/mellon/pull/9', commitSha: 'zz' }]) {
     assert.equal((await call(app.url, `/jobs/${JOB.jobId}/published`, 'POST', body)).status, 400);
   }
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/published`, 'POST', { prNumber: 9, prUrl: 'https://github.com/randoneering/mellon/pull/9', commitSha: 'a'.repeat(40) })).status, 409);
+  assert.equal((await stage(app, { stage: 'source_committed', commitSha: 'a'.repeat(40) })).status, 200);
   assert.equal((await call(app.url, `/jobs/${JOB.jobId}/published`, 'POST', { prNumber: 9, prUrl: 'https://github.com/randoneering/mellon/pull/9', commitSha: 'a'.repeat(40) })).status, 200);
   assert.equal((await (await call(app.url, '/jobs/' + JOB.jobId)).json()).state, 'published');
   assert.equal((await (await call(app.url, '/jobs/active')).json()).job, null);
   assert.equal((await post(app.url, JOB2)).status, 202);
+});
+
+test('a failed publication write keeps the slot occupied until a durable retry', async t => {
+  const { app, dir } = await approvedJob(t);
+  const sha = 'a'.repeat(40);
+  const publish = () => call(app.url, `/jobs/${JOB.jobId}/published`, 'POST', {
+    prNumber: 9, prUrl: 'https://github.com/randoneering/mellon/pull/9', commitSha: sha,
+  });
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' })).status, 200);
+  assert.equal((await stage(app, { stage: 'source_committed', commitSha: sha })).status, 200);
+  await chmod(dir, 0o500);
+  try {
+    assert.equal((await publish()).status, 503);
+    assert.equal((await post(app.url, JOB2)).status, 409);
+    assert.equal(JSON.parse(await readFile(join(dir, JOB.jobId + '.json'))).state, 'approved');
+  } finally { await chmod(dir, 0o700); }
+  assert.equal((await publish()).status, 200);
 });
 
 test('an assessment is claimed once per review run', async t => {
@@ -983,12 +1018,14 @@ test('a new pause after an unchanged owner fix accepts a fresh assessment claim'
   assert.equal((await claim()).status, 200);
   assert.equal((await get()).assessmentClaimed, true);
   assert.equal((await claim()).status, 409);
-  const body = { decision: 'fix', reviewRunId: first.review.reviewRunId, candidateDigest: first.review.candidateDigest, findings: [{ id: 'finding-1', rating: 'critical', fix: true }, { id: 'finding-2', rating: 'low' }] };
+  const body = { decision: 'fix', assessmentRunId: first.assessmentRunId, reviewRunId: first.review.reviewRunId, candidateDigest: first.review.candidateDigest, findings: [{ id: 'finding-1', rating: 'critical', fix: true }, { id: 'finding-2', rating: 'low' }] };
   assert.equal((await fetch(app.url + `/jobs/${JOB.jobId}/assessment`, { method: 'POST', headers: { authorization: 'Bearer ' + OWNER, 'content-type': 'application/json' }, body: JSON.stringify(body) })).status, 202);
   await new Promise(r => setTimeout(r, 20));
   const again = await waitState('awaiting_assessment');
   assert.equal(again.stage, 'review_no_progress');
   assert.equal(again.review.reviewRunId, first.review.reviewRunId);
+  assert.notEqual(first.assessmentRunId, again.assessmentRunId);
+  assert.equal((await fetch(app.url + `/jobs/${JOB.jobId}/assessment`, { method: 'POST', headers: { authorization: 'Bearer ' + OWNER, 'content-type': 'application/json' }, body: JSON.stringify(body) })).status, 409);
   assert.equal(again.assessmentClaimed, false);
   assert.equal((await claim()).status, 200);
   assert.equal((await claim()).status, 409);
