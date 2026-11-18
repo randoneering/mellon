@@ -142,6 +142,7 @@ test('marks empty, malformed and unusable HTTP200 bodies as invalid responses', 
     '{"data":{"rateLimit":{"limit":5000,"remaining":-1}}}',
     '{"data":{"rateLimit":{"limit":3,"remaining":4}}}',
     '{"data":{"rateLimit":{"limit":"5000","remaining":4}}}',
+    '{"errors":[null]}', '{"errors":[{}]}', '{"errors":[{"message":3}]}',
     '{"errors":{},"data":{"rateLimit":{"limit":5000,"remaining":4}}}']) {
     const result = summarizeProbe({ ...response(), body }, started(), 1100);
     assert.equal(result.status, 200);
@@ -279,7 +280,7 @@ test('blob stage rejects successful-status responses with unusable blob metadata
   assert.equal(invalid.category, 'invalid_response');
   const valid = diagnostics.summarizeBlobFetch({ statusCode: 200, body: blob, headers: {} }, expected);
   assert.equal(valid.category, 'ok');
-  assert.equal(valid.source_hash_verified, false);
+  assert.equal(valid.source_hash_verified, true);
   assert.equal(diagnostics.summarizeBlobFetch({}, expected).category, 'unsupported_envelope');
   assert.throws(() => diagnostics.summarizeBlobFetch({}, null), /validation/i);
   assert.doesNotMatch(JSON.stringify(invalid), /canary/);
@@ -343,9 +344,9 @@ test('preparatory GET permits native credential refresh without enabling payload
   const workflow = createProbeWorkflow(operator);
   const get = workflow.nodes.find(node => node.name === 'Read pinned public blob');
   const post = workflow.nodes.find(node => node.name === 'Read-only GraphQL request');
-  assert.equal(get.parameters.options.response.response.neverError, false);
+  assert.equal(get.parameters.operation, 'blob');
   assert.equal(get.onError, 'continueRegularOutput');
-  assert.equal(post.parameters.options.response.response.neverError, true);
+  assert.equal(post.parameters.operation, 'quota');
   assert.notEqual(get.retryOnFail, true);
   assert.notEqual(post.retryOnFail, true);
 });
@@ -417,22 +418,12 @@ test('workflow remains manual and inactive with no retained execution data', () 
   assert.equal(workflow.settings.executionTimeout, 180);
   assert.equal(workflow.nodes.filter(node => node.type.includes('Trigger')).length, 1);
   assert.equal(workflow.nodes.find(node => node.type.includes('Trigger')).type, 'n8n-nodes-base.manualTrigger');
-  const http = workflow.nodes.filter(node => node.type === 'n8n-nodes-base.httpRequest');
-  assert.equal(http.length, 2);
+  const http = workflow.nodes.filter(node => node.type === 'CUSTOM.mellonTransport');
+  assert.deepEqual(http.map(node => node.parameters.operation), ['blob', 'quota']);
   for (const node of http) {
-    assert.ok(node.parameters.url.startsWith('https://api.github.com/'));
-    assert.equal(node.parameters.options.redirect.redirect.followRedirects, false);
-    assert.equal(node.parameters.options.timeout, 20000);
     assert.equal(node.credentials.githubAppApi.id, 'probe-app');
     assert.notEqual(node.retryOnFail, true);
-    assert.equal(node.onError, 'continueRegularOutput');
-    assert.equal(node.continueOnFail, undefined);
-    assert.equal(node.alwaysOutputData, true);
-    assert.equal(node.parameters.options.response.response.responseFormat, 'text');
-    assert.equal(node.parameters.options.response.response.outputPropertyName, 'body');
   }
-  assert.equal(http.find(node => node.parameters.method === 'POST').parameters.url, 'https://api.github.com/graphql');
-  assert.equal(http.find(node => node.parameters.method === 'POST').parameters.options.response.response.responseFormat, 'text');
   assert.equal(workflow.nodes.find(node => node.type === 'n8n-nodes-base.splitInBatches').parameters.batchSize, 1);
 });
 
@@ -468,4 +459,45 @@ test('generated blob preparation checks the actual pinned object before making r
   const execute = new Function('$', 'require', prepare);
   assert.throws(() => execute(() => ({ first: () => ({ json: { statusCode: 200, body: blob } }) }), require), /validation/i);
   assert.throws(() => execute(() => ({ first: () => ({ json: { statusCode: 404, body: 'private' } }) }), require), /validation/i);
+});
+
+test('diagnostic transport applies byte limits before reading either response', async () => {
+  const { MellonTransport } = require('../../internal/n8n/MellonTransport.node.js');
+  for (const operation of ['blob', 'quota']) {
+    const calls = [];
+    const context = {
+      getNodeParameter: name => name === 'operation' ? operation : JSON.stringify({ query: READ_ONLY_QUERY, variables: {} }),
+      helpers: { httpRequestWithAuthentication: async (auth, options) => {
+        calls.push(options);
+        assert.equal(auth, 'githubAppApi');
+        return { statusCode: 200, headers: {}, body: '{}' };
+      } },
+    };
+    await new MellonTransport().execute.call(context);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].disableFollowRedirect, true);
+    assert.equal(calls[0].maxResponseBodyBytes, operation === 'blob' ? 16 * 1024 * 1024 : 65536);
+    assert.equal(calls[0].ignoreHttpStatusErrors, operation === 'quota');
+  }
+});
+
+test('blob response success requires canonical content, size and pinned Git hash', () => {
+  for (const fields of [{ content: '!' }, { size: 7 }, { content: 'YmFkISEK' }]) {
+    const result = diagnostics.summarizeBlobFetch({ statusCode: 200, body: { ...blob, ...fields } }, expected);
+    assert.equal(result.category, 'invalid_response');
+    assert.equal(result.source_hash_verified, false);
+  }
+});
+
+test('a sandbox without crypto still journals the blob-validation failure', () => {
+  const node = createProbeWorkflow(operator).nodes.find(n => n.name === 'Sanitize blob status');
+  const run = new Function('$json', '$', 'require', node.parameters.jsCode);
+  const denied = () => { throw new Error('module unavailable'); };
+  const pins = pinnedBaseline();
+  const report = JSON.stringify({ phase: 'started', synthetic: false, base_sha: pins.base_sha, blob_sha: pins.blob_sha });
+  const context = () => ({ first: () => ({ json: { report } }) });
+  const result = run({ statusCode: 200, body: '{}' }, context, denied).json;
+  assert.equal(result.category, 'blob_validation_unavailable');
+  assert.equal(result.source_hash_verified, false);
+  assert.equal(run({ statusCode: 499 }, context, denied).json.category, 'http_499');
 });

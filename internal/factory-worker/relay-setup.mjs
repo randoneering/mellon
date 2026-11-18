@@ -71,6 +71,13 @@ export function modelConfigMatches(actual, expected, suffix) {
   return canonical(value) === canonical(expected);
 }
 
+export function verifyProxyNetworks(proxy, config, outboundId) {
+  const networks = proxy?.NetworkSettings?.Networks ?? {};
+  if (Object.keys(networks).length !== 2 || !/^[a-f0-9]{64}$/.test(outboundId)
+      || networks[config.network]?.NetworkID !== config.networkId
+      || networks.n8n_default?.NetworkID !== outboundId) throw new Error('Proxy network mismatch.');
+}
+
 export function verifyRelayInspection(value, imageId, config) {
   const suffix = suffixOf(config);
   const mounts = (value?.Mounts ?? []).filter(m => m.Type !== 'tmpfs');

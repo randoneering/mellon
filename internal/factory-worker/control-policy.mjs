@@ -49,6 +49,7 @@ export function safeThreadState(value, threadId, config) {
   const thread = value?.thread;
   if (!thread || thread.threadId !== threadId || thread.projectId !== config.projectId
       || thread.providerInstanceId !== 'pi' || thread.model !== config.model
+      || !Number.isSafeInteger(thread.pendingRequestCount) || thread.pendingRequestCount < 0
       || !STATUSES.has(thread.status)) reject();
   const run = Array.isArray(value.recentRuns)
     ? value.recentRuns.find(r => r.runId === thread.latestRunId) : undefined;
@@ -56,7 +57,7 @@ export function safeThreadState(value, threadId, config) {
     threadId, status: thread.status, provider: 'pi', model: config.model,
     activeRunId: typeof thread.activeRunId === 'string' ? thread.activeRunId : null,
     latestRunId: typeof thread.latestRunId === 'string' ? thread.latestRunId : null,
-    pendingRequests: Number.isSafeInteger(thread.pendingRequestCount) ? thread.pendingRequestCount : null,
+    pendingRequests: thread.pendingRequestCount,
     runCount: Number.isSafeInteger(thread.runCount) ? thread.runCount : null,
     // T3 0.1.5's CLI show omits recentRuns; then the thread's own state decides.
     // The controller separately requires latestRunId to equal the bound run.

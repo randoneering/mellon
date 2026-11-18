@@ -1,4 +1,7 @@
 import { randomBytes } from 'node:crypto';
+import { once } from 'node:events';
+import { watch } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
 import { createServer } from 'node:http';
 import { mkdir, open, readFile, readdir, rename, rm, unlink } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -43,6 +46,13 @@ export async function revokeGrant(grantsDir, grantId) {
   if (!GRANT.test(grantId ?? '')) throw new Error('Relay grant input rejected.');
   try { await unlink(join(grantsDir, `${grantId}.json`)); }
   catch (error) { if (error.code !== 'ENOENT') throw new Error('Relay grant revocation failed.'); }
+  // The CLI and relay are separate processes. Return success only after all
+  // dispatches admitted before unlink have left their upstream request scope.
+  const deadline = performance.now() + 5000;
+  while ((await readdir(grantsDir)).some(name => name.startsWith(grantId + '.active-'))) {
+    if (performance.now() >= deadline) throw new Error('Relay grant revocation unconfirmed.');
+    await delay(10);
+  }
   await rm(join(grantsDir, grantId + '.reservations'), { recursive: true, force: true });
   return true;
 }
@@ -142,9 +152,19 @@ export function createRelay(config) {
       headers.set('authorization', `Bearer ${token}`);
       headers.set('chatgpt-account-id', account);
       const abort = new AbortController();
-      const timer = setTimeout(() => abort.abort(), requestMs);
+      const marker = join(config.grantsDir, grant.grantId + '.active-' + randomBytes(12).toString('hex'));
+      await (await open(marker, 'wx', 0o600)).close();
+      let watcher;
+      const timer = setTimeout(() => abort.abort(), Math.max(1, Math.min(requestMs, grant.expiresAt - Date.now())));
       res.once('close', () => abort.abort());
       try {
+        try {
+          watcher = watch(join(config.grantsDir, grant.grantId + '.json'), () => abort.abort());
+          watcher.on('error', () => abort.abort());
+        } catch { fail(401, 'grant_rejected'); return; }
+        if (!await grantFor(req.headers.authorization) || abort.signal.aborted || res.destroyed) {
+          fail(401, 'grant_rejected'); return;
+        }
         let response;
         try {
           response = await upstream(UPSTREAM_URL, { method: 'POST', headers, body: raw, signal: abort.signal, redirect: 'error' });
@@ -153,14 +173,14 @@ export function createRelay(config) {
         res.writeHead(response.status, { 'cache-control': 'no-store', ...(type ? { 'content-type': type } : {}) });
         if (!response.body) { res.end(); return; }
         let sent = 0;
-        for await (const chunk of Readable.fromWeb(response.body)) {
+        for await (const chunk of Readable.fromWeb(response.body, { signal: abort.signal })) {
           sent += chunk.length;
           if (sent > maxResponseBytes) { res.destroy(); return; }
-          if (!res.write(chunk)) await new Promise(next => res.once('drain', next));
+          if (!res.write(chunk)) await once(res, 'drain', { signal: abort.signal });
         }
         res.end();
       } catch { fail(502, 'upstream_interrupted'); }
-      finally { clearTimeout(timer); }
+      finally { clearTimeout(timer); watcher?.close(); await unlink(marker); }
     } catch { fail(500, 'relay_failed'); }
   });
   // The Codex client falls back to SSE when the WebSocket attempt fails.

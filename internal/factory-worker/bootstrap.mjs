@@ -101,6 +101,10 @@ export async function runContainer(imageId, name, execute = executeDocker) {
         report.containerStopped = stopped.status === 0;
       } catch { report.containerStopped = false; }
       if (!report.containerStopped) {
+        if (report.ok) {
+          report.stage = 'container_stop';
+          report.category = 'command_failed';
+        }
         report.ok = false;
         report.stopFailure = { stage: 'container_stop', category: 'command_failed' };
       }

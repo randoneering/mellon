@@ -293,10 +293,18 @@ export function createControlServer(config, run = execute, review = reviewCandid
   };
   // After a restart the container is up before T3's server is; wait for it.
   const waitForT3 = async () => {
+    const deadline = performance.now() + 90000;
     for (let attempt = 0; attempt < readinessAttempts; attempt++) {
-      const r = await run(['exec', config.workerId, 'node', '-e', T3_READY_PROGRAM], undefined, 10000).catch(() => ({ status: 1 }));
+      const remaining = Math.floor(deadline - performance.now());
+      if (remaining <= 0) break;
+      let timer;
+      const probe = run(['exec', config.workerId, 'node', '-e', T3_READY_PROGRAM], undefined, Math.min(10000, remaining)).catch(() => ({ status: 1 }));
+      const r = await Promise.race([probe, new Promise(resolve => {
+        timer = setTimeout(() => resolve({ status: 1 }), remaining);
+      })]).finally(() => clearTimeout(timer));
+      if (performance.now() >= deadline) break;
       if (r.status === 0 && String(r.stdout).includes('mellon-t3-ready')) return;
-      await new Promise(resolve => setTimeout(resolve, readinessIntervalMs));
+      if (attempt + 1 < readinessAttempts) await new Promise(resolve => setTimeout(resolve, Math.min(readinessIntervalMs, deadline - performance.now())));
     }
     throw new Error('T3 not ready.');
   };

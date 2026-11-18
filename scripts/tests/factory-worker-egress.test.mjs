@@ -52,3 +52,31 @@ for (const ip of ['104.18.32.7', '140.82.112.3', '1.1.1.1']) {
     assert.equal(checkedPublicAddress(ip), ip);
   });
 }
+
+test('a CONNECT tunnel carries more than 64 MiB without buffering the total transfer', { timeout: 10000 }, async () => {
+  const total = 65 * 1024 * 1024;
+  let received = 0;
+  const upstream = net.createServer(socket => socket.on('data', data => {
+    received += data.length;
+    if (received === total) socket.write('done');
+  }));
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  const proxy = startEgress({ listen: false, lookup: async () => [{ address: '1.1.1.1' }],
+    connect: () => net.connect(upstream.address().port, '127.0.0.1') });
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  const client = net.connect(proxy.address().port, '127.0.0.1');
+  try {
+    const reply = new Promise(resolve => client.once('data', resolve));
+    client.write('CONNECT github.com:443 HTTP/1.1\r\nHost: github.com\r\n\r\n');
+    assert.match(String(await reply), /200 Connection Established/);
+    const done = new Promise(resolve => client.once('data', resolve));
+    const chunk = Buffer.alloc(1024 * 1024);
+    for (let sent = 0; sent < total; sent += chunk.length) {
+      await new Promise((resolve, reject) => client.write(chunk, err => err ? reject(err) : resolve()));
+    }
+    assert.equal(String(await done), 'done');
+  } finally {
+    client.destroy();
+    await Promise.all([new Promise(resolve => proxy.close(resolve)), new Promise(resolve => upstream.close(resolve))]);
+  }
+});

@@ -24,12 +24,16 @@ It reads one pinned public Git blob and compares at most six sequential GraphQL 
 The GraphQL operation stays a fixed read-only quota query; file-change data appears only in unused variables.
 Requests use a nonexistent diagnostic branch in those variables, refuse redirects, and retain a 20-second timeout.
 GraphQL probe requests never retry automatically.
-The idempotent preparatory GET leaves Never Error off so a cached-token 401 can reach n8n's native credential-refresh handler; sanitized continuation still journals a final failure.
+The idempotent preparatory GET propagates HTTP errors so a cached-token 401 can reach n8n's native credential-refresh handler; sanitized continuation still journals a final failure.
 The native helper may refresh its token and resend that GET. This does not edit the static App ID, installation ID, private key, permissions, or domains.
 Do not copy this GET error-handling pattern onto mutating publisher calls; reconcile uncertain writes before any explicit resend.
 The helper validates the blob hash, canonical base64, sizes, query identity, and output metadata.
 Each request and measurement must match independently supplied trusted pins; the final report rejects mixed-pin measurements.
 An HTTP success is `ok` only when it contains a valid GraphQL quota response; empty, malformed, or unusable success bodies are `invalid_response`.
+
+Install the checked-in `internal/n8n/MellonTransport.node.js` in the n8n custom nodes directory on each execution host and restart n8n before importing the generated workflow. It uses the authenticated HTTP helper in n8n 2.44.7 with a 16 MiB response limit for the blob and 64 KiB for GraphQL. Both limits apply during receipt. This changes the measured transport from the stock HTTP Request node to the bounded helper.
+
+The two blob-validation Code nodes use the Node.js `crypto` built-in. Include `crypto` in `NODE_FUNCTION_ALLOW_BUILTIN` for the JavaScript task runner executing this workflow. When the runner cannot load it, the blob journal records `blob_validation_unavailable` on an HTTP 200 and payload preparation stops.
 
 Supply the existing App credential reference and a dedicated report table ID to `createProbeWorkflow({ credential, reportTableId })`.
 The diagnostic stores sanitized `started`, `blob_response`, `request_prepared`, `measurement`, and `complete` records in that table, keyed by execution ID.

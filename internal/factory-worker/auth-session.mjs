@@ -78,6 +78,9 @@ async function main(packageRoot, sessionDir) {
         || resolve(directory, '..') !== resolve(tmpdir())) rejected();
     const pkg = JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8'));
     if (pkg.name !== '@earendil-works/pi-coding-agent' || pkg.version !== '1.5.2') rejected();
+    const aiRoot = resolve(packageRoot, '../pi-ai');
+    const ai = JSON.parse(readFileSync(join(aiRoot, 'package.json'), 'utf8'));
+    if (ai.name !== '@earendil-works/pi-ai' || ai.version !== '1.5.2') rejected();
     mkdirSync(directory, { mode: 0o700 });
     ownedDirectory = directory;
     const agent = join(directory, 'pi-agent');
@@ -117,7 +120,6 @@ async function main(packageRoot, sessionDir) {
     chmodSync(socketPath, 0o600);
     stage = 'provider_login';
     // Only this fresh store is passed to the SDK; the host agent store is never opened.
-    const aiRoot = resolve(packageRoot, '../pi-ai');
     const { createModels } = await import(pathToFileURL(join(aiRoot, 'dist/models.js')).href);
     const { openaiCodexProvider } = await import(pathToFileURL(join(aiRoot, 'dist/providers/openai-codex.js')).href);
     const { AuthStorage } = await import(pathToFileURL(join(packageRoot, 'dist/core/auth-storage.js')).href);

@@ -68,10 +68,6 @@ export function startEgress(options = {}) {
       upstream.setTimeout(120000, finish);
       upstream.once('error', finish);
       upstream.once('close', finish);
-      let bytes = head.length;
-      const bound = data => { bytes += data.length; if (bytes > 64 * 1024 * 1024) finish(); };
-      client.on('data', bound);
-      upstream.on('data', bound);
       upstream.once('connect', () => {
         if (closed) return;
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');

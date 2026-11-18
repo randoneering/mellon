@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -77,3 +78,17 @@ for (const input of [
     assert.throws(() => validateAuthorizationUrl(input), /Worker authorization input rejected/);
   });
 }
+
+test('an unexpected sibling pi-ai version is rejected before login setup', () => {
+  const root = mkdtempSync(join(tmpdir(), 'mellon-auth-sdk-test-'));
+  const coding = join(root, 'pi-coding-agent');
+  mkdirSync(coding);
+  mkdirSync(join(root, 'pi-ai'));
+  writeFileSync(join(coding, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-coding-agent', version: '1.5.2' }));
+  writeFileSync(join(root, 'pi-ai/package.json'), JSON.stringify({ name: '@earendil-works/pi-ai', version: '1.5.3' }));
+  const session = join(tmpdir(), 'mellon-factory-auth-' + randomBytes(6).toString('hex'));
+  const run = spawnSync(process.execPath, ['internal/factory-worker/auth-session.mjs', coding, session], { encoding: 'utf8' });
+  assert.equal(run.status, 1);
+  assert.equal(JSON.parse(run.stdout).stage, 'session_setup');
+  assert.equal(existsSync(session), false);
+});

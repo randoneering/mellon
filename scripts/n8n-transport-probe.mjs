@@ -1,12 +1,14 @@
 import { createHash } from 'node:crypto';
 
-export const READ_ONLY_QUERY = 'query ReadOnlyPublicationTransportProbe { rateLimit { limit remaining } }';
+import transport from '../internal/n8n/MellonTransport.node.js';
+
+export const READ_ONLY_QUERY = transport.QUERY;
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 const MAX_RESPONSE_CHARACTERS = 16 * 1024 * 1024;
 const SAFE_ERROR = 'Transport probe input failed validation.';
 const PINNED = {
   baseSha: '24fc799c98040c02b11af5d5831e8e443248b41e',
-  blobSha: '912127067f44573328ae5a13e5b0d8e7f6a1a118',
+  blobSha: transport.BLOB_SHA,
   caseCount: 6,
 };
 const CATEGORIES = ['ok', 'http_499', 'http_error', 'graphql_error', 'invalid_response', 'transport_error', 'rate_limited'];
@@ -16,7 +18,7 @@ function validPins(expected) {
     && /^[a-f0-9]{40}$/.test(expected.blobSha);
 }
 
-export function createProbeCases(blob, expected) {
+function verifiedBlob(blob, expected) {
   if (!validPins(expected) || !blob || blob.sha !== expected.blobSha
       || blob.encoding !== 'base64' || typeof blob.content !== 'string'
       || !Number.isSafeInteger(blob.size) || blob.size <= 0 || blob.size > MAX_REQUEST_BYTES
@@ -27,6 +29,11 @@ export function createProbeCases(blob, expected) {
   if (data.length !== blob.size || data.toString('base64') !== compact) throw new Error(SAFE_ERROR);
   const hash = createHash('sha1').update(`blob ${data.length}\0`).update(data).digest('hex');
   if (hash !== expected.blobSha) throw new Error(SAFE_ERROR);
+  return data;
+}
+
+export function createProbeCases(blob, expected) {
+  const data = verifiedBlob(blob, expected);
   const sizes = [...new Set([0, 65_536, 262_144, 1_048_576, 2_097_152, data.length])]
     .filter(size => size <= data.length).sort((a, b) => a - b);
   return sizes.map((size, index) => {
@@ -160,12 +167,13 @@ export function summarizeBlobFetch(response, expected = PINNED, synthetic = fals
   else if (status === 499) category = 'http_499';
   else if (status === 429 || status === 403 && headers.rate_limit_remaining === 0) category = 'rate_limited';
   else if (status !== 200) category = 'http_error';
-  else if (!body || body.sha !== expected.blobSha || body.encoding !== 'base64'
-      || !Number.isSafeInteger(body.size) || body.size <= 0 || body.size > MAX_REQUEST_BYTES
-      || typeof body.content !== 'string') category = 'invalid_response';
+  else if (typeof createHash !== 'function') category = 'blob_validation_unavailable';
+  else {
+    try { verifiedBlob(body, expected); } catch { category = 'invalid_response'; }
+  }
   return { purpose: 'Read-only GitHub transport diagnostic', phase: 'blob_response', synthetic,
     base_sha: expected.baseSha, blob_sha: expected.blobSha, read_only: true, factory_ready: false,
-    source_hash_verified: false, status, node_error_code: nodeErrorCode(response), category, ...headers };
+    source_hash_verified: category === 'ok', status, node_error_code: nodeErrorCode(response), category, ...headers };
 }
 
 export function summarizeProbe(response, started, stoppedAt = Date.now(), expected = PINNED) {
@@ -181,7 +189,9 @@ export function summarizeProbe(response, started, stoppedAt = Date.now(), expect
   else if (status === 499) category = 'http_499';
   else if (status === 429 || status === 403 && remaining === 0) category = 'rate_limited';
   else if (status < 200 || status >= 300) category = 'http_error';
-  else if (Array.isArray(body?.errors) && body.errors.length) category = 'graphql_error';
+  else if (Array.isArray(body?.errors) && body.errors.length) {
+    category = body.errors.every(error => error && typeof error.message === 'string' && error.message.trim()) ? 'graphql_error' : 'invalid_response';
+  }
   else if (!validQuotaResponse(body)) category = 'invalid_response';
   return {
     base_sha: expected.baseSha,
@@ -249,10 +259,6 @@ export function createProbeWorkflow(options = {}) {
       || typeof reportTableId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(reportTableId)) throw new Error(SAFE_ERROR);
   const pins = JSON.stringify(PINNED);
   const constants = `const PINNED = ${pins};\nconst READ_ONLY_QUERY = ${JSON.stringify(READ_ONLY_QUERY)};\nconst MAX_REQUEST_BYTES = ${MAX_REQUEST_BYTES};\nconst MAX_RESPONSE_CHARACTERS = ${MAX_RESPONSE_CHARACTERS};\nconst SAFE_ERROR = ${JSON.stringify(SAFE_ERROR)};`;
-  const responseOptions = (neverError = true) => ({
-    timeout: 20_000, redirect: { redirect: { followRedirects: false } },
-    response: { response: { fullResponse: true, neverError, responseFormat: 'text', outputPropertyName: 'body' } },
-  });
   const credentials = { githubAppApi: { id: credential.id, name: credential.name } };
   const synthetic = "syntheticMarker($('Record diagnostic start').first().json)";
   const encodeReport = value => `={{ JSON.stringify(${value}) }}`;
@@ -275,16 +281,15 @@ export function createProbeWorkflow(options = {}) {
     store('probe-record-start', 'Record diagnostic start', [224, 0],
       encodeReport(`{ phase: 'started', ${context}, synthetic: $json.synthetic === true, read_only: true, factory_ready: false }`)),
     // Swallowing a GET 401 can skip n8n's native credential refresh.
-    { id: 'probe-blob', name: 'Read pinned public blob', type: 'n8n-nodes-base.httpRequest', typeVersion: 4.5, position: [448, 0], credentials, onError: 'continueRegularOutput', alwaysOutputData: true,
-      parameters: { method: 'GET', url: `https://api.github.com/repos/randoneering/mellon/git/blobs/${PINNED.blobSha}`,
-        authentication: 'predefinedCredentialType', nodeCredentialType: 'githubAppApi', options: responseOptions(false) } },
+    { id: 'probe-blob', name: 'Read pinned public blob', type: 'CUSTOM.mellonTransport', typeVersion: 1, position: [448, 0], credentials, onError: 'continueRegularOutput', alwaysOutputData: true,
+      parameters: { operation: 'blob' } },
     { id: 'probe-blob-status', name: 'Sanitize blob status', type: 'n8n-nodes-base.code', typeVersion: 2, position: [672, 0],
       parameters: { mode: 'runOnceForEachItem', language: 'javaScript', jsCode:
-        `${constants}\n${shared}\n${summarizeBlobFetch.toString()}\nreturn { json: summarizeBlobFetch($json, PINNED, ${synthetic}) };` } },
+        `${constants}\nlet createHash; try { ({ createHash } = require('crypto')); } catch {}\n${shared}\n${verifiedBlob.toString()}\n${summarizeBlobFetch.toString()}\nreturn { json: summarizeBlobFetch($json, PINNED, ${synthetic}) };` } },
     store('probe-record-blob', 'Record blob status', [896, 0], encodeReport('$json')),
     { id: 'probe-prepare', name: 'Prepare bounded probes', type: 'n8n-nodes-base.code', typeVersion: 2, position: [1120, 0],
       parameters: { mode: 'runOnceForAllItems', language: 'javaScript', jsCode:
-        `${constants}\nconst { createHash } = require('crypto');\n${shared}\n${createProbeCases.toString()}\nconst response = $('Read pinned public blob').first().json;\nif (confirmedStatus(response) !== 200) throw new Error(SAFE_ERROR);\nreturn createProbeCases(jsonResponseBody(response), PINNED).map(json => ({ json: { ...json, synthetic: ${synthetic} } }));` } },
+        `${constants}\nconst { createHash } = require('crypto');\n${shared}\n${verifiedBlob.toString()}\n${createProbeCases.toString()}\nconst response = $('Read pinned public blob').first().json;\nif (confirmedStatus(response) !== 200) throw new Error(SAFE_ERROR);\nreturn createProbeCases(jsonResponseBody(response), PINNED).map(json => ({ json: { ...json, synthetic: ${synthetic} } }));` } },
     { id: 'probe-loop', name: 'One probe at a time', type: 'n8n-nodes-base.splitInBatches', typeVersion: 3, position: [1344, 0], parameters: { batchSize: 1, options: {} } },
     { id: 'probe-clock', name: 'Start probe', type: 'n8n-nodes-base.code', typeVersion: 2, position: [1568, 160],
       parameters: { mode: 'runOnceForEachItem', language: 'javaScript', jsCode:
@@ -292,9 +297,8 @@ export function createProbeWorkflow(options = {}) {
     store('probe-record-prepared', 'Record prepared request', [1792, 160],
       encodeReport(`{ phase: 'request_prepared', ${context}, synthetic: $json.synthetic === true, case_id: $json.case_id,
         decoded_bytes: $json.decoded_bytes, request_bytes: $json.request_bytes, started_at_ms: $json.started_at_ms }`)),
-    { id: 'probe-http', name: 'Read-only GraphQL request', type: 'n8n-nodes-base.httpRequest', typeVersion: 4.5, position: [2016, 160], credentials, onError: 'continueRegularOutput', alwaysOutputData: true,
-      parameters: { method: 'POST', url: 'https://api.github.com/graphql', authentication: 'predefinedCredentialType', nodeCredentialType: 'githubAppApi',
-        sendBody: true, specifyBody: 'json', jsonBody: "={{ JSON.stringify($('Start probe').first(0, $runIndex).json.request_body) }}", options: responseOptions() } },
+    { id: 'probe-http', name: 'Read-only GraphQL request', type: 'CUSTOM.mellonTransport', typeVersion: 1, position: [2016, 160], credentials, onError: 'continueRegularOutput', alwaysOutputData: true,
+      parameters: { operation: 'quota', requestBody: "={{ JSON.stringify($('Start probe').first(0, $runIndex).json.request_body) }}" } },
     { id: 'probe-sanitize', name: 'Sanitize probe result', type: 'n8n-nodes-base.code', typeVersion: 2, position: [2240, 160],
       parameters: { mode: 'runOnceForEachItem', language: 'javaScript', jsCode:
         `${constants}\n${shared}\n${validateProbe.toString()}\n${validQuotaResponse.toString()}\n${summarizeProbe.toString()}\nconst request = $('Start probe').first(0, $runIndex).json;\nreturn { json: { ...summarizeProbe($json, request, Date.now()), synthetic: request.synthetic === true } };` } },

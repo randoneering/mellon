@@ -149,3 +149,30 @@ test('concurrent relay processes admit exactly the remaining allowance', async t
   assert.deepEqual(responses.map(r => r.status).sort(), [200, 429]);
   assert.equal(first.calls.length + second.calls.length, 1);
 });
+
+test('revocation waits for an admitted upstream request to abort', async t => {
+  const started = Promise.withResolvers();
+  const r = await relay(t, { upstream: async (_url, { signal }) => {
+    started.resolve(signal);
+    return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('cancelled')), { once: true }));
+  } });
+  const grant = await issueGrant(r.grantsDir, { jobId: JOB, ttlMs: 60000, maxRequests: 1 });
+  const pending = send(r.url, grant.capability);
+  const signal = await started.promise;
+  await revokeGrant(r.grantsDir, grant.grantId);
+  assert.equal(signal.aborted, true);
+  assert.equal((await pending).status, 502);
+});
+
+test('revocation during credential lookup prevents dispatch', async t => {
+  const started = Promise.withResolvers();
+  const credential = Promise.withResolvers();
+  const r = await relay(t, { config: { getAccessToken: () => { started.resolve(); return credential.promise; } } });
+  const grant = await issueGrant(r.grantsDir, { jobId: JOB, ttlMs: 60000, maxRequests: 1 });
+  const pending = send(r.url, grant.capability);
+  await started.promise;
+  await revokeGrant(r.grantsDir, grant.grantId);
+  credential.resolve(REAL);
+  assert.equal((await pending).status, 401);
+  assert.equal(r.calls.length, 0);
+});

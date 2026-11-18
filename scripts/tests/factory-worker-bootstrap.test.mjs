@@ -193,3 +193,17 @@ test('unsafe inspection prevents start and stops only the newly confirmed contai
   assert.equal(calls.some(c => c[0] === 'start'), false);
   assert.deepEqual(calls.at(-1), ['stop', '--time', '15', ID]);
 });
+
+test('an otherwise verified run reports the failed stop as its primary failure', async () => {
+  const report = await runContainer(IMAGE, NAME, async args => {
+    if (args[0] === 'inspect') return { status: 0, stdout: JSON.stringify([workerInspection(IMAGE, NAME, ID)]) };
+    if (args[0] === 'exec') return { status: 0, stdout: JSON.stringify({ ok: true, serverAuthenticated: true,
+      rpcInventoryVerified: true, piInstalled: true, piVersion: '1.5.2', piAuth: 'unauthenticated', innerBoundaryVerified: true }) };
+    return { status: args[0] === 'stop' ? 1 : 0, stdout: ID };
+  });
+  assert.equal(report.ok, false);
+  assert.equal(report.stage, 'container_stop');
+  assert.equal(report.category, 'command_failed');
+  assert.equal(report.containerId, ID);
+  assert.equal(report.smoke.innerBoundaryVerified, true);
+});

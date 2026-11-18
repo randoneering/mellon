@@ -1038,6 +1038,30 @@ test('launch waits for the T3 service after a worker start, and blocks if it nev
   assert.equal(starts, 0);
 });
 
+test('readiness rejects a successful probe that arrives past its overall deadline', async t => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-readiness-deadline-'));
+  const late = async args => {
+    if (!String(args.at(-1)).includes('mellon-t3-ready')) return;
+    now += 90001;
+    return { status: 0, stdout: 'mellon-t3-ready' };
+  };
+  const log = [];
+  const app = await running(buildConfig(dir), t3Emulator().run, undefined, log, late);
+  t.after(() => stop(app.server));
+  assert.equal((await post(app.url, JOB)).status, 202);
+  const until = Date.now() + 5000;
+  let job;
+  do {
+    job = await (await call(app.url, '/jobs/' + JOB.jobId)).json();
+    if (job.state === 'blocked') break;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  } while (Date.now() < until);
+  assert.equal(job.stage, 'worker_not_ready');
+  assert.equal(log.some(entry => entry[0] === 'issue'), false);
+});
+
 test('a new pause after an unchanged owner fix accepts a fresh assessment claim', async t => {
   const emulator = t3Emulator({ contents: ['same\n'] });
   const reviewer = twoFindings();

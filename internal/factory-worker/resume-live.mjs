@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { verifyJobInspection, verifyPrivateNetwork, verifyWorkerVolume, workerModelConfiguration } from './job-policy.mjs';
 
 import { liveSetupProgram } from './live-setup.mjs';
-import { modelConfigMatches, readinessWithGrant, verifyRelayInspection } from './relay-setup.mjs';
+import { modelConfigMatches, readinessWithGrant, verifyRelayInspection, verifyProxyNetworks } from './relay-setup.mjs';
 import { safeReadiness } from './provision-live.mjs';
 
 const DIR = dirname(fileURLToPath(import.meta.url));
@@ -15,6 +15,7 @@ const ROOT = resolve(DIR, '../..');
 const file = join(ROOT, '.pi/artifacts/factory-live/deployment.json');
 const result = JSON.parse(await readFile(file, 'utf8'));
 let stage = 'owned_resource_verification';
+const attemptedStarts = [];
 const docker = (args, input, timeout = 30000) => {
   const r = spawnSync('docker', args, { input, encoding: 'utf8', timeout, maxBuffer: 2 * 1024 * 1024 });
   if (r.status !== 0) throw new Error('Private worker operation failed.');
@@ -28,6 +29,8 @@ try {
   verifyJobInspection(worker, imageId, config);
   if (worker.State.Running !== false) throw new Error('Worker is not idle/stopped.');
   const proxy = JSON.parse(docker(['inspect', resources.proxyId]))[0];
+  const outboundId = docker(['network', 'inspect', '--format', '{{.Id}}', 'n8n_default']);
+  verifyProxyNetworks(proxy, config, outboundId);
   if (proxy.Name !== `/${config.proxyName}` || proxy.Image !== (resources.proxyImageId ?? imageId)
       || proxy.Config.User !== '10001:10001' || proxy.HostConfig.Privileged !== false
       || proxy.HostConfig.ReadonlyRootfs !== true || proxy.Mounts.length
@@ -45,9 +48,10 @@ try {
     provider: 'openai-codex', id: 'gpt-6.1-sol', source: 'Existing public model catalog cache; whitelisted fields only',
     sha256: createHash('sha256').update(JSON.stringify(modelConfig)).digest('hex'),
   };
-  docker(['start', resources.proxyId]);
-  docker(['start', resources.relayId]);
-  docker(['start', resources.workerId]);
+  for (const id of [resources.proxyId, resources.relayId, resources.workerId]) {
+    attemptedStarts.push(id);
+    docker(['start', id]);
+  }
   stage = 'worker_model_metadata';
   const program = `import fs from 'node:fs';
 if(process.getuid()!==10001||process.env.PI_CODING_AGENT_DIR!=='/worker-state/pi-agent')throw new Error('Wrong worker.');
@@ -74,8 +78,7 @@ else{fs.writeFileSync(path,JSON.stringify(config),{flag:'wx',mode:0o600});consol
   Object.assign(result, { ok: true, stage: 'complete', category: 'private_worker_ready' });
 } catch {
   Object.assign(result, { ok: false, stage, category: 'private_worker_verification_failed' });
-  for (const id of [result.resources?.workerId, result.resources?.relayId, result.resources?.proxyId]) {
-    if (!id) continue;
+  for (const id of attemptedStarts.reverse()) {
     try { docker(['stop', '--time', '15', id]); } catch { result.stopFailure = true; }
   }
 }

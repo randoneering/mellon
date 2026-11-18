@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
-  relayPrepArgs, relayCredentialArgs, workerStateArgs, modelConfigMatches, verifyRelayInspection, readinessWithGrant,
+  relayPrepArgs, relayCredentialArgs, workerStateArgs, modelConfigMatches, verifyRelayInspection, verifyProxyNetworks, readinessWithGrant,
 } from '../../internal/factory-worker/relay-setup.mjs';
 
 const IMAGE = `sha256:${'a'.repeat(64)}`;
@@ -126,4 +126,15 @@ test('readiness fails closed when the grant cannot be revoked', async () => {
     return '{"installed":"mellon-capability"}';
   };
   await assert.rejects(readinessWithGrant({ docker, relayId: 'e'.repeat(64), workerId: 'd'.repeat(64), suffix: SUFFIX }, async () => ({ ok: true })), /revocation/);
+});
+
+test('resume requires the exact private and outbound networks on the proxy', () => {
+  const config = { network: 'private', networkId: 'a'.repeat(64) };
+  const outboundId = 'b'.repeat(64);
+  const links = { private: { NetworkID: config.networkId }, n8n_default: { NetworkID: outboundId } };
+  const check = Networks => verifyProxyNetworks({ NetworkSettings: { Networks } }, config, outboundId);
+  check(links);
+  for (const invalid of [{}, { private: links.private }, { ...links, private: links.n8n_default }, { ...links, extra: {} }]) {
+    assert.throws(() => check(invalid), /network mismatch/);
+  }
 });

@@ -24,7 +24,7 @@ test('controller authentication requires the exact non-worker credential', () =>
 });
 
 test('T3 status is bound to the requested Pi thread and never returns assistant content', () => {
-  const value = { thread: { threadId: 'thread-id', projectId: CONFIG.projectId, providerInstanceId: 'pi', model: CONFIG.model, status: 'working', latestRunId: 'run-id' }, recentRuns: [], items: [{ text: 'private-output-canary' }] };
+  const value = { thread: { threadId: 'thread-id', projectId: CONFIG.projectId, providerInstanceId: 'pi', model: CONFIG.model, status: 'working', pendingRequestCount: 0, latestRunId: 'run-id' }, recentRuns: [], items: [{ text: 'private-output-canary' }] };
   const report = safeThreadState(value, 'thread-id', CONFIG);
   assert.equal(report.status, 'working');
   assert.equal(JSON.stringify(report).includes('private-output-canary'), false);
@@ -36,10 +36,13 @@ test('T3 status is bound to the requested Pi thread and never returns assistant 
 test('completion without recentRuns needs completed status, no active run, zero pending and a latest run', () => {
   const base = { threadId: 'thread-id', projectId: CONFIG.projectId, providerInstanceId: 'pi', model: CONFIG.model, status: 'completed', activeRunId: null, latestRunId: 'run-id', pendingRequestCount: 0 };
   assert.equal(safeThreadState({ thread: base, messages: [] }, 'thread-id', CONFIG).complete, true);
-  for (const change of [{ status: 'running' }, { activeRunId: 'run-id' }, { pendingRequestCount: 1 }, { pendingRequestCount: undefined }, { latestRunId: null }]) {
+  for (const change of [{ status: 'running' }, { activeRunId: 'run-id' }, { pendingRequestCount: 1 }, { latestRunId: null }]) {
     assert.equal(safeThreadState({ thread: { ...base, ...change }, messages: [] }, 'thread-id', CONFIG).complete, false);
   }
   assert.equal(safeThreadState({ thread: base, recentRuns: [{ runId: 'run-id', status: 'failed' }] }, 'thread-id', CONFIG).complete, false);
+  for (const count of [undefined, -1, 0.5, '0']) {
+    assert.throws(() => safeThreadState({ thread: { ...base, pendingRequestCount: count } }, 'thread-id', CONFIG));
+  }
   assert.equal(safeThreadState({ thread: base, recentRuns: [] }, 'thread-id', CONFIG).complete, false);
 });
 
