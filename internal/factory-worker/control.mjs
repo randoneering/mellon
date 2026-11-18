@@ -14,18 +14,25 @@ const RELAY_PORT = 8790;
 // Any HTTP answer on T3's local port means its server is listening.
 export const T3_READY_PROGRAM = "fetch('http://127.0.0.1:3773/',{signal:AbortSignal.timeout(2000)}).then(()=>console.log('mellon-t3-ready'),()=>process.exit(1))";
 
+// Pi caches a literal apiKey for the life of its session, so a later grant would be
+// ignored by a reused session. A !command runs at request time, so models.json keeps
+// this fixed command and each grant round rewrites only the capability file.
+export const CAPABILITY_COMMAND = '!cat /worker-state/pi-agent/relay-capability';
+
 // Runs inside the worker. The capability arrives on stdin, never in argv.
 export const CAPABILITY_PROGRAM = `import fs from 'node:fs';
 if(process.getuid()!==10001||process.env.PI_CODING_AGENT_DIR!=='/worker-state/pi-agent')throw new Error('Wrong worker.');
 let input='';for await(const c of process.stdin)input+=c;
 const {baseUrl,apiKey}=JSON.parse(input);
+if(typeof apiKey!=='string'||!/^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$/.test(apiKey))throw new Error('Bad capability.');
 const dir='/worker-state/pi-agent',file=dir+'/models.json',tmp=file+'.mellon-tmp';
 const config=JSON.parse(fs.readFileSync(file,'utf8'));
 const provider=config.providers?.['openai-codex'];
 if(Object.keys(config.providers??{}).join()!=='openai-codex'||provider?.models?.length!==1||provider.models[0].id!=='gpt-6.1-sol')throw new Error('Unexpected model config.');
 const auth=JSON.parse(fs.readFileSync(dir+'/auth.json','utf8'));
 if(Object.keys(auth).length)throw new Error('Worker still holds a model credential.');
-provider.baseUrl=baseUrl;provider.apiKey=apiKey;provider.models[0].baseUrl=baseUrl;
+const cap=dir+'/relay-capability';fs.writeFileSync(cap+'.mellon-tmp',apiKey,{flag:'w',mode:0o600});fs.renameSync(cap+'.mellon-tmp',cap);
+provider.baseUrl=baseUrl;provider.apiKey=${JSON.stringify(CAPABILITY_COMMAND)};provider.models[0].baseUrl=baseUrl;
 fs.writeFileSync(tmp,JSON.stringify(config),{flag:'w',mode:0o600});fs.renameSync(tmp,file);
 console.log(JSON.stringify({installed:'mellon-capability'}));`;
 

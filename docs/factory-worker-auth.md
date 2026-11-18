@@ -51,7 +51,8 @@ It accepts only `POST /backend-api/codex/responses` for `gpt-6.1-sol` and refuse
 It forwards to one fixed upstream URL, replacing the worker's authorization and account headers with trusted values.
 
 The worker keeps an empty `auth.json`.
-For each job, the controller issues a grant on the relay, then writes a JWT-shaped capability into the worker's `models.json` over stdin.
+For each job, the controller issues a grant on the relay, then writes a JWT-shaped capability to the worker's `pi-agent/relay-capability` file over stdin.
+`models.json` keeps a fixed `apiKey` of `!cat /worker-state/pi-agent/relay-capability`, which Pi runs on every request, so a session that outlives one grant picks up the next.
 The capability names a random grant ID and carries a placeholder account claim, because the unchanged Pi Codex client parses one locally.
 Grants expire with the job and cap the request count.
 The relay re-reads the grant file on every request, so revocation takes effect immediately.

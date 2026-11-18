@@ -78,3 +78,29 @@ test('jobs declare requiresRebuild, and it must match their paths', () => {
     assert.throws(() => validateControlJob(bad, {}), /Factory controller input rejected/);
   }
 });
+
+test('each grant round rewrites only the capability file; models.json keeps a request-time command', async () => {
+  const { CAPABILITY_PROGRAM, CAPABILITY_COMMAND } = await import('../../internal/factory-worker/control.mjs');
+  const { mkdtemp, mkdir, writeFile, readFile, stat } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { spawnSync } = await import('node:child_process');
+  const dir = join(await mkdtemp(join(tmpdir(), 'mellon-capability-')), 'pi-agent');
+  await mkdir(dir, { mode: 0o700 });
+  await writeFile(join(dir, 'auth.json'), '{}');
+  await writeFile(join(dir, 'models.json'), JSON.stringify({ providers: { 'openai-codex': { models: [{ id: 'gpt-6.1-sol', baseUrl: 'https://chatgpt.com/backend-api' }] } } }));
+  const program = CAPABILITY_PROGRAM.replace("process.getuid()!==10001||process.env.PI_CODING_AGENT_DIR!=='/worker-state/pi-agent'", 'false').replace("const dir='/worker-state/pi-agent'", `const dir=${JSON.stringify(dir)}`);
+  const install = apiKey => spawnSync(process.execPath, ['--input-type=module', '-e', program], { input: JSON.stringify({ baseUrl: 'http://mellon-factory-relay-012345abcdef:8790/backend-api', apiKey }), encoding: 'utf8' });
+  assert.equal(install('a.first.c').status, 0);
+  const first = await readFile(join(dir, 'models.json'), 'utf8');
+  assert.equal(await readFile(join(dir, 'relay-capability'), 'utf8'), 'a.first.c');
+  assert.equal((await stat(join(dir, 'relay-capability'))).mode & 0o777, 0o600);
+  const provider = JSON.parse(first).providers['openai-codex'];
+  assert.equal(provider.apiKey, CAPABILITY_COMMAND);
+  assert.equal(provider.apiKey, `!cat /worker-state/pi-agent/relay-capability`);
+  assert.equal(first.includes('a.first.c'), false);
+  assert.equal(install('a.second.c').status, 0);
+  assert.equal(await readFile(join(dir, 'relay-capability'), 'utf8'), 'a.second.c');
+  assert.equal(await readFile(join(dir, 'models.json'), 'utf8'), first);
+  assert.notEqual(install('bad capability').status, 0);
+});
