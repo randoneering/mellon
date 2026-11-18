@@ -1004,3 +1004,104 @@ test('an owner send-back tells T3 the owner wants each finding fixed, with ratin
   const automatic = fixMessage([FINDING]);
   assert.match(automatic, /leave it unchanged if it is not valid/);
 });
+
+// Rebuild publications: tracked stages with their own deadlines and an exact head chain.
+const REBUILD_JOB = { ...JOB, allowedPaths: ['src/inputs.mjs', 'tests/unit/inputs.test.mjs'], requiresRebuild: true };
+async function approvedRebuild(t, extra = {}) {
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-rebuild-'));
+  const emulator = t3Emulator();
+  const exportFiles = async args => (args[0] === 'exec' && args.includes('--input-type=module') && args.at(-1) === '-' && !args.includes('-e'))
+    ? { status: 0, stdout: JSON.stringify({ baseSha: JOB.baseSha, files: [{ path: 'src/inputs.mjs', content: 'export const x = 1;\n' }, { path: 'tests/unit/inputs.test.mjs', content: 'test\n' }] }) } : undefined;
+  const app = await running({ ...buildConfig(dir), ...extra }, emulator.run, reviewSequence(['approved']).fn, [], exportFiles);
+  t.after(() => stop(app.server));
+  assert.equal((await post(app.url, REBUILD_JOB)).status, 202);
+  let value;
+  for (let i = 0; i < 12; i++) { await new Promise(r => setTimeout(r, 15)); value = await (await call(app.url, '/jobs/' + JOB.jobId)).json(); if (value.state === 'approved') break; }
+  assert.equal(value.state, 'approved');
+  const proposal = await (await call(app.url, `/jobs/${JOB.jobId}/proposal`)).json();
+  assert.equal(proposal.structuredOutput.requires_dist_rebuild, true);
+  return app;
+}
+const stage = (app, body) => call(app.url, `/jobs/${JOB.jobId}/publication-stage`, 'POST', body);
+const SRC = 'a'.repeat(40), G1 = 'b'.repeat(40), G2 = 'c'.repeat(40);
+
+test('publication stages advance only in order, and the runner stage is for rebuild jobs', async t => {
+  const app = await approvedRebuild(t);
+  assert.equal((await stage(app, { stage: 'source_committed', commitSha: SRC })).status, 409);
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' })).status, 200);
+  assert.equal((await stage(app, { stage: 'runner', requestId: 'n8n-1000001' })).status, 409);
+  assert.equal((await stage(app, { stage: 'source_committed', commitSha: 'zz' })).status, 400);
+  const committed = await (await stage(app, { stage: 'source_committed', commitSha: SRC })).json();
+  assert.equal(committed.publishStage, 'source_committed');
+  assert.equal(committed.publishHead, SRC);
+  assert.equal((await stage(app, { stage: 'source_committed', commitSha: SRC })).status, 409);
+  assert.equal((await stage(app, { stage: 'runner', requestId: 'bad id' })).status, 400);
+  assert.equal((await stage(app, { stage: 'runner', requestId: 'n8n-1000001' })).status, 200);
+  assert.equal((await stage(app, { stage: 'mystery' })).status, 400);
+});
+
+test('generated commits must chain from the recorded head, once per generated path', async t => {
+  const app = await approvedRebuild(t);
+  await call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' });
+  await stage(app, { stage: 'source_committed', commitSha: SRC });
+  await stage(app, { stage: 'runner', requestId: 'n8n-1000001' });
+  assert.equal((await stage(app, { stage: 'generated', expectedHead: SRC, headSha: G1, path: 'dist/index.mjs' })).status, 409, 'generated needs a built stage first');
+  assert.equal((await stage(app, { stage: 'built', runId: 'x', changedPaths: [] })).status, 400);
+  assert.equal((await stage(app, { stage: 'built', runId: '123', changedPaths: ['src/inputs.mjs'] })).status, 400);
+  assert.equal((await stage(app, { stage: 'built', runId: '123', changedPaths: ['dist/index.mjs', 'dist/build-meta.json'] })).status, 200);
+  assert.equal((await stage(app, { stage: 'generated', expectedHead: G1, headSha: G2, path: 'dist/index.mjs' })).status, 409);
+  assert.equal((await stage(app, { stage: 'generated', expectedHead: SRC, headSha: G1, path: 'src/inputs.mjs' })).status, 400);
+  assert.equal((await stage(app, { stage: 'generated', expectedHead: SRC, headSha: G1, path: 'dist/scorer.mjs' })).status, 409, 'not a changed path');
+  assert.equal((await stage(app, { stage: 'generated', expectedHead: SRC, headSha: SRC, path: 'dist/index.mjs' })).status, 400);
+  const first = await (await stage(app, { stage: 'generated', expectedHead: SRC, headSha: G1, path: 'dist/index.mjs' })).json();
+  assert.equal(first.publishHead, G1);
+  assert.equal((await stage(app, { stage: 'generated', expectedHead: G1, headSha: G2, path: 'dist/index.mjs' })).status, 409);
+  assert.equal((await stage(app, { stage: 'generated', expectedHead: G1, headSha: G2, path: 'dist/build-meta.json' })).status, 200);
+  // Publication must name the last generated head.
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/published`, 'POST', { prNumber: 9, prUrl: 'https://github.com/randoneering/mellon/pull/9', commitSha: G1 })).status, 409);
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/published`, 'POST', { prNumber: 9, prUrl: 'https://github.com/randoneering/mellon/pull/9', commitSha: G2 })).status, 200);
+});
+
+test('a live runner stage holds the claim past the plain claim age; an overrun stage can be released', async t => {
+  const app = await approvedRebuild(t, { publicationClaimMs: 20, runnerStageMs: 120 });
+  await call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' });
+  await stage(app, { stage: 'source_committed', commitSha: SRC });
+  const runner = await (await stage(app, { stage: 'runner', requestId: 'n8n-1000001' })).json();
+  assert.ok(runner.publishDeadlineAt > Date.now() + 60);
+  await new Promise(r => setTimeout(r, 50));
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/publication-failed`, 'POST', { reason: 'uncertain' })).status, 409);
+  await new Promise(r => setTimeout(r, 100));
+  const released = await call(app.url, `/jobs/${JOB.jobId}/publication-failed`, 'POST', { reason: 'uncertain' });
+  assert.equal(released.status, 200);
+  assert.equal((await released.json()).stage, 'publication_uncertain');
+});
+
+test('the runner stage budget is bounded', async () => {
+  for (const runnerStageMs of [0, 3 * 3600000, 1.5]) {
+    assert.throws(() => createControlServer({ ...buildConfig('/tmp/x'), ...RELAY, runnerStageMs }), /Controller budget rejected/);
+  }
+});
+
+test('a rebuild job cannot be published before its build is recorded and every changed file is committed', async t => {
+  const app = await approvedRebuild(t);
+  const publish = commitSha => call(app.url, `/jobs/${JOB.jobId}/published`, 'POST', { prNumber: 9, prUrl: 'https://github.com/randoneering/mellon/pull/9', commitSha });
+  await call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' });
+  await stage(app, { stage: 'source_committed', commitSha: SRC });
+  assert.equal((await publish(SRC)).status, 409, 'no runner yet');
+  await stage(app, { stage: 'runner', requestId: 'n8n-1000001' });
+  assert.equal((await publish(SRC)).status, 409, 'runner not finished');
+  await stage(app, { stage: 'built', runId: '123', changedPaths: ['dist/index.mjs'] });
+  assert.equal((await publish(SRC)).status, 409, 'changed file not committed');
+  await stage(app, { stage: 'generated', expectedHead: SRC, headSha: G1, path: 'dist/index.mjs' });
+  assert.equal((await publish(G1)).status, 200);
+});
+
+test('a rebuild whose generated files are unchanged publishes on the source commit', async t => {
+  const app = await approvedRebuild(t);
+  await call(app.url, `/jobs/${JOB.jobId}/claim`, 'POST', { action: 'publish' });
+  await stage(app, { stage: 'source_committed', commitSha: SRC });
+  await stage(app, { stage: 'runner', requestId: 'n8n-1000001' });
+  const built = await (await stage(app, { stage: 'built', runId: '123', changedPaths: [] })).json();
+  assert.equal(built.publishStage, 'built');
+  assert.equal((await call(app.url, `/jobs/${JOB.jobId}/published`, 'POST', { prNumber: 9, prUrl: 'https://github.com/randoneering/mellon/pull/9', commitSha: SRC })).status, 200);
+});

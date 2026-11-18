@@ -66,3 +66,26 @@ test('candidate review runs on a named local branch so Qodo can build a finding 
   assert.throws(() => candidateCheckoutCommands('/r', 'main', EXPECTED.candidateDigest), /rejected/);
   assert.throws(() => candidateCheckoutCommands('/r', EXPECTED.baseSha, 'not-a-digest'), /rejected/);
 });
+
+test('the review clone applies edits and planned deletions, staging both, and refuses symlinks', async () => {
+  const { applyCandidateFiles } = await import('../../internal/factory-worker/review.mjs');
+  const { mkdtemp, writeFile, symlink, readFile, access } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { execFileSync } = await import('node:child_process');
+  const root = await mkdtemp(join(tmpdir(), 'mellon-review-apply-'));
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+  const git = async args => execFileSync('git', ['-C', root, '-c', 'user.name=t', '-c', 'user.email=t@invalid', '-c', 'commit.gpgsign=false', ...args], { encoding: 'utf8', env, timeout: 20000 }).trim();
+  await git(['init', '-q']);
+  await writeFile(join(root, 'README.md'), 'base\n');
+  await writeFile(join(root, 'old.md'), 'old\n');
+  await git(['add', '.']); await git(['commit', '-q', '-m', 'base']);
+  await applyCandidateFiles(root, [{ path: 'README.md', content: 'new\n' }, { path: 'old.md', deleted: true }, { path: 'docs/added.md', content: 'added\n' }], git);
+  assert.equal(await readFile(join(root, 'README.md'), 'utf8'), 'new\n');
+  await assert.rejects(access(join(root, 'old.md')));
+  assert.deepEqual((await git(['diff', '--cached', '--name-status'])).split('\n').sort(), ['A\tdocs/added.md', 'D\told.md', 'M\tREADME.md']);
+  await symlink('/etc/hostname', join(root, 'link.md'));
+  await assert.rejects(applyCandidateFiles(root, [{ path: 'link.md', content: 'x\n' }], git), /rejected/);
+  await assert.rejects(applyCandidateFiles(root, [{ path: 'link.md', deleted: true }], git), /rejected/);
+  await assert.rejects(applyCandidateFiles(root, [{ path: 'missing.md', deleted: true }], git), /rejected/);
+});

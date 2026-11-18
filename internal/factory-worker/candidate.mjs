@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { NO_REBUILD_PATH, REBUILD_PATH } from './control-policy.mjs';
 
 const ERROR = 'Factory candidate rejected.';
 const SECRET = /-----BEGIN[^\r\n]*PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/;
@@ -9,7 +10,8 @@ function checkedScope(config) {
       || new Set(config.allowedPaths).size !== config.allowedPaths.length) reject();
   for (const path of config.allowedPaths) {
     if (typeof path !== 'string' || path.split('/').some(p => !p || p === '.' || p === '..')
-        || !/^(?:tests\/(?:unit|integration)\/[A-Za-z0-9_-]+\.test\.mjs|src\/[A-Za-z0-9_./-]+\.mjs|docs\/[A-Za-z0-9_./-]+\.md|README\.md)$/.test(path)) reject();
+        // One policy for jobs and exports, so an accepted job never fails at export.
+        || !(NO_REBUILD_PATH.test(path) || REBUILD_PATH.test(path))) reject();
   }
 }
 
@@ -20,15 +22,20 @@ export function validateCandidate(value, config) {
   const seen = new Set();
   let totalBytes = 0;
   const files = value.files.map(file => {
-    if (!file || !config.allowedPaths.includes(file.path) || seen.has(file.path)
-        || typeof file.content !== 'string' || !file.content.length || file.content.includes('\0')
-        || SECRET.test(file.content)) reject();
+    if (!file || !config.allowedPaths.includes(file.path) || seen.has(file.path)) reject();
     seen.add(file.path);
+    // A planned deletion carries no content; anything else must be complete text.
+    if (file.deleted !== undefined) {
+      if (file.deleted !== true || file.content !== undefined) reject();
+      return { path: file.path, deleted: true };
+    }
+    if (typeof file.content !== 'string' || !file.content.length || file.content.includes('\0')
+        || SECRET.test(file.content)) reject();
     totalBytes += Buffer.byteLength(file.content, 'utf8');
     if (totalBytes > 128 * 1024) reject();
     return { path: file.path, content: file.content, sha256: createHash('sha256').update(file.content).digest('hex') };
   }).sort((a,b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
-  const digest = createHash('sha256').update(JSON.stringify({ baseSha: config.baseSha, files: files.map(f => ({ path:f.path,sha256:f.sha256 })) })).digest('hex');
+  const digest = createHash('sha256').update(JSON.stringify({ baseSha: config.baseSha, files: files.map(f => (f.deleted ? { path: f.path, deleted: true } : { path:f.path,sha256:f.sha256 })) })).digest('hex');
   return { baseSha: config.baseSha, files, totalBytes, digest };
 }
 
@@ -47,7 +54,8 @@ if(!changed.length||changed.some(p=>!allowed.includes(p)))throw new Error('Candi
 const credentials=JSON.parse(fs.readFileSync('/worker-state/pi-agent/auth.json','utf8'));
 const secrets=Object.values(credentials).flatMap(c=>[c.access,c.refresh,c.key]).filter(v=>typeof v==='string'&&v.length>10);
 let total=0;
-const files=changed.sort().map(p=>{const target=path.join(root,p),info=fs.lstatSync(target);if(!info.isFile()||info.isSymbolicLink()||info.size>131072||!fs.realpathSync(target).startsWith(root+'/'))throw new Error('Unsafe candidate file.');const fd=fs.openSync(target,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);let data;try{data=fs.readFileSync(fd);}finally{fs.closeSync(fd);}total+=data.length;if(total>131072)throw new Error('Candidate too large.');const content=data.toString('utf8');if(!Buffer.from(content).equals(data)||content.includes('\\0')||secrets.some(s=>content.includes(s)))throw new Error('Unsafe candidate content.');return{path:p,content};});
+const tracked=p=>spawnSync('git',['-C',root,'cat-file','-e',base+':'+p]).status===0;
+const files=changed.sort().map(p=>{const target=path.join(root,p);let info;try{info=fs.lstatSync(target);}catch(e){if(e.code==='ENOENT'&&tracked(p))return{path:p,deleted:true};throw new Error('Unsafe candidate file.');}if(!info.isFile()||info.isSymbolicLink()||info.size>131072||!fs.realpathSync(target).startsWith(root+'/'))throw new Error('Unsafe candidate file.');const fd=fs.openSync(target,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);let data;try{data=fs.readFileSync(fd);}finally{fs.closeSync(fd);}total+=data.length;if(total>131072)throw new Error('Candidate too large.');const content=data.toString('utf8');if(!Buffer.from(content).equals(data)||content.includes('\\0')||secrets.some(s=>content.includes(s)))throw new Error('Unsafe candidate content.');return{path:p,content};});
 let meta;
 try{const target=path.join(root,META),info=fs.lstatSync(target);if(info.isFile()&&!info.isSymbolicLink()&&info.size<=16384){const fd=fs.openSync(target,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);let raw;try{raw=fs.readFileSync(fd,'utf8');}finally{fs.closeSync(fd);}const v=JSON.parse(raw);if(v&&typeof v.title==='string'&&typeof v.summary==='string'&&!secrets.some(s=>raw.includes(s)))meta={title:v.title.slice(0,200),summary:v.summary.slice(0,5000)};}}catch{}
 console.log(JSON.stringify({baseSha:base,files,...(meta?{meta}:{})}));`;

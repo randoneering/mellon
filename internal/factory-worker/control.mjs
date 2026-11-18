@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { authorizedControlRequest, validateControlJob, safeThreadState, validateAssessment, proposalMetadata } from './control-policy.mjs';
 import { candidateProgram, validateCandidate } from './candidate.mjs';
 import { reviewCandidate } from './review.mjs';
+import { GENERATED_PATHS } from './publication.mjs';
 
 const RELAY_PORT = 8790;
 // Any HTTP answer on T3's local port means its server is listening.
@@ -71,6 +72,8 @@ export function createControlServer(config, run = execute, review = reviewCandid
   const assessmentWindowMs = config.assessmentWindowMs ?? 24 * 3600000;
   // A publish claim older than this without a published report may have written to GitHub.
   const publicationClaimMs = config.publicationClaimMs ?? 15 * 60000;
+  // The isolated runner can take up to 40 minutes; its stage gets its own budget.
+  const runnerStageMs = config.runnerStageMs ?? 50 * 60000;
   const readinessIntervalMs = config.readinessIntervalMs ?? 2000;
   const readinessAttempts = config.readinessAttempts ?? 45;
   if (!Number.isSafeInteger(maxJobMs) || maxJobMs < 1 || maxJobMs > 3600000
@@ -78,6 +81,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
       || !Number.isSafeInteger(maxOwnerFixRounds) || maxOwnerFixRounds < 0 || maxOwnerFixRounds > 3
       || !Number.isSafeInteger(assessmentWindowMs) || assessmentWindowMs < 1 || assessmentWindowMs > 72 * 3600000
       || !Number.isSafeInteger(publicationClaimMs) || publicationClaimMs < 1 || publicationClaimMs > 2 * 3600000
+      || !Number.isSafeInteger(runnerStageMs) || runnerStageMs < 1 || runnerStageMs > 2 * 3600000
       || !Number.isSafeInteger(readinessIntervalMs) || readinessIntervalMs < 1 || readinessIntervalMs > 10000
       || !Number.isSafeInteger(readinessAttempts) || readinessAttempts < 1 || readinessAttempts > 120) throw new Error('Controller budget rejected.');
   // An owner send-back renews the coding lease, so deadlines live on the job.
@@ -89,6 +93,12 @@ export function createControlServer(config, run = execute, review = reviewCandid
   const pauseStart = job => (job.assessmentUntil ?? 0) - assessmentWindowMs;
   const assessmentClaimed = job => job.state === 'awaiting_assessment' && job.assessClaim?.reviewRunId === job.review?.reviewRunId
     && job.assessClaim.at >= pauseStart(job);
+  // Each publication stage has its own deadline; only an overrun stage may be released as uncertain.
+  const publishDeadline = job => {
+    const p = job.publishProgress;
+    if (!p) return (job.publishClaim?.at ?? 0) + publicationClaimMs;
+    return p.stageAt + (p.stage === 'runner' ? runnerStageMs : publicationClaimMs);
+  };
   const scope = job => ({ ...config, issueNumber: job.issueNumber, baseSha: job.baseSha, allowedPaths: job.allowedPaths });
   const jobs = new Map();
   const timers = new Map();
@@ -136,7 +146,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
     for (const file of await readdir(config.storeDir)) {
       if (!/^[a-f0-9-]{36}\.json$/.test(file)) continue;
       const saved = JSON.parse(await readFile(join(config.storeDir, file), 'utf8'));
-      const input = validateControlJob(Object.fromEntries(['jobId', 'issueNumber', 'baseSha', 'planSha256', 'task', 'allowedPaths'].map(key => [key, saved[key]])), config);
+      const input = validateControlJob(Object.fromEntries(['jobId', 'issueNumber', 'baseSha', 'planSha256', 'task', 'allowedPaths', 'requiresRebuild'].filter(key => saved[key] !== undefined).map(key => [key, saved[key]])), config);
       const digest = createHash('sha256').update(JSON.stringify(input)).digest('hex');
       if (saved.digest !== digest || file !== `${input.jobId}.json`) throw new Error('Job journal identity rejected.');
       if (!Number.isSafeInteger(saved.createdAt) || saved.createdAt < 1 || saved.createdAt > Date.now()) throw new Error('Job journal timestamp rejected.');
@@ -451,6 +461,8 @@ export function createControlServer(config, run = execute, review = reviewCandid
     ownerFixRounds: job.ownerFixRounds ?? 0, assessmentUntil: job.assessmentUntil ?? null,
     publishClaimedAt: job.publishClaim?.at ?? null, assessClaimedFor: job.assessClaim?.reviewRunId ?? null,
     assessmentClaimed: assessmentClaimed(job),
+    publishStage: job.publishProgress?.stage ?? null, publishHead: job.publishProgress?.head ?? null,
+    publishDeadlineAt: job.publishClaim ? publishDeadline(job) : null, requiresRebuild: job.requiresRebuild === true,
     assessment: job.assessment ? { decision: job.assessment.decision, assessedAt: job.assessment.assessedAt, reviewRunId: job.assessment.reviewRunId } : null,
   });
   const server = createServer({ maxHeaderSize: 8192 }, async (request, response) => {
@@ -510,8 +522,9 @@ export function createControlServer(config, run = execute, review = reviewCandid
           metadataSource: (job.proposalMeta ?? proposalMetadata(undefined, job.issueNumber)).source,
           structuredOutput: { status: 'ready', title: (job.proposalMeta ?? proposalMetadata(undefined, job.issueNumber)).title,
             summary: (job.proposalMeta ?? proposalMetadata(undefined, job.issueNumber)).summary,
-            requires_dist_rebuild: false,
-            files: job.candidate.files.map(({path,content}) => ({path,content})) } });
+            requires_dist_rebuild: job.requiresRebuild === true,
+            files: job.candidate.files.map(f => (f.deleted ? { path: f.path, deleted: true } : { path: f.path, content: f.content })) },
+          requiresRebuild: job.requiresRebuild === true });
         return;
       }
       if (url.pathname === '/jobs/active' && request.method === 'GET') {
@@ -522,7 +535,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
         send(200, { job: job ? safe(job) : null });
         return;
       }
-      const action = /^\/jobs\/([a-f0-9-]{36})\/(claim|published|acknowledge|publication-failed)$/.exec(url.pathname);
+      const action = /^\/jobs\/([a-f0-9-]{36})\/(claim|published|acknowledge|publication-failed|publication-stage)$/.exec(url.pathname);
       if (action && request.method === 'POST') {
         let body = '';
         for await (const data of request) { body += data.toString(); if (Buffer.byteLength(body) > 4096) throw new Error('Body too large.'); }
@@ -538,6 +551,7 @@ export function createControlServer(config, run = execute, review = reviewCandid
             // One claim only: an unfinished claim means a write may have happened.
             if (job.state !== 'approved' || job.publishClaim) { send(409, { error: 'publication_not_claimable' }); return; }
             job.publishClaim = { at: Date.now() };
+            job.publishProgress = { stage: 'claimed', stageAt: Date.now(), generated: [] };
           } else { send(400, { error: 'factory_request_rejected' }); return; }
           await save(job);
           send(200, safe(job));
@@ -545,6 +559,11 @@ export function createControlServer(config, run = execute, review = reviewCandid
         }
         if (action[2] === 'published') {
           if (job.state !== 'approved' || !job.publishClaim) { send(409, { error: 'publication_not_claimed' }); return; }
+          if (job.publishProgress?.head && value.commitSha !== job.publishProgress.head) { send(409, { error: 'publication_head_mismatch' }); return; }
+          // A rebuild job publishes only after its build is recorded and every changed file is committed.
+          const done = job.publishProgress;
+          if (job.requiresRebuild === true && (!done || !['built', 'generated'].includes(done.stage)
+              || done.changedPaths.some(path => !done.generated.includes(path)))) { send(409, { error: 'publication_build_incomplete' }); return; }
           if (!Number.isSafeInteger(value.prNumber) || value.prNumber < 1 || !/^[a-f0-9]{40}$/.test(value.commitSha ?? '')
               || value.prUrl !== `https://github.com/randoneering/mellon/pull/${value.prNumber}`) { send(400, { error: 'factory_request_rejected' }); return; }
           job.publication = { prNumber: value.prNumber, prUrl: value.prUrl, commitSha: value.commitSha, at: Date.now() };
@@ -556,12 +575,43 @@ export function createControlServer(config, run = execute, review = reviewCandid
           send(200, safe(job));
           return;
         }
+        if (action[2] === 'publication-stage') {
+          // Stages run in order: claimed -> source_committed -> runner (rebuild jobs) -> generated...
+          const progress = job.publishProgress;
+          const sha = v => /^[a-f0-9]{40}$/.test(v ?? '');
+          const shapes = {
+            source_committed: () => sha(value.commitSha),
+            runner: () => /^n8n-[1-9][0-9]{0,19}$/.test(value.requestId ?? ''),
+            built: () => /^[1-9][0-9]{0,19}$/.test(String(value.runId ?? '')) && Array.isArray(value.changedPaths)
+              && value.changedPaths.length <= GENERATED_PATHS.length && new Set(value.changedPaths).size === value.changedPaths.length
+              && value.changedPaths.every(path => GENERATED_PATHS.includes(path)),
+            generated: () => sha(value.expectedHead) && sha(value.headSha) && value.headSha !== value.expectedHead && GENERATED_PATHS.includes(value.path),
+          };
+          if (!Object.hasOwn(shapes, value.stage) || !shapes[value.stage]()) { send(400, { error: 'factory_request_rejected' }); return; }
+          const from = { source_committed: ['claimed'], runner: ['source_committed'], built: ['runner'], generated: ['built', 'generated'] }[value.stage];
+          if (job.state !== 'approved' || !progress || !from.includes(progress.stage)
+              || (value.stage === 'runner' && job.requiresRebuild !== true)
+              || (value.stage === 'generated' && (value.expectedHead !== progress.head || progress.generated.includes(value.path)
+                || !progress.changedPaths.includes(value.path)))) {
+            send(409, { error: 'publication_stage_rejected' }); return;
+          }
+          progress.stage = value.stage;
+          progress.stageAt = Date.now();
+          if (value.stage === 'source_committed') { progress.source = value.commitSha; progress.head = value.commitSha; }
+          if (value.stage === 'runner') progress.requestId = value.requestId;
+          // The runner's verified result names exactly which generated files must be committed.
+          if (value.stage === 'built') { progress.runId = String(value.runId); progress.changedPaths = [...value.changedPaths]; }
+          if (value.stage === 'generated') { progress.head = value.headSha; progress.generated.push(value.path); }
+          await save(job);
+          send(200, safe(job));
+          return;
+        }
         if (action[2] === 'publication-failed') {
           // 'policy': refused before any write. 'uncertain': a write may have happened, so
           // only an aged claim is released; the owner reconciles GitHub state from the record.
           if (!['policy', 'uncertain'].includes(value.reason)) { send(400, { error: 'factory_request_rejected' }); return; }
           if (job.state !== 'approved' || !job.publishClaim
-              || (value.reason === 'uncertain' && Date.now() - job.publishClaim.at < publicationClaimMs)) { send(409, { error: 'publication_not_releasable' }); return; }
+              || (value.reason === 'uncertain' && Date.now() < publishDeadline(job))) { send(409, { error: 'publication_not_releasable' }); return; }
           job.state = 'blocked';
           job.stage = value.reason === 'policy' ? 'publication_policy_blocked' : 'publication_uncertain';
           await save(job);

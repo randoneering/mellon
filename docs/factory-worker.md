@@ -101,3 +101,18 @@ The plan was already approved through the `n8n: build` label.
 - `POST /jobs/<id>/publication-failed` releases a claimed publication: `policy` when nothing was written, `uncertain` only after the claim is older than `publicationClaimMs` (default 15 minutes).
   Both block the job; for `uncertain`, check the issue branch and any PR before relabeling the issue.
 - Before granting model access, the controller probes T3's server inside the worker up to 45 times, 2 seconds apart (longer if probes time out); if it never answers, the job blocks as `worker_not_ready`.
+
+### Rebuild jobs and deletions
+
+- A job may also name Action runtime paths: `src/*.mjs` outside `src/personalized/`, `action.yml`, and `tests/fixtures/` data.
+  It must then declare `requiresRebuild: true`; the controller recomputes the flag from the paths and refuses a mismatch.
+  Tooling, detector code, workflows, lockfiles and `dist/` stay out of scope.
+- A file the plan lists may be deleted; a rename lists both paths.
+  The export reports a missing tracked file as a deletion, refuses unplanned ones, and the review clone applies it with `git rm`.
+- Publication of a claimed job moves through stages with `POST /jobs/<id>/publication-stage`:
+  `source_committed` (the signed source commit), `runner` (rebuild jobs only, while the isolated runner builds `dist/`), `built` (the runner's run ID and the exact generated files that changed), then one `generated` step per changed file.
+  A rebuild job can only be marked published after `built`, with every changed file committed; with no changes it publishes on the source commit.
+  Each `generated` step names the recorded head as its expected head, so the commit chain cannot fork or repeat a file.
+  The runner stage allows `runnerStageMs` (default 50 minutes); other stages allow `publicationClaimMs`.
+  `published` must name the last recorded head.
+- `publication.mjs` `reconcileGeneratedWrite` decides each generated write: commit when the branch head equals the recorded head, record an earlier write when the branch moved by exactly our signed single-file commit, and block otherwise.

@@ -18,6 +18,26 @@ export function candidateCheckoutCommands(root, baseSha, digest) {
   return [[...git, 'checkout', '--detach', baseSha], [...git, 'switch', '--create', `factory-candidate-${digest.slice(0, 16)}`]];
 }
 
+// Applies a validated candidate to a fresh clone and stages it. Edits never write
+// through a symlink; a deletion must remove a regular tracked file.
+export async function applyCandidateFiles(root, files, git) {
+  for (const file of files) {
+    const target = resolve(root, file.path);
+    if (!target.startsWith(root + '/')) throw new Error(ERROR);
+    const existing = await lstat(target).catch(() => null);
+    if (existing && !existing.isFile()) throw new Error(ERROR);
+    if (file.deleted === true) {
+      if (!existing) throw new Error(ERROR);
+      await git(['rm', '--quiet', '--', file.path]);
+      continue;
+    }
+    await mkdir(resolve(target, '..'), { recursive: true, mode: 0o700 });
+    await writeFile(target, file.content, { mode: 0o600 });
+  }
+  const kept = files.filter(f => f.deleted !== true).map(f => f.path);
+  if (kept.length) await git(['add', '--', ...kept]);
+}
+
 export function evaluateCandidateReview(value, expected) {
   const snapshot = value?.meta?.run?.snapshot;
   if (value?.meta?.coverage?.complete !== true || value.finding_state?.complete !== true
@@ -81,16 +101,7 @@ export async function reviewCandidate(candidate, config) {
     await run('git', ['-c', 'core.hooksPath=/dev/null', 'clone', '--quiet', 'https://github.com/randoneering/mellon.git', root], undefined);
     for (const args of candidateCheckoutCommands(root, config.baseSha, checked.digest)) await run('git', args);
     if (await run('git', ['-C', root, 'rev-parse', 'HEAD']) !== config.baseSha) throw new Error(ERROR);
-    for (const file of checked.files) {
-      const target = resolve(root, file.path);
-      if (!target.startsWith(root+'/')) throw new Error(ERROR);
-      // Existing files may be replaced, but never through a symlink in the clone.
-      await mkdir(resolve(target, '..'), { recursive: true, mode: 0o700 });
-      const existing = await lstat(target).catch(() => null);
-      if (existing && !existing.isFile()) throw new Error(ERROR);
-      await writeFile(target, file.content, { mode: 0o600 });
-    }
-    await run('git', ['-C', root, 'add', '--', ...checked.files.map(f => f.path)]);
+    await applyCandidateFiles(root, checked.files, args => run('git', ['-C', root, ...args]));
     const treeSha = await run('git', ['-C', root, 'write-tree']);
     const contextFile = join(config.reviewDir, `${checked.digest}.context.json`);
     const context = {

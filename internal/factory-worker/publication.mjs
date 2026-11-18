@@ -44,3 +44,28 @@ export function selectGeneratedChanges(input) {
     changedPaths: changed.map(file => file.path), batches: changed.map(file => [file]),
   };
 }
+
+export function gitBlobSha(bytes) {
+  return createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+}
+
+// Decides what to do before each generated commit. The controller records the
+// chain head; an uncertain earlier write is accepted only if the branch moved by
+// exactly our signed single-file commit. Anything else needs the owner.
+export function reconcileGeneratedWrite({ recordedHead, branchHead, headCommit, path, blobSha, message }) {
+  const block = reason => ({ action: 'block', reason });
+  const sha = v => typeof v === 'string' && /^[a-f0-9]{40}$/.test(v);
+  if (!sha(recordedHead) || !sha(branchHead) || !sha(blobSha) || !GENERATED_PATHS.includes(path) || typeof message !== 'string') {
+    return block('Generated publication state is incomplete.');
+  }
+  if (branchHead === recordedHead) return { action: 'commit', expectedHead: recordedHead };
+  const c = headCommit;
+  if (!c || c.sha !== branchHead || !Array.isArray(c.parents) || c.parents.length !== 1 || c.parents[0]?.sha !== recordedHead) {
+    return block('The branch moved to a commit that does not follow the recorded head.');
+  }
+  if (c.commit?.verification?.verified !== true || c.commit?.message !== message) return block('The new head is not our signed generated commit.');
+  if (!Array.isArray(c.files) || c.files.length !== 1 || c.files[0]?.filename !== path || c.files[0]?.sha !== blobSha) {
+    return block('The new head does not contain exactly the expected generated file.');
+  }
+  return { action: 'record', headSha: branchHead };
+}

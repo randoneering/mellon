@@ -59,3 +59,22 @@ test('worker PR metadata must be one safe conventional line and a clean summary'
     assert.equal(result.title, 'chore(factory): address issue #5');
   }
 });
+
+test('rebuild paths cover runtime source, action.yml and test fixtures, never tooling or generated files', async () => {
+  const { REBUILD_PATH, requiresRebuild } = await import('../../internal/factory-worker/control-policy.mjs');
+  for (const path of ['action.yml', 'src/action.mjs', 'src/github.mjs', 'src/inputs.mjs', 'src/moderation.mjs', 'src/prepare.mjs', 'tests/fixtures/a.json', 'tests/fixtures/deep/b.txt']) assert.equal(REBUILD_PATH.test(path), true, path);
+  for (const path of ['src/personalized/cli.mjs', 'scripts/build.mjs', 'detector/scorer.mjs', 'dist/index.mjs', 'package.json', '.github/workflows/ci.yml', 'src/../x.mjs', 'tests/fixtures/x.sh', 'action.yaml.bak']) assert.equal(REBUILD_PATH.test(path), false, path);
+  assert.equal(requiresRebuild(['docs/a.md', 'tests/unit/a.test.mjs']), false);
+  assert.equal(requiresRebuild(['src/inputs.mjs', 'tests/unit/a.test.mjs']), true);
+});
+
+test('jobs declare requiresRebuild, and it must match their paths', () => {
+  const rebuild = { ...JOB, allowedPaths: ['src/inputs.mjs', 'tests/unit/inputs.test.mjs'], requiresRebuild: true };
+  assert.deepEqual(validateControlJob(rebuild, {}), rebuild);
+  // No-rebuild jobs omit the flag, so digests of existing journals stay valid.
+  assert.deepEqual(validateControlJob({ ...JOB, requiresRebuild: false }, {}), JOB);
+  assert.deepEqual(validateControlJob(JOB, {}), JOB);
+  for (const bad of [{ ...rebuild, requiresRebuild: false }, { ...JOB, requiresRebuild: true }, { ...rebuild, requiresRebuild: 'yes' }, { ...JOB, allowedPaths: ['scripts/build.mjs'] }]) {
+    assert.throws(() => validateControlJob(bad, {}), /Factory controller input rejected/);
+  }
+});

@@ -17,21 +17,31 @@ export function authorizedControlRequest(header, secret) {
 // src/personalized/ is a separate CLI and is not imported by src/action.mjs.
 export const NO_REBUILD_PATH = /^(?:tests\/(?:unit|integration)\/[A-Za-z0-9_-]+\.test\.mjs|docs\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\.md|README\.md|src\/personalized\/[A-Za-z0-9_-]+\.mjs)$/;
 
+// Action runtime source and its test fixtures: these change the bundled dist/ and
+// go through the isolated runner. Tooling, detector code and generated files never do.
+export const REBUILD_PATH = /^(?:action\.yml|src\/[A-Za-z0-9_-]+\.mjs|tests\/fixtures\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\.(?:mjs|json|txt))$/;
+export const requiresRebuild = paths => paths.some(path => REBUILD_PATH.test(path));
+
 export function validateControlJob(value, config) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
-      || Object.keys(value).some(k => !['jobId', 'issueNumber', 'baseSha', 'planSha256', 'task', 'allowedPaths'].includes(k))
+      || Object.keys(value).some(k => !['jobId', 'issueNumber', 'baseSha', 'planSha256', 'task', 'allowedPaths', 'requiresRebuild'].includes(k))
       || !UUID.test(value.jobId ?? '') || !Number.isSafeInteger(value.issueNumber) || value.issueNumber < 1
       || (config.issueNumber !== undefined && value.issueNumber !== config.issueNumber)
       || !/^[a-f0-9]{40}$/.test(value.baseSha ?? '') || (config.baseSha !== undefined && value.baseSha !== config.baseSha)
       || !Array.isArray(value.allowedPaths) || !value.allowedPaths.length || value.allowedPaths.length > 10
       || new Set(value.allowedPaths).size !== value.allowedPaths.length
-      || value.allowedPaths.some(path => typeof path !== 'string' || !NO_REBUILD_PATH.test(path))
+      || value.allowedPaths.some(path => typeof path !== 'string' || !(NO_REBUILD_PATH.test(path) || REBUILD_PATH.test(path)))
+      // The declared flag must match the paths, so a rebuild job cannot skip the runner.
+      || (value.requiresRebuild !== undefined && typeof value.requiresRebuild !== 'boolean')
+      || (value.requiresRebuild === true) !== requiresRebuild(value.allowedPaths)
       || !/^[a-f0-9]{64}$/.test(value.planSha256 ?? '')
       || typeof value.task !== 'string' || !value.task.trim() || value.task.includes('\0')
       || Buffer.byteLength(value.task, 'utf8') > 32768) reject();
   return {
     jobId: value.jobId, issueNumber: value.issueNumber, baseSha: value.baseSha,
     planSha256: value.planSha256, task: value.task, allowedPaths: [...value.allowedPaths],
+    // Emitted only when true, so existing no-rebuild journal digests stay valid.
+    ...(value.requiresRebuild === true ? { requiresRebuild: true } : {}),
   };
 }
 
