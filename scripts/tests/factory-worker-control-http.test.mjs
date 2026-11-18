@@ -340,25 +340,37 @@ test('an uncertain launch that reconciliation blocks also revokes its grant', as
   }finally{await stop(app.server);}
 });
 
-test('a grant that lands after the job deadline is revoked and never launched', async () => {
-  const dir=await mkdtemp(join(tmpdir(),'mellon-control-late-grant-'));
-  const log=[];let starts=0;
-  const run=async args=>{ if(args.includes('start'))starts++; return{status:0,stdout:'d'.repeat(64)}; };
-  const slowIssue=async args=>{
-    if(args.includes('/opt/bootstrap/relay.mjs')&&args[4]==='issue'){
-      await new Promise(resolve=>setTimeout(resolve,60));
-      log.push(['issue']);
-      return{status:0,stdout:JSON.stringify({grantId:GRANT,capability:'a.b.c',expiresAt:Date.now()+60000})};
-    }
-    return undefined;
+test('a grant that lands after the job deadline is revoked and never launched', { timeout: 5000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'mellon-control-late-grant-'));
+  const issuing = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const log = [];
+  let starts = 0;
+  const run = async args => {
+    if (args.includes('start')) starts++;
+    return { status: 0, stdout: 'd'.repeat(64) };
   };
-  const app=await running({workerId:'d'.repeat(64),projectId:'project-id',model:MODEL,secret:SECRET,issueNumber:123,baseSha:JOB.baseSha,storeDir:dir,maxJobMs:20},run,undefined,log,slowIssue);
-  try{
-    assert.equal((await post(app.url,JOB)).status,202);
-    await new Promise(resolve=>setTimeout(resolve,140));
-    assert.equal(starts,0);
-    assert.deepEqual(log.filter(e=>e[0]==='revoke'),[['revoke',GRANT]]);
-  }finally{await stop(app.server);}
+  const slowIssue = async args => {
+    if (!args.includes('/opt/bootstrap/relay.mjs') || args[4] !== 'issue') return;
+    issuing.resolve();
+    await release.promise;
+    return { status: 0, stdout: JSON.stringify({ grantId: GRANT, capability: 'a.b.c', expiresAt: Date.now() + 60000 }) };
+  };
+  const app = await running({ ...buildConfig(dir), maxJobMs: 1000 }, run, undefined, log, slowIssue);
+  t.after(() => { release.resolve(); return stop(app.server); });
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() });
+  assert.equal((await post(app.url, JOB)).status, 202);
+  await issuing.promise;
+  t.mock.timers.tick(1000);
+  const status = async () => (await call(app.url, '/jobs/' + JOB.jobId)).json();
+  let job;
+  do { job = await status(); } while (job.state === 'stopping');
+  assert.equal(job.stage, 'job_deadline');
+  assert.equal(job.state, 'blocked');
+  release.resolve();
+  do { job = await status(); } while (job.cleanupUnconfirmed);
+  assert.equal(starts, 0);
+  assert.deepEqual(log.filter(entry => entry[0] === 'revoke'), [['revoke', GRANT]]);
 });
 
 const firstRun = id => `run:thread:${encodeURIComponent(id)}:ordinal:1`;
