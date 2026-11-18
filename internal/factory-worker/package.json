@@ -1,0 +1,11 @@
+{
+  "name": "mellon-factory-worker-runtime",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": { "node": ">=24 <25" },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "ws": "8.23.0"
+  }
+}

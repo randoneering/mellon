@@ -167,6 +167,7 @@ The test runners serialize files because build-safety tests rewrite `dist/` whil
 The build produces the bundled Action, scorer, detector assets, metadata, and third-party notices in `dist/`.
 Include those files in a release commit; the Action does not install packages or download models at runtime.
 Repository maintainers can use the [isolated n8n build runner](docs/n8n-build-runner.md) to test approved source commits and export generated bundles without giving the runner publication credentials.
+The experimental [offline T3 Code worker bootstrap](docs/factory-worker.md) documents a separate, restricted T3 Code/Pi environment; it does not enable the issue factory.
 
 ## Security and operations
 
