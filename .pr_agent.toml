@@ -1,0 +1,9 @@
+[review_agent]
+enable_review_md = true
+
+# The router skipped docs-only PRs, but these files carry release and pinning steps consumers follow.
+smart_router_extra_instructions = """
+Never skip or route to Fast a pull request that changes README.md, docs/release.md, docs/configuration.md, action.yml, examples/, or .github/workflows/.
+In mellon these files define release steps, SHA pinning, and moderation behavior that consumers copy.
+Use at least Balanced for them, even when the diff is documentation only.
+"""
