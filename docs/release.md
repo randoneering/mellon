@@ -6,7 +6,7 @@
 2. Run the README checks, including asset verification, tests, parity, `npm run build`, and release validation.
 3. Commit `dist/index.mjs`, `dist/scorer.mjs`, `dist/detector/` provenance/assets, `dist/build-meta.json`, and `dist/THIRD_PARTY_NOTICES.txt` with the reviewed source.
 4. Confirm workflow and bundle checks passed on the exact release commit.
-5. Review the Release Drafter notes and suggested version. For the first release, set the tag and title to `v0.1.0`.
+5. Review the Release Drafter notes and suggested version.
 6. Review the target commit, passing CI run, and generated files before publishing.
 7. If publishing to Marketplace, follow the publication steps below and review metadata warnings.
 8. Pin consumers to the actual reviewed release commit, not a mutable branch, tag, or unrelated SHA.
@@ -18,7 +18,6 @@ Use Node 24 and the repository lockfile. Install dependencies only in the build 
 CI rebuilds `dist/` and fails if tracked or untracked distribution files differ from the checkout.
 Release Drafter updates a draft on pushes to `main`; it does not publish releases.
 Its suggested version depends on PR labels and previous releases, so check it before publishing.
-For the first release, set the tag and title to `v0.1.0` in GitHub's release editor.
 Review the notes, the target commit, the passing CI run, and the generated files first.
 
 To list mellon in GitHub Marketplace, open `action.yml` on GitHub and choose **Draft a release**.
