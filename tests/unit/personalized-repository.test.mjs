@@ -130,6 +130,21 @@ test('rejects invalid limits and missing credentials before fetching', async () 
   assert.equal(requests, 0);
 });
 
+test('reports absent repository sample counts without making a request', async () => {
+  let requests = 0;
+  const fetchImpl = async () => {
+    requests++;
+    return response([]);
+  };
+  for (const counts of [undefined, null, {}, { issues: 1 }, { pullRequests: 1 }]) {
+    await assert.rejects(
+      github.discoverRepositoryUrls('a/b', counts, 'token', fetchImpl),
+      { message: 'Issue and PR counts must be integers from 0 to 100, with at least one positive count.' },
+    );
+  }
+  assert.equal(requests, 0);
+});
+
 test('bounds scans even when all issue pages contain only PRs', async () => {
   let requests = 0;
   await assert.rejects(github.discoverRepositoryUrls('a/b', { issues: 1, pullRequests: 0 }, 'token', async () => {
