@@ -24,7 +24,7 @@ Check each instruction against the source of truth and flag mismatches as remedi
 
 - Check commands against `package.json` scripts and the check list in the README `Build and test` section.
 - Check generated file lists against what `scripts/build.mjs` writes.
-- Check version, tag, and "first release" wording against existing release tags; `v0.1.0` and later tags already exist, so first-release steps are stale.
+- Mellon has shipped releases since `v0.1.0`. In release and setup docs, flag any instruction to cut the first release or create the initial tag.
 - Check new sections that restate an existing section for conflicting steps.
 
 ### Factory pull request claims
