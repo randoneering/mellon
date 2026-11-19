@@ -32,8 +32,9 @@ export function parseRepository(value) {
   return { owner: match[1], repo: match[2] };
 }
 
-export async function discoverRepositoryUrls(repository, { issues, pullRequests }, token, fetchImpl = fetch) {
+export async function discoverRepositoryUrls(repository, counts, token, fetchImpl = fetch) {
   const { owner, repo } = parseRepository(repository);
+  const { issues, pullRequests } = counts ?? {};
   if (![issues, pullRequests].every(count => Number.isInteger(count) && count >= 0 && count <= 100)
       || issues + pullRequests === 0) {
     throw new Error('Issue and PR counts must be integers from 0 to 100, with at least one positive count.');
