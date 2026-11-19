@@ -85,6 +85,13 @@ test('CI checks both tracked and untracked distribution changes after building',
   assert.equal(steps[check].run, 'test -z "$(git status --porcelain --untracked-files=all -- dist)"');
 });
 
+test('CI cancels superseded runs only within the same pull request', () => {
+  assert.deepEqual(workflow().concurrency, {
+    group: "mellon-node-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}",
+    'cancel-in-progress': "${{ github.event_name == 'pull_request' }}",
+  });
+});
+
 test('workflow keeps fork-safe triggers, hosted runners, least privilege and pinned Actions', () => {
   const value = workflow();
   assert.deepEqual(value.on, { push: null, pull_request: null });
