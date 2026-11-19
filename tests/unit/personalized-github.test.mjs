@@ -31,6 +31,30 @@ test('fetches selected issue with credentials only to GitHub API', async () => {
   assert.equal(calls[0].options.redirect, 'manual');
 });
 
+test('fetches a selected pull request with no description via the shared issues endpoint', async () => {
+  const parsed = parseSubmissionUrl('https://github.com/owner/repo/pull/12');
+  const calls = [];
+  const result = await fetchSubmission(parsed, 'fixture-token', async (url, options) => {
+    calls.push({ url, options });
+    return new Response(JSON.stringify({ title: 'Pull request', body: null }));
+  });
+  assert.deepEqual(result, { title: 'Pull request', body: '' });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://api.github.com/repos/owner/repo/issues/12');
+  assert.equal(calls[0].options.method, 'GET');
+  assert.equal(calls[0].options.redirect, 'manual');
+  assert.equal(calls[0].options.headers.authorization, 'Bearer fixture-token');
+});
+
+test('rejects a malformed pull request body with the fixed safe error', async () => {
+  const parsed = parseSubmissionUrl('https://github.com/owner/repo/pull/12');
+  await assert.rejects(
+    fetchSubmission(parsed, 'fixture-token', async () =>
+      new Response(JSON.stringify({ title: 'Private title', body: { text: 'Private description' } }))),
+    { message: 'GitHub submission request failed safely.' },
+  );
+});
+
 test('rejects mismatched parsed submission fields before fetching', async () => {
   const parsed = parseSubmissionUrl('https://github.com/o/r/issues/5');
   let called = false;
