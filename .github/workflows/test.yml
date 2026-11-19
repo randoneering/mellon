@@ -12,29 +12,77 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out source
+        id: checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
       - name: Set up Node 24
+        id: setup_node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24
           cache: npm
       - name: Install locked dependencies without scripts
+        id: install_root
         run: npm ci --ignore-scripts
       - name: Install locked detector dependencies without scripts
+        id: install_detector
         run: npm ci --prefix detector --ignore-scripts
       - name: Verify assets
+        id: verify_assets
         run: npm run verify:assets
       - name: Test build safety
+        id: test_build
         run: npm run test:build
       - name: Run JavaScript tests
+        id: test_js
         run: npm test
       - name: Verify parity
+        id: test_parity
         run: npm run test:parity
       - name: Build release files
+        id: build
         run: npm run build
       - name: Check distribution is committed
+        id: verify_dist
         run: test -z "$(git status --porcelain --untracked-files=all -- dist)"
       - name: Validate workflow and bundle metadata
+        id: validate_release
         run: npm run validate:release
+      - name: Summarize failed verification stages
+        id: summarize_failures
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          SETUP_NODE_OUTCOME: ${{ steps.setup_node.outcome }}
+          INSTALL_ROOT_OUTCOME: ${{ steps.install_root.outcome }}
+          INSTALL_DETECTOR_OUTCOME: ${{ steps.install_detector.outcome }}
+          VERIFY_ASSETS_OUTCOME: ${{ steps.verify_assets.outcome }}
+          TEST_BUILD_OUTCOME: ${{ steps.test_build.outcome }}
+          TEST_JS_OUTCOME: ${{ steps.test_js.outcome }}
+          TEST_PARITY_OUTCOME: ${{ steps.test_parity.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          VERIFY_DIST_OUTCOME: ${{ steps.verify_dist.outcome }}
+          VALIDATE_RELEASE_OUTCOME: ${{ steps.validate_release.outcome }}
+        run: |
+          report_failure() {
+            if [[ "$1" == failure ]]; then
+              printf -- '- %s\n' "$2"
+            fi
+          }
+
+          {
+            printf '## Release verification failed\n\n'
+            report_failure "$CHECKOUT_OUTCOME" 'Check out source'
+            report_failure "$SETUP_NODE_OUTCOME" 'Set up Node 24'
+            report_failure "$INSTALL_ROOT_OUTCOME" 'Install locked dependencies without scripts'
+            report_failure "$INSTALL_DETECTOR_OUTCOME" 'Install locked detector dependencies without scripts'
+            report_failure "$VERIFY_ASSETS_OUTCOME" 'Verify assets'
+            report_failure "$TEST_BUILD_OUTCOME" 'Test build safety'
+            report_failure "$TEST_JS_OUTCOME" 'Run JavaScript tests'
+            report_failure "$TEST_PARITY_OUTCOME" 'Verify parity'
+            report_failure "$BUILD_OUTCOME" 'Build release files'
+            report_failure "$VERIFY_DIST_OUTCOME" 'Check distribution is committed'
+            report_failure "$VALIDATE_RELEASE_OUTCOME" 'Validate workflow and bundle metadata'
+          } >> "$GITHUB_STEP_SUMMARY"

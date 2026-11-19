@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { parse } from 'yaml';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -26,7 +28,7 @@ test('CI retains locked installs and every ordinary release check without agent 
   const value = workflow();
   assert.deepEqual(Object.keys(value.jobs), ['test']);
   assert.equal(value.jobs.test.outputs, undefined);
-  assert.deepEqual(value.jobs.test.steps.filter(step => step.run).map(step => step.run), [
+  assert.deepEqual(value.jobs.test.steps.filter(step => step.run && step.id !== 'summarize_failures').map(step => step.run), [
     'npm ci --ignore-scripts',
     'npm ci --prefix detector --ignore-scripts',
     'npm run verify:assets',
@@ -37,6 +39,42 @@ test('CI retains locked installs and every ordinary release check without agent 
     'test -z "$(git status --porcelain --untracked-files=all -- dist)"',
     'npm run validate:release',
   ]);
+});
+
+test('CI failure summary uses every stage outcome and writes only fixed names of failed stages', t => {
+  const steps = workflow().jobs.test.steps;
+  const summary = steps.at(-1);
+  assert.equal(summary.id, 'summarize_failures');
+  assert.equal(summary.if, '${{ failure() }}');
+  assert.equal(summary.shell, 'bash');
+  assert.doesNotMatch(summary.run, /\$\{\{/);
+
+  const stages = steps.slice(0, -1);
+  const outcomeVariable = stage => `${stage.id.toUpperCase()}_OUTCOME`;
+  assert.deepEqual(summary.env, Object.fromEntries(stages.map(stage => [
+    outcomeVariable(stage), `\${{ steps.${stage.id}.outcome }}`,
+  ])));
+
+  const directory = mkdtempSync(join(tmpdir(), 'mellon-ci-summary-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, 'summary.md');
+  const existingSummary = 'Existing summary\n';
+  const outcomes = Object.fromEntries(stages.map(stage => [outcomeVariable(stage), 'success']));
+  for (const stage of stages) {
+    writeFileSync(path, existingSummary);
+    const result = spawnSync('bash', ['-e', '-o', 'pipefail', '-c', summary.run], {
+      env: {
+        ...outcomes,
+        GITHUB_STEP_SUMMARY: path,
+        [outcomeVariable(stages.at(-1))]: 'skipped',
+        [outcomeVariable(stage)]: 'failure',
+      },
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(path, 'utf8'),
+      `${existingSummary}## Release verification failed\n\n- ${stage.name}\n`);
+  }
 });
 
 test('CI checks both tracked and untracked distribution changes after building', () => {
